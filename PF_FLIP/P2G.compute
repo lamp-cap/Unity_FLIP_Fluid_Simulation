@@ -1,0 +1,41 @@
+#pragma use_dxc
+#pragma target 6.0
+
+#pragma kernel CSMain
+
+StructuredBuffer<int> s_id;
+RWStructuredBuffer<float> s_data;
+
+[numthreads(32, 1, 1)]
+void CSMain (uint gi : SV_GroupIndex)
+{
+	// if (gi < 30)
+	{
+		// 计算分界点
+		const int laneid = WaveGetLaneIndex();
+		bool is_boundary = laneid == 0;
+		const int id = s_id[gi];
+		if (laneid > 0)
+		{
+			const int prev_id = WaveReadLaneAt(id, laneid - 1);
+			is_boundary = (prev_id != id);
+		}
+	
+		// 构造分界点掩码
+		const uint mark = reversebits(WaveActiveBallot(is_boundary));
+		const uint chk = laneid < 32 ? ((mark << (laneid + 1)) | ((1U << (laneid + 1)) - 1)) : 0xFFFFFFFFu;
+		const int interval = 31 - asint(firstbithigh(chk));  // 从当前线程开始的连续 0 数量
+		const int iter = WaveActiveMax(interval);
+	
+		float data = s_data[gi];
+	
+		for (int stride = 1; stride <= iter; stride <<= 1)
+		{
+			const float neighbor = WaveReadLaneAt(data, min(laneid + stride, 31));
+			if (stride <= interval && laneid + stride < 32)
+				data += neighbor;
+		}
+
+		s_data[gi] = is_boundary ? data : 0;
+	}
+}
