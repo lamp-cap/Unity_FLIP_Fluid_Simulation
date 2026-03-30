@@ -318,7 +318,7 @@
 
                 float3 ro = posWS - V;
                 float3 rd = V;
-#if 1
+#if DRAW_VOLUME
 				return min(Render(ro, rd), 100);
 #else
 				

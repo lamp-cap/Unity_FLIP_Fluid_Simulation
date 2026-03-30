@@ -11,6 +11,12 @@ public class GPU_FLIP : MonoBehaviour
         public uint2 Velocity;
     }
 
+    public enum DrawType
+    {
+        Particles,
+        Mesh,
+    }
+
     public ComputeShader initCs;
     public ComputeShader buildLutCs;
     public ComputeShader P2GCs;
@@ -32,6 +38,8 @@ public class GPU_FLIP : MonoBehaviour
     
     [Range(0, 2)]
     public float threshold = 0.5f;
+
+    public DrawType drawType;
 
     public Material meshMat;
     
@@ -223,19 +231,19 @@ public class GPU_FLIP : MonoBehaviour
             _pause = !_pause;
         if (!_pause)
             Simulation();
-        
-        Graphics.DrawProceduralIndirect(meshMat, _bounds, MeshTopology.Triangles, _argsBuffer);
-        
-        // Graphics.DrawProceduralIndirect(_material,
-        //     _bounds,
-        //     MeshTopology.Points,
-        //     _particleRenderingBufferWithArgs,
-        //     0,
-        //     null,
-        //     _mpb,
-        //     ShadowCastingMode.Off,
-        //     false
-        // );
+        if (drawType == DrawType.Mesh)
+            Graphics.DrawProceduralIndirect(meshMat, _bounds, MeshTopology.Triangles, _argsBuffer);
+        else
+            Graphics.DrawProceduralIndirect(_material,
+                _bounds,
+                MeshTopology.Points,
+                _particleRenderingBufferWithArgs,
+                0,
+                null,
+                _mpb,
+                ShadowCastingMode.Off,
+                false
+            );
     }
 
     private void OnDrawGizmos()
@@ -266,8 +274,10 @@ public class GPU_FLIP : MonoBehaviour
         cmd.EndSample("G2P");
         
         cmd.BeginSample("Rendering");
-        // PrepareForRenderParticles(cmd);
-        RenderingMesh(cmd);
+        if (drawType == DrawType.Mesh)
+            PrepareForRenderingMesh(cmd);
+        else
+            PrepareForRenderParticles(cmd);
         cmd.EndSample("Rendering");
         
         Graphics.ExecuteCommandBuffer(cmd);
@@ -458,7 +468,7 @@ public class GPU_FLIP : MonoBehaviour
         cmd.DispatchCompute(cs, kernel, PGroupThreadsX, 1, 1);
     }
 
-    private void RenderingMesh(CommandBuffer cmd)
+    private void PrepareForRenderingMesh(CommandBuffer cmd)
     {
         var cs = initCs;
         cmd.SetComputeVectorParam(cs, "_Size", new Vector4(GridSize.x, GridSize.y, GridSize.z, 0));
@@ -484,8 +494,6 @@ public class GPU_FLIP : MonoBehaviour
         cmd.SetComputeBufferParam(cs, 1, "_Counter", _argsBuffer);
         
         cmd.DispatchCompute(cs, 1, GridSize.x / 8 + 1, GridSize.y / 8, GridSize.z / 8 + 1);
-        
-        // cmd.DrawProceduralIndirect(Matrix4x4.identity, _meshMat, 0, MeshTopology.Triangles, _argsBuffer);
     }
 
     private void Sort(CommandBuffer cmd, GPUDoubleBuffer<uint> toSort, GPUDoubleBuffer<uint> payload, int maxDigit = 32)

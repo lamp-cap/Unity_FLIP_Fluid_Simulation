@@ -104,7 +104,7 @@ Material:
     - _GlossyReflections: 0
     - _Metallic: 0
     - _OcclusionStrength: 1
-    - _Offset: 0.1
+    - _Offset: 0.072
     - _Parallax: 0.005
     - _QueueOffset: 0
     - _Range: 1
@@ -114,9 +114,9 @@ Material:
     - _SpecularHighlights: 1
     - _SrcBlend: 1
     - _SrcBlendAlpha: 1
-    - _Step: 0.1
+    - _Step: 0.089
     - _Surface: 0
-    - _Threshold: 0.5
+    - _Threshold: 0.35
     - _WorkflowMode: 1
     - _ZWrite: 1
     m_Colors:

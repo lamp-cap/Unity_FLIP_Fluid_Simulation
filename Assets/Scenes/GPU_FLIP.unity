@@ -163,7 +163,8 @@ MonoBehaviour:
   flipness: 0.975
   mouseForce: 1
   mouseForceRange: 3
-  threshold: 0.01
+  threshold: 0.5
+  drawType: 1
   meshMat: {fileID: 2100000, guid: b10ed8ca361f71d4db26639892ce1e22, type: 2}
 --- !u!4 &911704354
 Transform:
@@ -548,7 +549,7 @@ MonoBehaviour:
   m_VolumeTrigger: {fileID: 0}
   m_VolumeFrameworkUpdateModeOption: 2
   m_RenderPostProcessing: 1
-  m_Antialiasing: 3
+  m_Antialiasing: 1
   m_AntialiasingQuality: 2
   m_StopNaN: 0
   m_Dithering: 0
