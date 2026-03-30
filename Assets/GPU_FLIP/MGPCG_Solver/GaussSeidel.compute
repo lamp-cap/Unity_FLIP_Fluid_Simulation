@@ -1,0 +1,129 @@
+
+#pragma use_dxc
+#include "../FlipUtils.hlsl"
+#pragma kernel CSMain
+
+// Texture3D<float4> _Coefficients;
+Texture3D<float4> _GridCoefficientR;
+Texture3D<float> _Divergence;
+RWTexture3D<float> _Pressure;
+
+inline int LocalIdx(int3 i) { return i.x + i.y*8 + i.z * 64; }
+inline int3 LocalCoord(int i) { return int3(i%8, i/8%8, i/64); }
+
+uint _Color;
+
+[numthreads(128,1,1)]
+void CSMain (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    for (uint i = 0; i < 2; i++) 
+    {
+        uint3 localCoord = MortonD3Decode(i * 128 + gi);
+        localCoord.z = (localCoord.z << 1) | ((_Color ^ localCoord.x ^ localCoord.y) & 1);
+        int3 coord = blockBase + localCoord;
+        
+        float4 ac = _GridCoefficientR[coord];
+
+        if (IsActive(ac.x))
+        {
+            float sum = 0;
+            float4 ar = coord.x < _GridSize.x - 1 ? _GridCoefficientR[coord + uint3(1, 0, 0)] : float4(0,0,0,0);
+            float4 au = coord.y < _GridSize.y - 1 ? _GridCoefficientR[coord + uint3(0, 1, 0)] : float4(0,0,0,0);
+            float4 af = coord.z < _GridSize.z - 1 ? _GridCoefficientR[coord + uint3(0, 0, 1)] : float4(0,0,0,0);
+            sum += IsActive(ac.y) ? ac.y * _Pressure[coord - uint3(1, 0, 0)]: 0;
+            sum += IsActive(ac.z) ? ac.z * _Pressure[coord - uint3(0, 1, 0)]: 0;
+            sum += IsActive(ac.w) ? ac.w * _Pressure[coord - uint3(0, 0, 1)]: 0;
+            sum += IsActive(ar.y) ? ar.y * _Pressure[coord + uint3(1, 0, 0)]: 0;
+            sum += IsActive(au.z) ? au.z * _Pressure[coord + uint3(0, 1, 0)]: 0;
+            sum += IsActive(af.w) ? af.w * _Pressure[coord + uint3(0, 0, 1)]: 0;
+            
+            _Pressure[coord] = (_CellSize * _CellSize * _Divergence[coord] - sum) / ac.x;
+        }
+    }
+}
+
+// inline int3 FaceNeighborLocalCoord(int axis, int sgn, const int vi) {
+//     int axk = (sgn == -1) ? -1 : 8;
+//     int i = vi / 8, j = vi % 8;
+//     return axis == 0 ? int3(axk, i, j) : axis == 1 ? int3(i, axk, j) : int3(i, j, axk);
+// }
+// [numthreads(128,1,1)]
+// void CSMain (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+// {
+//     int3 blockBase = gid * 8;
+//     // load haloBock Data
+//     for (int i = 0; i < 4; i++) {
+//         // Voxel index
+//         int vi = i * 128 + gi;
+//         int3 l_ijk = LocalCoord(vi);
+//
+//         int3 coord = blockBase + l_ijk;
+//         // Load x, off-diagonal and diagonal coefficients
+//         haloBlockValue[LocalIdx(l_ijk)] = _b[coord];
+//         haloBlockValue[HaloIdx(l_ijk + 1)] = _x[coord];
+//         haloBlockCoeff[HaloIdx(l_ijk + 1)] = _Coefficients[coord];
+//     }
+//
+//
+//     Coord b_ijk = info.mTileCoord;
+//
+//     // Load boundaries for x-, y-, z- (negative) boundaries
+//     if (ti < 64) {
+//         int fi = ti;
+//         for (int axis = 0; axis < 3; axis++) 
+//         {
+//             int3 fl_ijk = FaceNeighborLocalCoord(axis, -1, fi);
+//
+//             int3 nb_ijk = b_ijk; nb_ijk[axis]--; 
+//             int3 nl_ijk = fl_ijk; nl_ijk[axis] = 7;
+//
+//             //HATileInfo<Tile> ninfo = acc.tileInfo(info.mLevel, nb_ijk);
+//             HATileInfo<Tile> ninfo = tile.mNeighbors[axis];
+//             bool empty = ninfo.empty();
+//             
+//             shared_data.xValueT(fl_ijk) = empty ? 0 : ninfo.tile()(x_channel, nl_ijk);
+//
+//             shared_data.ttypeValue(fl_ijk) = empty ? info.mType : ninfo.mType;
+//             //ttype_s[fl_ijk[0] + 1][fl_ijk[1] + 1][fl_ijk[2] + 1] = empty ? info.mType : ninfo.mType;
+//         }
+//     }
+//     else {
+//         // Load boundaries for x+, y+, z+ (positive) boundaries
+//         int fi = gi - 64;
+//         for (int axis = 0; axis < 3; axis++) {
+// 			int3 fl_ijk = FaceNeighborLocalCoord(axis, 1, fi);
+//
+//             int3 nb_ijk = b_ijk; nb_ijk[axis]++;
+//             int3 nl_ijk = fl_ijk; nl_ijk[axis] = 0;
+//
+//             //HATileInfo<Tile> ninfo = acc.tileInfo(info.mLevel, nb_ijk);
+//             HATileInfo<Tile> ninfo = tile.mNeighbors[axis + 3];
+//             bool empty = ninfo.empty();
+//
+// 			shared_data.xValueT(fl_ijk) = empty ? 0 : ninfo.tile()(x_channel, nl_ijk);
+// 			shared_data.offDiagValueT(axis, fl_ijk) = empty ? 0 : ninfo.tile()(coeff_channel + axis, nl_ijk);
+//             shared_data.ttypeValue(fl_ijk) = empty ? info.mType : ninfo.mType;
+//             //ttype_s[fl_ijk[0] + 1][fl_ijk[1] + 1][fl_ijk[2] + 1] = empty ? info.mType : ninfo.mType;
+//         }
+//     }
+//     
+//     for (int i = 0; i < 4; i++) {
+//         //voxel idx
+//         int vi = i * 128 + ti;
+//         Coord l_ijk = acc.localOffsetToCoord(vi);
+//
+//         int li = l_ijk[0], lj = l_ijk[1], lk = l_ijk[2];
+//         if ((li + lj + lk) % 2 == color) {
+//             uint8_t ctype = info.tile().type(vi);
+//             T b = info.tile()(rhs_channel, vi);
+//             T Ax = shared_data.negativeLapSameLevel(l_ijk);
+//             T D = shared_data.diagValueT(l_ijk);
+//             T delta_x = (ctype & INTERIOR) ? (b - Ax) / D : 0;
+//             //T delta_x = D == 0 ? 0 : (b - Ax) / D;
+//             //(b - Ax) / shared_data.diagValueT(l_ijk);
+//             T x1 = shared_data.xValueT(l_ijk) + delta_x;
+//             info.tile()(x_channel, vi) = x1;
+//         }
+//     }
+// }

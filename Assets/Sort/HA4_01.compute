@@ -1,0 +1,392 @@
+// Copyright (c) 2020, the YACCLAB contributors, as shown by the AUTHORS file. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be found in the LICENSE file.
+// The algorithm is presented in "A new Direct Connected Component Labeling and Analysis Algorithms for GPUs",
+// A. Hennequin, L. Lacassagne, L. Cabaret, Q. Meunier, DASIP, 2018
+// https://github.com/prittt/YACCLAB/blob/master/cuda/src/labeling_hennequin_2018_HA8.cu
+
+#pragma target 6.0
+#pragma use_dxc
+
+#pragma kernel Init
+#pragma kernel Color
+#pragma kernel StripLabeling
+#pragma kernel StripMerge
+#pragma kernel Relabeling
+
+#define WARP_SIZE 32
+#define BLOCK_H 4
+
+// StructuredBuffer<uint> img;
+// RWStructuredBuffer<uint> labels;
+Texture2D<float4> src;
+RWTexture2D<float4> debug;
+Texture2D<uint> img;
+RWTexture2D<uint> labels;
+int rows;
+int cols;
+
+inline uint2 Label2Coord(uint idx) { return uint2(idx & 65535u, idx >> 16); }
+inline uint start_distance(uint pixels, uint tx)
+{
+    if (tx == 0) return 0;
+    return 31 - asint(firstbithigh(~(pixels << (32 - tx))));
+} //count leading zeros
+inline uint end_distance(uint pixels, uint tx) { return firstbitlow(~(pixels >> (tx + 1))); }// find first set
+inline uint ReadImg(uint label) { return img[Label2Coord(label)]; }
+inline uint ReadLabel(uint label) { return labels[Label2Coord(label)] - 1; }
+inline void WriteLabel(uint index, uint label) { labels[Label2Coord(index)] = label + 1; }
+
+void merge(int label_1, int label_2)
+{
+    uint fa1 = ReadLabel(label_1);
+    while (label_1 != label_2 && (label_1 != fa1)) {
+        label_1 = fa1;
+        fa1 = ReadLabel(label_1);
+    }
+    
+    uint fa2 = ReadLabel(label_2);
+    while (label_1 != label_2 && (label_2 != fa2)) {
+        label_2 = fa2;
+        fa2 = ReadLabel(label_2);
+    }
+    while (label_1 != label_2) {
+        if (label_1 < label_2) {
+            const uint tmp = label_1;
+            label_1 = label_2;
+            label_2 = tmp;
+        }
+        uint label_3;
+        InterlockedMin(labels[Label2Coord(label_1)], label_2 + 1, label_3);
+        label_3 -= 1;
+        if (label_1 == label_3)
+            label_1 = label_2;
+        else 
+            label_1 = label_3;
+    }
+}
+
+float random(float x, float y) { return frac(sin(dot(float2(x, y), float2(12.9898, 78.233))) * 43758.5453); }
+
+[numthreads(16, 16, 1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < cols && id.y < rows) 
+        labels[id.xy] = src[id.xy].r > 0.5;
+}
+
+[numthreads(16, 16, 1)]
+void Color(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < cols && id.y < rows)
+    {
+        const uint label = img[id.xy];
+        // debug[id.xy] = float4((label > 0 ? 1 : 0).xxx, 1);
+        const uint rnd = asuint(random(label&65535, label>>16)*6553);
+        // const uint rnd = label;
+        debug[id.xy] = float4((rnd&1023)/1023.0, ((rnd>> 10) & 1023)/1023.0, ((rnd >> 20) & 1023)/1023.0, 1)*(label > 0 ? 1 : 0);
+        // debug[id.xy] = float4(frac((label&65535)/512.0), frac((label>>16)/512.0), 0, 1);
+    }
+}
+
+groupshared uint shared_pixels[BLOCK_H];
+groupshared uint shared_labels[WARP_SIZE * BLOCK_H];
+[numthreads(WARP_SIZE, BLOCK_H, 1)]
+void StripLabeling(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint GI : SV_GroupIndex, uint3 Gid : SV_GroupID)
+{
+    const uint y = DTid.y;
+    // if (y < rows)
+    {
+        int distance_y = 0;
+        int distance_y_1 = 0;
+
+        for (int i = 0; i < cols; i += WARP_SIZE)
+        {
+            const uint x = GTid.x + i;
+            // if (x < cols)
+            {
+                const uint index = (y << 16) | x;
+                const bool p_y = ReadImg(index) > 0;
+
+                // const uint pixels_y = mask & WaveActiveBallot(p_y).x;
+                const uint pixels_y = WaveActiveBallot(p_y).x;
+                uint s_dist_y = start_distance(pixels_y, GTid.x);
+                //
+                if (p_y && s_dist_y == 0)
+                    shared_labels[GI] = (index - ((GTid.x == 0) ? distance_y : 0)) + 1;
+                    // WriteLabel(index, index - ((GTid.x == 0) ? distance_y : 0));
+                else
+                    shared_labels[GI] = 0;
+
+                if (GTid.x == 0)
+                    shared_pixels[GTid.y] = pixels_y;
+                
+                GroupMemoryBarrierWithGroupSync();
+
+                const uint pixels_y_1 = (GTid.y > 0) ? shared_pixels[GTid.y - 1] : 0;
+                const bool p_y_1 = ((pixels_y_1 >> GTid.x) & 1u) > 0;
+                uint s_dist_y_1 = start_distance(pixels_y_1, GTid.x);
+                
+                // if (GTid.x == 0) {
+                //     s_dist_y = distance_y;
+                //     s_dist_y_1 = distance_y_1;
+                // }
+                
+                // Added for 8-connectivity
+                // const uint pixels_y_shifted = (pixels_y << 1) | (distance_y > 0);
+                // const uint pixels_y_1_shifted = (pixels_y_1 << 1) | (distance_y_1 > 0);
+                
+                if (p_y && p_y_1 && (s_dist_y == 0 || s_dist_y_1 == 0)) {
+                    const uint label_1 = index - s_dist_y;
+                    const uint label_2 = index - 65536u - s_dist_y_1;
+                    // InterlockedMin(labels[Label2Coord(label_1)], label_2 + 1);
+                    InterlockedMin(shared_labels[GI - s_dist_y], label_2 + 1);
+                }
+                // Added for 8-connectivity
+                // else if (p_y && s_dist_y == 0 && ((pixels_y_1_shifted >> GTid.x) & 1u)) {
+                //     const uint s_dist_y_1_prev = (GTid.x == 0) ? (distance_y_1 - 1) : start_distance(pixels_y_1, GTid.x - 1);
+                //     const uint label_1 = index;
+                //     const uint label_2 = index - 65536u - 1 - s_dist_y_1_prev;
+                //     merge(label_1, label_2);
+                // }
+                // else if (p_y_1 && s_dist_y_1 == 0 && ((pixels_y_shifted >> GTid.x) & 1u)) {
+                //     const uint s_dist_y_prev = (GTid.x == 0) ? (distance_y - 1) : (start_distance(pixels_y, GTid.x - 1));
+                //     const uint label_1 = index - 1 - s_dist_y_prev;
+                //     const uint label_2 = index - 65536u;
+                //     merge(label_1, label_2);
+                // }
+                GroupMemoryBarrierWithGroupSync();
+                if (shared_labels[GTid.y * 32 + GTid.x] > 0)
+                {
+                    const int2 base = uint2(i, Gid.y * 4);
+                    uint label = shared_labels[GI];
+                    int2 local = Label2Coord(label - 1) - base;
+                    while (local.x >= 0 && label != shared_labels[local.y * 32 + local.x])
+                    {
+                        label = shared_labels[local.y * 32 + local.x];
+                        local = Label2Coord(label - 1) - base;
+                    }
+                    WriteLabel(index, label - 1);
+                }
+                GroupMemoryBarrierWithGroupSync();
+                int d = start_distance(pixels_y_1, 32);
+                distance_y_1 = d + ((d == 32) ? distance_y_1 : 0);
+                d = start_distance(pixels_y, 32);
+                distance_y = d + ((d == 32) ? distance_y : 0);
+            }
+        }
+    }
+}
+
+groupshared uint last_dist_vec[32];  // Magic number could be removed
+groupshared uint last_dist_up_vec[32];
+
+// x: max((cols + WARP_SIZE * 30 - 1) / (WARP_SIZE * 31), 1),
+// y: (rows - 1) / BLOCK_H,
+// z: 1);
+[numthreads(32, 1, 16)] // line width 32 * 32
+void StripMerge(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
+{
+    // const uint warp_starting_x = blockIdx.x * (blockDim.x * blockDim.z - WARP_SIZE) + threadIdx.z * WARP_SIZE;
+    const uint warp_starting_x = Gid.x * (1024 - 32) + GTid.z * 32; // 32 pixels overlapping between 1024-long lines
+    const uint y = (Gid.y + 1) * BLOCK_H;
+    const uint x = warp_starting_x + GTid.x; // DTid.x
+    
+    // if (y < rows && x < cols)
+    {
+        // uint mask = 0xFFFFFFFF;
+        // if (cols - warp_starting_x < 32)
+        //     mask = mask >> (32 - (cols - warp_starting_x));
+
+        const uint index = (y << 16) | x;
+        const uint index_up = ((y - 1) << 16) | x;
+
+        const int p = ReadImg(index);
+        const int p_up = ReadImg(index_up);
+
+        const uint pixels = WaveActiveBallot(p).x;
+        const uint pixels_up = WaveActiveBallot(p_up).x;
+
+        const uint s_dist = start_distance(pixels, GTid.x);
+        const uint s_dist_up = start_distance(pixels_up, GTid.x);
+
+        if (GTid.x == WARP_SIZE - 1)
+        {
+            last_dist_vec[GTid.z] = start_distance(pixels, 32);
+            last_dist_up_vec[GTid.z] = start_distance(pixels_up, 32);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (Gid.x == 0 || GTid.z > 0)
+        {
+            // if texture width is larger than 1024,
+            // There is a 32-pixel overlapping between 1024-long lines
+            const uint last_dist = GTid.z > 0 ? last_dist_vec[GTid.z - 1] : 0;
+            const uint last_dist_up = GTid.z > 0 ? last_dist_up_vec[GTid.z - 1] : 0;
+
+            const uint p_prev = GTid.x > 0 ? ((pixels >> (GTid.x - 1)) & 1u) : last_dist;
+            const uint p_up_prev = GTid.x > 0 ? ((pixels_up >> (GTid.x - 1)) & 1u) : last_dist_up;
+
+            if (p && p_up)
+            {
+                if (s_dist == 0 || s_dist_up == 0)
+                    merge(index - s_dist, index_up - s_dist_up);
+            }
+            // else if (p && p_up_prev && s_dist == 0)
+            // {
+            //     const uint s_dist_up_prev = (GTid.x == 0) ? (last_dist_up - 1) : start_distance(pixels_up, GTid.x - 1);
+            //     merge(index, index_up - 1 - s_dist_up_prev);
+            // }
+            // else if (p_prev && p_up && s_dist_up == 0)
+            // {
+            //     const uint s_dist_prev = (GTid.x == 0) ? (last_dist - 1) : (start_distance(pixels, GTid.x - 1));
+            //     merge(index - 1 - s_dist_prev, index_up);
+            // }
+        }
+    }
+}
+
+[numthreads(WARP_SIZE, BLOCK_H, 1)]
+void Relabeling(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
+{
+    const uint y = DTid.y;
+    const uint x = DTid.x;
+
+    if (x < cols && y < rows)
+    {
+        uint mask = 0xFFFFFFFF;
+        const uint involved_cols = cols - Gid.x * WARP_SIZE;
+        if (involved_cols < WARP_SIZE)
+            mask = mask >> (WARP_SIZE - involved_cols);
+
+        const uint index = (y << 16) | x;
+
+        const int p = ReadImg(index);
+        const uint pixels = mask & WaveActiveBallot(p);
+        const uint s_dist = start_distance(pixels, GTid.x);
+        int label = 0;
+
+        if (p && s_dist == 0) {
+            label = ReadLabel(index);
+            uint fa = ReadLabel(label);
+            while (label != fa)
+            {
+                label = fa;
+                fa = ReadLabel(label);
+            }
+        }
+
+        label = WaveReadLaneAt(label, GTid.x - s_dist);
+
+        if (p)
+            WriteLabel(index, label);
+    }
+}
+
+/*
+// class HA8 : public GpuLabeling2D<Connectivity2D::CONN_8> {
+// private:
+//     dim3 grid_size_;
+//     dim3 block_size_;
+//
+// public:
+//     HA8() {}
+//
+//     void PerformLabeling() {
+//
+//         d_img_labels_.create(d_img_.size(), CV_32SC1);
+//         cudaMemset2D(d_img_labels_.data, d_img_labels_.step, 0, d_img_labels_.cols * 4, d_img_labels_.rows);
+//
+//         block_size_ = dim3(WARP_SIZE, BLOCK_H, 1);
+//         grid_size_ = dim3(
+//             1,
+//             (d_img_.rows + block_size_.y - 1) / block_size_.y,
+//             1);
+//
+//         StripLabeling << <grid_size_, block_size_ >> > (d_img_, d_img_labels_);
+//
+//         const uint horizontal_warps = std::min((d_img_.cols + WARP_SIZE - 1) / WARP_SIZE, 32);
+//         block_size_ = dim3(WARP_SIZE, 1, horizontal_warps);
+//         grid_size_ = dim3(
+//             std::max((d_img_.cols + WARP_SIZE * 30 - 1) / (WARP_SIZE * 31), 1),
+//             (d_img_.rows - 1) / BLOCK_H,
+//             1);
+//
+//         StripMerge << <grid_size_, block_size_ >> > (d_img_, d_img_labels_);
+//
+//         block_size_ = dim3(WARP_SIZE, BLOCK_H, 1);
+//         grid_size_ = dim3(
+//             (d_img_.cols + block_size_.x - 1) / block_size_.x,
+//             (d_img_.rows + block_size_.y - 1) / block_size_.y,
+//             1);
+//
+//         Relabeling << <grid_size_, block_size_ >> > (d_img_, d_img_labels_);
+//
+//         cudaDeviceSynchronize();
+//     }
+//
+//
+// private:
+//     double Alloc() {
+//
+//         perf_.start();
+//         d_img_labels_.create(d_img_.size(), CV_32SC1);
+//         cudaMemset2D(d_img_labels_.data, d_img_labels_.step, 0, d_img_labels_.cols * 4, d_img_labels_.rows);
+//         cudaDeviceSynchronize();
+//
+//         double t = perf_.stop();
+//
+//         perf_.start();
+//         cudaMemset2D(d_img_labels_.data, d_img_labels_.step, 0, d_img_labels_.cols * 4, d_img_labels_.rows);
+//         cudaDeviceSynchronize();
+//
+//         t -= perf_.stop();
+//         return t;
+//     }
+//
+//     void Dealloc() {
+//     }
+//
+//     double MemoryTransferHostToDevice() {
+//         perf_.start();
+//         d_img_.upload(img_);
+//         perf_.stop();
+//         return perf_.last();
+//     }
+//
+//     void MemoryTransferDeviceToHost() {
+//         d_img_labels_.download(img_labels_);
+//     }
+//
+//     void AllScans()
+//     {
+//         cudaMemset2D(d_img_labels_.data, d_img_labels_.step, 0, d_img_labels_.cols * 4, d_img_labels_.rows);
+//
+//         block_size_ = dim3(WARP_SIZE, BLOCK_H, 1);
+//         grid_size_ = dim3(
+//             1,
+//             (d_img_.rows + block_size_.y - 1) / block_size_.y,
+//             1);
+//
+//         StripLabeling << <grid_size_, block_size_ >> > (d_img_, d_img_labels_);
+//
+//         const uint horizontal_warps = std::min((d_img_.cols + WARP_SIZE - 1) / WARP_SIZE, 32);
+//         block_size_ = dim3(WARP_SIZE, 1, horizontal_warps);
+//         grid_size_ = dim3(
+//             std::max((d_img_.cols + WARP_SIZE * 30 - 1) / (WARP_SIZE * 31), 1),
+//             (d_img_.rows - 1) / BLOCK_H,
+//             1);
+//
+//         StripMerge << <grid_size_, block_size_ >> > (d_img_, d_img_labels_);
+//
+//         block_size_ = dim3(WARP_SIZE, BLOCK_H, 1);
+//         grid_size_ = dim3(
+//             (d_img_.cols + block_size_.x - 1) / block_size_.x,
+//             (d_img_.rows + block_size_.y - 1) / block_size_.y,
+//             1);
+//
+//         Relabeling << <grid_size_, block_size_ >> > (d_img_, d_img_labels_);
+//
+//         cudaDeviceSynchronize();
+//     }
+*/

@@ -1,0 +1,98 @@
+
+#pragma use_dxc
+
+#include "FlipUtils.hlsl"
+
+#pragma target 6.0
+#pragma enable_d3d12_debug_symbols
+
+#pragma kernel MakePair
+#pragma kernel ClearGrid
+#pragma kernel SetRange
+#pragma kernel Rearrange
+#pragma kernel BlockRange
+
+StructuredBuffer<uint> _ParticlesIDR;
+RWStructuredBuffer<uint> _ParticlesIDW;
+
+StructuredBuffer<uint> _ParticlesHashR;
+RWStructuredBuffer<uint> _ParticlesHashW;
+
+StructuredBuffer<Particle> _ParticlesR;
+RWStructuredBuffer<Particle> _ParticlesW;
+
+StructuredBuffer<uint2> _ParticlesRangeR;
+RWStructuredBuffer<uint2> _ParticlesRangeW;
+
+RWTexture3D<float> _PressureW;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void MakePair (uint3 id : SV_DispatchThreadID)
+{
+    _ParticlesIDW[id.x] = id.x;
+    _ParticlesHashW[id.x] = Coord2Idx(PositionCoord(_ParticlesR[id.x].packedPosition));
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void ClearGrid (uint3 id : SV_DispatchThreadID)
+{
+    _PressureW[id] = 0.f;
+    uint idx = Coord2Idx(id);
+    _ParticlesRangeW[idx] = uint2(_NumParticles, 0);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void SetRange(uint3 thread_id : SV_DispatchThreadID)
+{
+    const uint curr_o_id = thread_id.x;
+
+    uint max_id = _NumParticles - 1;
+    const uint prev_o_id = curr_o_id == 0 ? max_id : curr_o_id - 1;
+    const uint next_o_id = curr_o_id == max_id ? 0 : curr_o_id + 1;
+    const uint curr_c_id = _ParticlesHashR[curr_o_id];
+    const uint prev_c_id = _ParticlesHashR[prev_o_id];
+    const uint next_c_id = _ParticlesHashR[next_o_id];
+
+    if (curr_c_id != prev_c_id) _ParticlesRangeW[curr_c_id].x = curr_o_id;
+    if (curr_c_id != next_c_id) _ParticlesRangeW[curr_c_id].y = curr_o_id + 1;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void Rearrange(uint3 id : SV_DispatchThreadID)
+{
+    _ParticlesW[id.x] = _ParticlesR[_ParticlesIDR[id.x]];
+}
+
+RWStructuredBuffer<uint2> _BlockParticleRangeW;
+
+groupshared uint2 g_range[8];
+
+[numthreads(256, 1, 1)]
+void BlockRange(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint rangeStart = gid.x * 512;
+    uint2 localRange = uint2(_NumParticles, 0);
+    [unroll(2)]
+    for (int i = 0; i < 2; ++i)
+    {
+        uint idx = i*256 + gi;
+        uint2 range = _ParticlesRangeR[rangeStart + idx];
+        uint rangeX = WaveActiveMin(range.x);
+        uint rangeY = WaveActiveMax(range.y);
+        if (WaveIsFirstLane())
+            localRange = uint2(min(rangeX, localRange.x), max(rangeY, localRange.y));
+    }
+    if (WaveIsFirstLane())
+        g_range[gi / 32] = localRange;
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    if (gi < 8)
+    {
+        uint2 range = g_range[gi];
+        uint rangeX = WaveActiveMin(range.x);
+        uint rangeY = WaveActiveMax(range.y);
+        if (gi == 0) 
+            _BlockParticleRangeW[gid.x] = uint2(rangeX, rangeY);
+    }
+}

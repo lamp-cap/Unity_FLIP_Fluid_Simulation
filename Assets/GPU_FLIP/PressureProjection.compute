@@ -1,0 +1,140 @@
+#include "FlipUtils.hlsl"
+
+#pragma kernel CalcDivergence
+#pragma kernel Projection
+#pragma kernel UpdateVelocity
+#pragma kernel Vorticity
+#pragma kernel EnhanceVorticity
+
+Texture3D<uint> _GridTypesR;
+
+Texture3D<float4> _VelocityR;
+RWTexture3D<float4> _VelocityW;
+
+Texture3D<float> _DivergenceR;
+RWTexture3D<float> _DivergenceW;
+
+Texture3D<float> _PressureR;
+RWTexture3D<float> _PressureW;
+
+float _Damping;
+
+[numthreads(GROUP_THREADS_D3)]
+void CalcDivergence (uint3 id : SV_DispatchThreadID)
+{
+    float divergence = 0;
+    uint grid_types = _GridTypesR[id];
+
+    if (IsFluidCell(GetMyType(grid_types)))
+    {
+        float4 gridData = _VelocityR[id];
+        float3 vel = gridData.xyz;
+        float v_xn = id.x + 1 < _GridSize.x ? _VelocityR[id + int3(1, 0, 0)].x : 0;
+        float v_yn = id.y + 1 < _GridSize.y ? _VelocityR[id + int3(0, 1, 0)].y : 0;
+        float v_zn = id.z + 1 < _GridSize.z ? _VelocityR[id + int3(0, 0, 1)].z : 0;
+
+        float densityErr = gridData.w / 4 - 1;
+        densityErr *= densityErr > 0 ? 1 : 0.2f;
+        divergence = _InvCellSize * (v_xn - vel.x + v_yn - vel.y + v_zn - vel.z - densityErr);
+    }
+
+    _DivergenceW[id] = divergence;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void Projection (uint3 id : SV_DispatchThreadID)
+{
+    const uint grid_types = _GridTypesR[id];
+    float pressure = 0;
+
+    if (IsFluidCell(GetMyType(grid_types)))
+    {
+        // project using Jacobi iterations
+        uint3 id_xp = IsSolidCell(GetXPrevType(grid_types)) ? id : id + int3(-1,  0,  0);
+        uint3 id_xn = IsSolidCell(GetXNextType(grid_types)) ? id : id + int3( 1,  0,  0);
+        uint3 id_yp = IsSolidCell(GetYPrevType(grid_types)) ? id : id + int3( 0, -1,  0);
+        uint3 id_yn = IsSolidCell(GetYNextType(grid_types)) ? id : id + int3( 0,  1,  0);
+        uint3 id_zp = IsSolidCell(GetZPrevType(grid_types)) ? id : id + int3( 0,  0, -1);
+        uint3 id_zn = IsSolidCell(GetZNextType(grid_types)) ? id : id + int3( 0,  0,  1);
+        
+        float oldPressure = _PressureR[id];
+
+        float newPressure = -1.0 / 6.0 * (_CellSize * _CellSize * _DivergenceR[id] - 
+            (_PressureR[id_xp] + _PressureR[id_xn] + _PressureR[id_yp] + _PressureR[id_yn] + _PressureR[id_zp] + _PressureR[id_zn]));
+        
+        pressure = lerp(oldPressure, newPressure, _Damping);
+    }
+
+    _PressureW[id] = pressure;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void UpdateVelocity (uint3 id : SV_DispatchThreadID)
+{
+    uint gridTypes = _GridTypesR[id];
+    
+    float3 velocity = _VelocityW[id];
+    float3 pressure = _PressureR[id];
+
+    int3 c_id_xp = IsSolidCell(GetXPrevType(gridTypes)) ? id : id + int3(-1,  0,  0);
+    int3 c_id_yp = IsSolidCell(GetYPrevType(gridTypes)) ? id : id + int3( 0, -1,  0);
+    int3 c_id_zp = IsSolidCell(GetZPrevType(gridTypes)) ? id : id + int3( 0,  0, -1);
+
+    velocity -= _InvCellSize * (pressure - float3(_PressureR[c_id_xp], _PressureR[c_id_yp], _PressureR[c_id_zp]));
+            
+    _VelocityW[id] = float4(EnforceBoundaryCondition(velocity, gridTypes), 0);
+}
+
+
+Texture3D<float3> _VorticityR;
+RWTexture3D<float3> _VorticityW;
+
+SamplerState my_linear_Clamp_sampler;
+
+[numthreads(GROUP_THREADS_D3)]
+void Vorticity (uint3 id : SV_DispatchThreadID)
+{
+    float3 L = _VelocityR.SampleLevel(my_linear_Clamp_sampler, (id + float3(0, 0.5, 0.5))/_GridSize, 0);
+    float3 R = _VelocityR.SampleLevel(my_linear_Clamp_sampler, (id + float3(1, 0.5, 0.5))/_GridSize, 0);
+
+    float3 B = _VelocityR.SampleLevel(my_linear_Clamp_sampler, (id + float3(0.5, 0, 0.5))/_GridSize, 0);
+    float3 T = _VelocityR.SampleLevel(my_linear_Clamp_sampler, (id + float3(0.5, 1, 0.5))/_GridSize, 0);
+
+    float3 D = _VelocityR.SampleLevel(my_linear_Clamp_sampler, (id + float3(0.5, 0.5, 0))/_GridSize, 0);
+    float3 U = _VelocityR.SampleLevel(my_linear_Clamp_sampler, (id + float3(0.5, 0.5, 1))/_GridSize, 0);
+
+    float3 vorticity = 0.5 * float3(((T.z - B.z) - (U.y - D.y)), ((U.x - D.x) - (R.z - L.z)),
+                                    ((R.y - L.y) - (T.x - B.x)));
+
+    _VorticityW[id] = vorticity;
+    
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void EnhanceVorticity (uint3 id : SV_DispatchThreadID)
+{
+    uint gridTypes = _GridTypesR[id];
+    
+    if (IsFluidCell(GetMyType(gridTypes)))
+    {
+        float omegaL = length(_VorticityR[id - int3(1, 0, 0)]);
+        float omegaR = length(_VorticityR[id + int3(1, 0, 0)]);
+        float omegaB = length(_VorticityR[id - int3(0, 1, 0)]);
+        float omegaT = length(_VorticityR[id + int3(0, 1, 0)]);
+        float omegaD = length(_VorticityR[id - int3(0, 0, 1)]);
+        float omegaU = length(_VorticityR[id + int3(0, 0, 1)]);
+    
+        float3 omega = _VorticityR[id];
+    
+        float3 eta = 0.5 * float3( omegaR - omegaL, omegaT - omegaB, omegaU - omegaD );
+
+        eta = normalize( eta + float3(0.001,0.001,0.001) );
+    
+        float3 force = _DeltaTime * float3(
+            eta.y * omega.z - eta.z * omega.y,
+            eta.z * omega.x - eta.x * omega.z,
+            eta.x * omega.y - eta.y * omega.x );
+	
+        _VelocityW[id] += float4(force, 0);
+    }
+}

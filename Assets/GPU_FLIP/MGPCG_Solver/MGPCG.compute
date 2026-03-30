@@ -1,0 +1,320 @@
+#pragma use_dxc
+
+#pragma kernel SmoothRed
+#pragma kernel SmoothBlack
+#pragma kernel Restrict
+#pragma kernel Prolongate
+#pragma kernel SymmetricSmooth
+#pragma kernel Dot
+#pragma kernel Laplace
+#pragma kernel UpdateV
+
+Texture3D<float4> _coefficients;
+Texture3D<float> _b;
+RWTexture3D<float> _x;
+
+int3 _size;
+float _h;
+float _h2;
+float _ih2;
+
+inline uint Morton3DGetThirdBits(uint num) {
+    uint x = num        & 0x49249249;
+    x = (x ^ (x >> 2))  & 0xc30c30c3;
+    x = (x ^ (x >> 4))  & 0x0f00f00f;
+    x = (x ^ (x >> 8))  & 0xff0000ff;
+    x = (x ^ (x >> 16)) & 0x0000ffff;
+    return x;
+}
+
+inline uint3 MortonD3Decode(uint code)
+{
+    return uint3(Morton3DGetThirdBits(code), Morton3DGetThirdBits(code >> 1), Morton3DGetThirdBits(code >> 2));
+}
+
+inline bool IsActive(float x) { return abs(x) > 1e-5f; }
+
+inline float NeighborSum(uint3 coord, float4 ac)
+{
+    float sum = 0;
+    float4 ar = coord.x < _size.x - 1 ? _coefficients[coord + uint3(1, 0, 0)] : float4(0,0,0,0);
+    float4 au = coord.y < _size.y - 1 ? _coefficients[coord + uint3(0, 1, 0)] : float4(0,0,0,0);
+    float4 af = coord.z < _size.z - 1 ? _coefficients[coord + uint3(0, 0, 1)] : float4(0,0,0,0);
+    sum += IsActive(ac.y) ? ac.y * _x[coord - uint3(1, 0, 0)]: 0;
+    sum += IsActive(ac.z) ? ac.z * _x[coord - uint3(0, 1, 0)]: 0;
+    sum += IsActive(ac.w) ? ac.w * _x[coord - uint3(0, 0, 1)]: 0;
+    sum += IsActive(ar.y) ? ar.y * _x[coord + uint3(1, 0, 0)]: 0;
+    sum += IsActive(au.z) ? au.z * _x[coord + uint3(0, 1, 0)]: 0;
+    sum += IsActive(af.w) ? af.w * _x[coord + uint3(0, 0, 1)]: 0;
+            
+    return sum;
+}
+
+void RedBlackGaussianSeidel(uint i, uint3 blockBase, uint color)
+{
+    for (int iter = 0; iter < 2; iter++) 
+    {
+        uint3 localCoord = MortonD3Decode(iter * 128 + i);
+        localCoord.z = (localCoord.z << 1) | ((color ^ localCoord.x ^ localCoord.y) & 1);
+        int3 coord = blockBase + localCoord;
+        
+        float4 ac = _coefficients[coord];
+
+        if (abs(ac.x) > 1e-5f)
+            _x[coord] = lerp(_x[coord], (_h2 * _b[coord] - NeighborSum(coord, ac)) / ac.x, 1.2);
+    }
+}
+
+[numthreads(128,1,1)]
+void SmoothRed (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    RedBlackGaussianSeidel(gi, blockBase, 0);
+}
+
+[numthreads(128,1,1)]
+void SmoothBlack (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    RedBlackGaussianSeidel(gi, blockBase, 1);
+}
+
+Texture3D<float4> _af;
+RWTexture3D<float4> _ac;
+
+Texture3D<float> _rf;
+RWTexture3D<float> _rc;
+
+Texture3D<float> _ecR;
+RWTexture3D<float> _ecW;
+
+Texture3D<float> _efR;
+RWTexture3D<float> _efW;
+
+StructuredBuffer<uint> _counterR; // 0: rz_old  1: pAp
+RWStructuredBuffer<uint> _counterW; // 0: rz_old  1: pAp
+
+inline float NeighborSum(Texture3D<float> x, Texture3D<float4> a,uint3 coord, float4 ac, out float ace)
+{
+    float sum = 0;
+    float4 ar = coord.x < _size.x - 1 ? a[coord + uint3(1, 0, 0)] : float4(0,0,0,0);
+    float4 au = coord.y < _size.y - 1 ? a[coord + uint3(0, 1, 0)] : float4(0,0,0,0);
+    float4 af = coord.z < _size.z - 1 ? a[coord + uint3(0, 0, 1)] : float4(0,0,0,0);
+    sum += IsActive(ac.y) ? ac.y * x[coord - uint3(1, 0, 0)]: 0;
+    sum += IsActive(ac.z) ? ac.z * x[coord - uint3(0, 1, 0)]: 0;
+    sum += IsActive(ac.w) ? ac.w * x[coord - uint3(0, 0, 1)]: 0;
+    sum += IsActive(ar.y) ? ar.y * x[coord + uint3(1, 0, 0)]: 0;
+    sum += IsActive(au.z) ? au.z * x[coord + uint3(0, 1, 0)]: 0;
+    sum += IsActive(af.w) ? af.w * x[coord + uint3(0, 0, 1)]: 0;
+    
+    ace = ac.x * x[coord];
+            
+    return sum;
+}
+
+[numthreads(128,1,1)]
+void Restrict (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    for (int iter = 0; iter < 4; iter++)
+    {
+        uint3 localCoord = MortonD3Decode(iter * 128 + gi);
+        int3 coordC = blockBase + localCoord;
+        
+        float rCoarse = 0;
+        float4 aCoarse = 0;
+        for (int zz = 0; zz < 2; zz++)
+        for (int yy = 0; yy < 2; yy++)
+        for (int xx = 0; xx < 2; xx++)
+        {
+            int3 coordF = coordC * 2 + int3(xx, yy, zz);
+            float4 aFine = _af[coordF];
+            if (!IsActive(aFine.x)) 
+                continue;
+            aCoarse.x += aFine.x;
+            float ac;
+            float sum = NeighborSum(_efR, _af, coordF, aFine, ac);
+            float rFine = _rf[coordF] - _ih2 * (ac + sum);
+            rCoarse += rFine;
+                
+            if (xx == 0) aCoarse.y += aFine.y;
+            else aCoarse.x += aFine.y * 2;
+                
+            if (yy == 0) aCoarse.z += aFine.z;
+            else aCoarse.x += aFine.z * 2;
+                
+            if (zz == 0) aCoarse.w += aFine.w;
+            else aCoarse.x += aFine.w * 2;
+        }
+
+        _rc[coordC] = rCoarse * 0.125f;
+        _ac[coordC] = aCoarse * 0.125f;
+        _ecW[coordC] = 0;
+    }
+}
+
+[numthreads(128,1,1)]
+void Prolongate (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    for (int iter = 0; iter < 4; iter++)
+    {
+        uint3 localCoord = MortonD3Decode(iter * 128 + gi);
+        int3 coordF = blockBase + localCoord;
+        
+        float4 a = _af[coordF];
+        if (!IsActive(a.x)) return;
+        _efW[coordF] += _ecR[coordF >> 1] * 2;
+    }
+}
+
+groupshared float g_x[16][8][8];
+groupshared float g_b[16][8][8];
+groupshared float4 g_a[16][8][8];
+
+[numthreads(16,8,8)]
+void SymmetricSmooth (uint3 id : SV_DispatchThreadID)
+{
+    // load Bock Data
+    g_x[id.x][id.y][id.z] = _x[id];
+    g_a[id.x][id.y][id.z] = _coefficients[id];
+    GroupMemoryBarrierWithGroupSync();
+    
+    float b = _b[id];
+    
+    float4 a0 = g_a[id.x][id.y][id.z];
+    float4 a1 = float4(0,   id.x < 16 ? g_a[id.x+1][id.y][id.z].y : 0,
+                            id.y < 16 ? g_a[id.x][id.y+1][id.z].z : 0,
+                            id.z < 16 ? g_a[id.x][id.y][id.z+1].w : 0);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        if (((id.x ^ id.y ^ id.z) & 1) == 0 && IsActive(a0.x))
+        {
+            float sum = 0;
+            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
+            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
+            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
+            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
+            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
+            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
+            
+            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
+        }
+        
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (((id.x ^ id.y ^ id.z) & 1) == 1 && IsActive(a0.x))
+        {
+            float sum = 0;
+            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
+            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
+            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
+            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
+            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
+            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
+            
+            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (((id.x ^ id.y ^ id.z) & 1) == 1 && IsActive(a0.x))
+        {
+            float sum = 0;
+            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
+            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
+            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
+            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
+            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
+            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
+            
+            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
+        }
+        
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (((id.x ^ id.y ^ id.z) & 1) == 0 && IsActive(a0.x))
+        {
+            float sum = 0;
+            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
+            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
+            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
+            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
+            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
+            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
+            
+            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    _x[id] = g_x[id.x][id.y][id.z];
+    
+    if (id.x < 2) _counterW[id.x] = 0;
+}
+
+Texture3D<float> _lhs;
+Texture3D<float> _rhs;
+
+#define SCALER 4096.0
+
+groupshared uint g_sum;
+uint _Index;
+
+[numthreads(128, 1, 1)]
+void Dot (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    if (gi == 0)
+        g_sum = 0;
+    GroupMemoryBarrierWithGroupSync();
+    int3 blockBase = gid * 8;
+    float sum = 0;
+    for (int iter = 0; iter < 4; iter++) 
+    {
+        uint3 localCoord = MortonD3Decode(iter * 128 + gi);
+        int3 coord = blockBase + localCoord;
+        
+        float dot = _lhs[coord] * _rhs[coord];
+        sum += WaveActiveSum(dot);
+    }
+    if (WaveIsFirstLane())
+    {
+        InterlockedAdd(g_sum, (uint)round(sum * SCALER));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0)
+        InterlockedAdd(_counterW[_Index], g_sum);
+}
+
+Texture3D<float> _p;
+RWTexture3D<float> _Ap;
+
+[numthreads(128, 1, 1)]
+void Laplace (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    for (int iter = 0; iter < 4; iter++)
+    {
+        uint3 localCoord = MortonD3Decode(iter * 128 + gi);
+        uint3 coord = blockBase + localCoord;
+        
+        float4 aFine = _coefficients[coord];
+        if (!IsActive(aFine.x)) 
+            continue;
+
+        float ac;
+        float sum = NeighborSum(_p, _coefficients, coord, aFine, ac);
+        _Ap[coord] = _ih2 * (ac + sum);
+    }
+}
+
+[numthreads(128, 1, 1)]
+void UpdateV (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+    int3 blockBase = gid * 8;
+    for (int iter = 0; iter < 4; iter++)
+    {
+        uint3 localCoord = MortonD3Decode(iter * 128 + gi);
+        uint3 coord = blockBase + localCoord;
+        
+        _x[coord] = ((float)_counterR[0] / (float)_counterR[1]) * _p[coord];
+    }
+}

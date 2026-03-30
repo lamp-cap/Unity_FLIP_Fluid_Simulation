@@ -1,0 +1,40 @@
+# 核心忽略：这些是Unity自动生成的本地缓存和编译临时文件
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+
+# 内存快照文件，可能很大且包含敏感信息
+/[Mm]emoryCaptures/
+
+# 自动生成的Visual Studio / Rider项目文件
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+
+# 编译生成的二进制文件
+*.dll
+*.pdb
+*.mdb
+
+# 操作系统或IDE生成的元数据
+.DS_Store
+.vs/
+.idea/
+
+# 打包或导出的文件
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# Addressables可寻址资源系统的缓存文件
+/[Aa]ssets/[Aa]ddressable[Aa]ssets[Dd]ata/*/*.bin*

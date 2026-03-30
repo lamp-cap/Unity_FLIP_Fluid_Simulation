@@ -1,0 +1,113 @@
+#pragma use_dxc
+#pragma target 6.0
+
+#pragma kernel Init
+#pragma kernel DecoupledLookbackScan
+
+#define PARTITION_SIZE      512
+#define FLAG_INVALID        0u
+#define FLAG_AGGREGATE      1u
+#define FLAG_PREFIX         2u
+
+RWStructuredBuffer<uint> toScan;
+RWStructuredBuffer<uint> totalVertCount;         // total count
+
+globallycoherent RWStructuredBuffer<uint> partitionCounter; // init with 0
+globallycoherent RWStructuredBuffer<uint> partitionDescriptors; // init with 0
+
+uint numElements;
+uint numPartitions;
+
+[numthreads(128, 1, 1)]
+void Init(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x == 0) partitionCounter[0] = 0;
+    if (id.x < numPartitions) partitionDescriptors[id.x] = 0;
+}
+
+// 用于分配 partition ID 的原子计数器
+groupshared uint sharedData[16];
+groupshared uint partitionIndex;
+groupshared uint sharedPrefix;
+
+[numthreads(PARTITION_SIZE, 1, 1)]
+void DecoupledLookbackScan(uint id : SV_GroupIndex) 
+{
+    // it won't work by group id order, so assign Partition by atomic add
+    if (id == 0) 
+    {
+        InterlockedAdd(partitionCounter[0], 1u, partitionIndex);
+        sharedPrefix = 0;
+    }
+    int wid = id / 32;
+    GroupMemoryBarrierWithGroupSync();
+    uint pid = partitionIndex;
+    // === 加载数据到 shared memory ===
+    uint globalIdx = pid * PARTITION_SIZE + id;
+    
+    uint val = toScan[globalIdx];
+    uint localInclusive = WavePrefixSum(val) + val;
+    
+    if (WaveGetLaneIndex() == 31) sharedData[wid] = localInclusive;
+    GroupMemoryBarrierWithGroupSync();
+    
+    if (id < 16)
+    {
+        sharedData[id] += WavePrefixSum(sharedData[id]);
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    uint aggregate = sharedData[15];
+    
+    // publish the aggregate
+    if (id == 0) 
+    {
+        if (pid == 0) 
+            partitionDescriptors[pid] = FLAG_PREFIX | (aggregate << 2);
+        else
+            // if the last group has finished，there will be exclusive << 2 | FLAG_AGGREGATE,
+            // it will be finished after add current group's value
+            InterlockedAdd(partitionDescriptors[pid], (FLAG_AGGREGATE | (aggregate << 2)));
+    }
+    
+    // === Look-back   only id==0 ===
+    // look at current at first, if not finished, look back
+    if (id == 0) 
+    {
+        int lookback = pid;
+        uint lookbackReduction = 0;
+        for (int spinCount = 0; spinCount < 10000 && lookback >= 0; ++spinCount) 
+        {
+            const uint desc = partitionDescriptors[lookback];
+            if ((desc & 3) == FLAG_PREFIX) {
+                // 找到了已确定的 prefix，结束
+                lookbackReduction += desc >> 2;
+                // 更新后一个的状态
+                if (pid < numPartitions - 1)
+                    InterlockedAdd(partitionDescriptors[pid + 1], 1 | lookbackReduction << 2);
+        
+                sharedPrefix = lookbackReduction - aggregate;
+                break;
+            }
+            
+            if ((desc & 3) == FLAG_AGGREGATE) 
+            {
+                // FLAG_AGGREGATE: 继续往前看
+                lookbackReduction += desc >> 2;
+                lookback--;
+            }
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // === 写出最终结果 ===
+    if (globalIdx < numElements) {
+        toScan[globalIdx] = sharedPrefix + localInclusive - val + (wid > 0 ? sharedData[wid - 1] : 0);
+    }
+    // 最后一个 partition 的最后一个有效线程写出总数
+    if (pid == numPartitions - 1 && id == 0) {
+        totalVertCount[0] = sharedPrefix + aggregate;
+    }
+}

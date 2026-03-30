@@ -1,0 +1,7 @@
+﻿#pragma kernel PrefixScan
+#pragma kernel AddGroupSum
+
+#pragma use_dxc
+#pragma target 6.0
+
+#include "../GPUPrefixScan.hlsl"

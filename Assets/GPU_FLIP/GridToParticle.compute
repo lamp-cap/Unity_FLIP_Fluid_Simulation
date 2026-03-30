@@ -1,0 +1,91 @@
+#pragma use_dxc
+
+#include "FlipUtils.hlsl"
+
+#pragma kernel G2P
+#pragma kernel Advection
+
+RWStructuredBuffer<Particle> _Particles;
+
+Texture3D<float4> _VelocityOldR;
+Texture3D<float4> _VelocityR;
+
+float _Flipness;
+
+inline float3 WorldPosToGrid(const float3 pos)
+{
+    return (pos - _GridMin) * _InvCellSize;
+}
+
+SamplerState my_linear_clamp_sampler;
+
+inline float3 SampleGrid(float3 pos, Texture3D<float4> gridData)
+{
+    return float3(
+        gridData.SampleLevel(my_linear_clamp_sampler, (pos * _InvCellSize + float3(0.5f, 0, 0)) / _GridSize, 0).x,
+        gridData.SampleLevel(my_linear_clamp_sampler, (pos * _InvCellSize + float3(0, 0.5f, 0)) / _GridSize, 0).y,
+        gridData.SampleLevel(my_linear_clamp_sampler, (pos * _InvCellSize + float3(0, 0, 0.5f)) / _GridSize, 0).z);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void G2P (uint3 id : SV_DispatchThreadID)
+{
+    const uint p_id = id.x;
+
+    Particle p = _Particles[p_id];
+
+    float3 pos = DecodePosition(p.packedPosition);
+    const float3 origin_vel = SampleGrid(pos, _VelocityOldR);
+    const float3 vel = SampleGrid(pos, _VelocityR);
+
+    const float3 pic_vel = vel;
+    const float3 flip_vel = DecodeVelocity(p.packedVelocity) + (vel - origin_vel);
+
+    _Particles[p_id].packedVelocity = EncodeVelocity(lerp(pic_vel, flip_vel, _Flipness));
+}
+
+#define POSITION_EPSILON  0.01f
+
+inline void ClampPosition(inout float3 position, float3 grid_min, float3 grid_max)
+{
+    position = clamp(position, (grid_min + POSITION_EPSILON) * _CellSize, (grid_max - POSITION_EPSILON) * _CellSize);
+}
+
+#define USE_RK3
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void Advection (uint3 id : SV_DispatchThreadID)
+{
+    const uint p_id = id.x;
+
+    Particle p = _Particles[p_id];
+
+    float3 pos = DecodePosition(p.packedPosition);
+    float3 vel = DecodeVelocity(p.packedVelocity);
+    // https://en.wikipedia.org/wiki/List_of_Runge-Kutta_methods
+    
+    #if defined(USE_RK3)
+    // advect using RK3 (Ralston's third-order method)
+    const float3 k1 = SampleGrid(pos, _VelocityR);
+    const float3 k2 = SampleGrid(pos + 0.5f * _DeltaTime * k1, _VelocityR);
+    const float3 k3 = SampleGrid(pos + 0.75f * _DeltaTime * k2, _VelocityR);
+    const float3 velocity = 2.0f / 9.0f * k1 + 1.0f / 3.0f * k2 + 4.0f / 9.0f * k3;
+    #elif defined(USE_RK2)
+    // advect using RK2 (Explicit midpoint method)
+    const float3 k1 = SampleGrid(pos, _VelocityR);
+    const float3 k2 = SampleGrid(pos + 0.5f * _DeltaTime * k1, _VelocityR);
+    const float3 velocity = k2;
+    #else
+    // advect using RK1 (Forward Euler)
+    const float3 k1 = SampleGrid(pos, _VelocityR);
+    const float3 velocity = 1.0f * k1;
+    #endif
+
+    pos += velocity * _DeltaTime;
+
+    p.packedVelocity = EncodeVelocity(pos < 0 ? max(0, vel) : vel);
+    ClampPosition(pos, _GridMin, _GridMin + _GridSize);
+
+    p.packedPosition = EncodePosition(pos);
+    _Particles[p_id] = p;
+}

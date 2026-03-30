@@ -1,0 +1,130 @@
+#pragma use_dxc
+
+#include "FlipUtils.hlsl"
+
+#pragma kernel P2G
+#pragma kernel SetGridType
+#pragma kernel AddForce
+#pragma kernel Normalize
+
+float4 _Gravity;
+
+StructuredBuffer<Particle> _Particles;
+StructuredBuffer<uint2> _ParticlesRange;
+
+RWTexture3D<float4> _VelocityW;
+
+Texture3D<float4> _VelocityOldR;
+RWTexture3D<float4> _VelocityOldW;
+
+Texture3D<uint> _GridTypesR;
+RWTexture3D<uint> _GridTypesW;
+
+static const float KernelPoly6 = 315.0f / (64.0f * 3.14159265);
+
+static float SmoothingKernelPoly6(float r2)
+{
+    if (r2 < 1)
+    {
+        float v = 1 - r2;
+        return v * v * v * KernelPoly6;
+    }
+
+    return 0;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void P2G (uint3 id : SV_DispatchThreadID)
+{
+    float3 cellCenter = ((float3)id + 0.5f) * _CellSize;
+    uint3 coordMin = max((int3)id - 1, 0);
+    uint3 coordMax = min(id + 1, _GridSize - 1);
+    float density = 0;
+    float3 weightSum = 0;
+    float3 velocitySum = 0;
+    
+    float3 position_vx = cellCenter + float3(-0.5f * _CellSize, 0, 0);
+    float3 position_vy = cellCenter + float3(0, -0.5f * _CellSize, 0);
+    float3 position_vz = cellCenter + float3(0, 0, -0.5f * _CellSize);
+    
+    for (uint z = coordMin.z; z <= coordMax.z; ++z)
+    for (uint y = coordMin.y; y <= coordMax.y; ++y)
+    for (uint x = coordMin.x; x <= coordMax.x; ++x)
+    {
+        uint2 range = _ParticlesRange[Coord2Idx(x, y, z)];
+        for (uint pid = range.x; pid < range.y; ++pid)
+        {
+            Particle p = _Particles[pid];
+            float3 pos = DecodePosition(p.packedPosition);
+                
+            float3 weights = float3(
+                GetWeight(pos, position_vx, _InvCellSize),
+                GetWeight(pos, position_vy, _InvCellSize),
+                GetWeight(pos, position_vz, _InvCellSize));
+            
+            weightSum += weights;
+            velocitySum += weights * DecodeVelocity(p.packedVelocity);
+            float3 vec = pos - cellCenter;
+            density += SmoothingKernelPoly6(dot(vec, vec) * _InvCellSize * _InvCellSize);
+        }
+    }
+    
+    _VelocityOldW[id] = float4(weightSum > 1e-7f ? velocitySum / weightSum : 0, density);
+}
+
+inline uint GetType(uint2 range)
+{
+    return range.y > range.x ? FLUID : AIR;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void SetGridType (uint3 id : SV_DispatchThreadID)
+{
+    uint3 grid_max = _GridSize - 1;
+
+    const uint gridType = GetType(_ParticlesRange[Coord2Idx(id)]);
+    const uint xp_type = id.x == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(-1, 0, 0))]);
+    const uint xn_type = id.x == grid_max.x ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(1, 0, 0))]);
+    const uint yp_type = id.y == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(0, -1, 0))]);
+    const uint yn_type = id.y == grid_max.y ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(0, 1, 0))]);
+    const uint zp_type = id.z == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(0, 0, -1))]);
+    const uint zn_type = id.z == grid_max.z ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(0, 0, 1))]);
+
+    _GridTypesW[id] = PackGridTyped(gridType, xp_type, xn_type, yp_type, yn_type, zp_type, zn_type);
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void Normalize (uint3 id : SV_DispatchThreadID)
+{
+}
+
+float3 _RayOrigin;
+float3 _RayDirection;
+float4 _MouseForceParameter; // x,y,z: Force w: Range
+
+inline float GetMouseForce(float3 position)
+{
+    const float distance_to_mouse_ray = length(cross(_RayDirection, position - _RayOrigin));
+    const float normalized_distance = distance_to_mouse_ray / _MouseForceParameter.w;
+    return smoothstep(1.0, 0.9, normalized_distance);
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void AddForce (uint3 id : SV_DispatchThreadID)
+{
+    uint grid_types = _GridTypesR[id];
+    
+    // forward Euler time integration
+    float4 velocity = _VelocityOldR[id] + _Gravity * _DeltaTime;
+    
+    // add mouse force
+    const float3 position = id * _CellSize;
+    const float3 position_vx = position + float3(-0.5f * _InvCellSize, 0.0f, 0.0f);
+    const float3 position_vy = position + float3(0.0f, -0.5f * _InvCellSize, 0.0f);
+    const float3 position_vz = position + float3(0.0f, 0.0f, -0.5f * _InvCellSize);
+    float3 mouse_force = float3(GetMouseForce(position_vx), GetMouseForce(position_vy), GetMouseForce(position_vz));
+    mouse_force *= _MouseForceParameter.xyz;
+    velocity.xyz += mouse_force * _DeltaTime;
+    
+    _VelocityW[id] = float4(EnforceBoundaryCondition(velocity, grid_types), velocity.w);
+}

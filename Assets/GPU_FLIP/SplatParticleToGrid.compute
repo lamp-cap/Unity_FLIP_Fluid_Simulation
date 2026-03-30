@@ -1,0 +1,314 @@
+#pragma use_dxc
+#pragma target 6.0
+
+#include "FlipUtils.hlsl"
+#pragma kernel P2G
+#pragma kernel SetGridType
+#pragma kernel AddForce
+#pragma kernel Normalize
+#pragma kernel ClearGridWeight
+
+float4 _Gravity;
+
+StructuredBuffer<Particle> _Particles;
+StructuredBuffer<uint2> _ParticlesRange;
+
+RWTexture3D<float4> _VelocityW;
+
+Texture3D<float4> _VelocityOldR;
+RWTexture3D<float4> _VelocityOldW;
+
+RWTexture3D<float4> _GridCoefficientW;
+
+RWTexture3D<uint> _GridTypesR;
+RWTexture3D<uint> _GridTypesW;
+
+StructuredBuffer<int> _WeightsSumR;
+RWStructuredBuffer<int> _WeightsSumW;
+
+StructuredBuffer<uint2> _BlockParticleRangeR;
+
+static const float KernelPoly6 = 315.0f / (64.0f * 3.14159265);
+
+static float SmoothingKernelPoly6(float r2)
+{
+    if (r2 < 1)
+    {
+        float v = 1 - r2;
+        return v * v * v * KernelPoly6;
+    }
+
+    return 0;
+}
+
+int _Color;
+
+//quadratic kernel used by MPM and PFM
+//does not guard 1.5
+float QuadraticKernelFast(const float x) {
+	float abs_x = abs(x);
+	float ret = abs_x < 0.5f ? (0.75f - abs_x * abs_x) : (0.5f * (1.5f - abs_x) * (1.5f - abs_x));
+	return ret;
+}
+float QuadraticKernel(const float x) {
+	float abs_x = abs(x);
+	return abs_x < 0.5f ? (0.75f - abs_x * abs_x) : (0.5f * (1.5f - abs_x) * (1.5f - abs_x));
+}
+float3 QuadraticKernel(const float3 x) {
+	float3 abs_x = abs(x);
+	return abs_x < 0.5f ? (0.75f - abs_x * abs_x) : (0.5f * (1.5f - abs_x) * (1.5f - abs_x));
+}
+inline float3 faceCenter(const int axis, const int3 s_ijk)
+{
+	float3 offset = 0.5f;
+	offset[axis] = 0;
+	float3 center = ((float3)s_ijk + offset) * _CellSize;
+
+	return center;
+}
+
+inline int LocalIdx(int3 coord)
+{
+	return coord.x + coord.y * 10 + coord.z * 100;
+}
+inline int3 LocalCoord(int i)
+{
+	return int3(i%10, i/10%10, i/100);
+}
+
+#define SCALER 2048.0
+
+groupshared int g_dataSum[10 * 10 * 10 * 7]; // velocity 3 + weights 3 + density 1
+
+void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
+{
+	float3 pos = DecodePosition(p.packedPosition);
+	float3 vel = DecodeVelocity(p.packedVelocity);
+
+	// 2. Compute base voxel index and fractional offset
+	int3 pCoord = PositionCoord(p.packedPosition);
+	int3 localCoord = pCoord - coordMin;
+	
+	// 计算分界点
+	int laneid = WaveGetLaneIndex();
+	int local_idx = LocalIdx(localCoord);
+	bool is_boundary = WaveIsFirstLane();
+	if (!is_boundary)
+	{
+		int prev_idx = WaveReadLaneAt(local_idx, laneid - 1);
+		is_boundary = prev_idx != local_idx;
+	}
+
+	// 构造分界点掩码
+	uint mark = reversebits(WaveActiveBallot(is_boundary));
+	uint chk = laneid < 31 ? ((mark << (laneid + 1)) | ((1U << (laneid + 1)) - 1)) : 0xFFFFFFFF;
+	int interval = 31 - asint(firstbithigh(chk));  // 从当前线程开始的连续 0 数量
+	int iter = WaveActiveMax(interval);
+
+	// 3. Iterate over 3x3x3 neighborhood
+	for (int offi = -1; offi <= 1; ++offi)
+	for (int offj = -1; offj <= 1; ++offj)
+	for (int offk = -1; offk <= 1; ++offk) 
+	{
+		int3 neighborCoord = pCoord + int3(offi, offj, offk);
+
+		float3 cellCenter = (neighborCoord + 0.5f) * _CellSize;
+		float3 position_vx = cellCenter + float3(-0.5f * _CellSize, 0, 0);
+		float3 position_vy = cellCenter + float3(0, -0.5f * _CellSize, 0);
+		float3 position_vz = cellCenter + float3(0, 0, -0.5f * _CellSize);
+
+		float3 weights = float3(
+			GetWeight(pos, position_vx, _InvCellSize),
+			GetWeight(pos, position_vy, _InvCellSize),
+			GetWeight(pos, position_vz, _InvCellSize));
+
+		float3 warp_velocity_sum = weights * vel;
+		float3 warp_weight_sum = weights;
+		
+		float3 vec = pos - cellCenter;
+		float density = SmoothingKernelPoly6(dot(vec, vec) * _InvCellSize * _InvCellSize);
+
+		int stride = 1;
+		while (stride <= iter) 
+		{
+			float3 neighbor_velocity = WaveReadLaneAt(warp_velocity_sum, laneid + stride);
+			float3 neighbor_weights = WaveReadLaneAt(warp_weight_sum, laneid + stride);
+			float3 neighbor_density = WaveReadLaneAt(density, laneid + stride);
+			if (stride <= interval) {
+				warp_velocity_sum += neighbor_velocity;
+				warp_weight_sum += neighbor_weights;
+				density += neighbor_density;
+			}
+
+			stride <<= 1;
+		}
+
+		int index = LocalIdx(localCoord + int3(offi, offj, offk));
+		bool is_valid = all(neighborCoord >= 0) && all(neighborCoord < _GridSize) && index >= 0 && index < 1000;
+
+		if (is_boundary && is_valid)
+		{
+			InterlockedAdd(g_dataSum[index + 0 * 1000], (int)round(warp_velocity_sum.x * SCALER));
+			InterlockedAdd(g_dataSum[index + 1 * 1000], (int)round(warp_velocity_sum.y * SCALER));
+			InterlockedAdd(g_dataSum[index + 2 * 1000], (int)round(warp_velocity_sum.z * SCALER));
+
+			InterlockedAdd(g_dataSum[index + 3 * 1000], (int)round(warp_weight_sum.x * SCALER));
+			InterlockedAdd(g_dataSum[index + 4 * 1000], (int)round(warp_weight_sum.y * SCALER));
+			InterlockedAdd(g_dataSum[index + 5 * 1000], (int)round(warp_weight_sum.z * SCALER));
+			
+			InterlockedAdd(g_dataSum[index + 6 * 1000], (int)round(density * SCALER));
+		}
+	}
+}
+
+#define SPLAT_SIZE 128
+
+[numthreads(SPLAT_SIZE, 1, 1)]
+void P2G (uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+	// clear group shared array
+	for (int i = 0; i < 1000; i += SPLAT_SIZE)
+	{
+		int idx = gi + i;
+		if (idx < 1000)
+		{
+			[unroll(7)]
+			for (int j = 0; j < 7; ++j)
+				g_dataSum[idx * 7 + j] = 0;
+		}
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+    // use Z-order curve
+    int3 coord0 = (int3)gid * 8;
+	uint2 range = _BlockParticleRangeR[Coord2Idx(gid)];
+    int3 coordMin = coord0 - 1;
+ 
+	if (range.x < range.y)
+	{
+		int num_groups = (range.y - range.x + SPLAT_SIZE - 1) / SPLAT_SIZE;
+		for (uint i = 0; i < num_groups; i++)
+		{
+			uint pid = range.x + SPLAT_SIZE * i + gi;
+			if (pid < range.y)
+			{
+				ScatterParticleToSharedBlock(_Particles[pid], coordMin);
+			}
+		}
+	}
+	
+    GroupMemoryBarrierWithGroupSync();
+
+	for (int i = 0; i < 1000; i += SPLAT_SIZE)
+	{
+		int idx = gi + i;
+		if (idx < 1000)
+		{
+			int3 localCoord = LocalCoord(idx);
+			int3 globalCoord = coordMin + localCoord;
+			if (range.x < range.y && all(globalCoord < _GridSize) && all(globalCoord >= 0))
+			{
+				int globalIdx = Morton3DEncode(globalCoord);
+				if (all(localCoord > 1) && all(localCoord < 8))
+				{
+					_WeightsSumW[globalIdx + 0 * _NumCells] = g_dataSum[idx + 0 * 1000];
+					_WeightsSumW[globalIdx + 1 * _NumCells] = g_dataSum[idx + 1 * 1000];
+					_WeightsSumW[globalIdx + 2 * _NumCells] = g_dataSum[idx + 2 * 1000];
+					_WeightsSumW[globalIdx + 3 * _NumCells] = g_dataSum[idx + 3 * 1000];
+					_WeightsSumW[globalIdx + 4 * _NumCells] = g_dataSum[idx + 4 * 1000];
+					_WeightsSumW[globalIdx + 5 * _NumCells] = g_dataSum[idx + 5 * 1000];
+					_WeightsSumW[globalIdx + 6 * _NumCells] = g_dataSum[idx + 6 * 1000];
+				}
+				else
+				{
+					InterlockedAdd(_WeightsSumW[globalIdx + 0*_NumCells], g_dataSum[idx + 0*1000]);
+					InterlockedAdd(_WeightsSumW[globalIdx + 1*_NumCells], g_dataSum[idx + 1*1000]);
+					InterlockedAdd(_WeightsSumW[globalIdx + 2*_NumCells], g_dataSum[idx + 2*1000]);
+					InterlockedAdd(_WeightsSumW[globalIdx + 3*_NumCells], g_dataSum[idx + 3*1000]);
+					InterlockedAdd(_WeightsSumW[globalIdx + 4*_NumCells], g_dataSum[idx + 4*1000]);
+					InterlockedAdd(_WeightsSumW[globalIdx + 5*_NumCells], g_dataSum[idx + 5*1000]);
+					InterlockedAdd(_WeightsSumW[globalIdx + 6*_NumCells], g_dataSum[idx + 6*1000]);
+				}
+			}
+		}
+	}
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void Normalize (uint3 id : SV_DispatchThreadID)
+{
+	int idx = Morton3DEncode(id);
+	int data0 = _WeightsSumR[idx + 0 * _NumCells];
+	int data1 = _WeightsSumR[idx + 1 * _NumCells];
+	int data2 = _WeightsSumR[idx + 2 * _NumCells];
+	int data3 = _WeightsSumR[idx + 3 * _NumCells];
+	int data4 = _WeightsSumR[idx + 4 * _NumCells];
+	int data5 = _WeightsSumR[idx + 5 * _NumCells];
+	int data6 = _WeightsSumR[idx + 6 * _NumCells];
+	float3 velocity = float3(data0, data1, data2) / SCALER;
+    float4 weights = float4(data3, data4, data5, data6) / SCALER;
+    _VelocityOldW[id] = float4(
+        EnforceBoundaryCondition(velocity/max(1e-5f, weights.xyz), _GridTypesR[id]), weights.w);
+}
+
+inline uint GetType(uint2 range)
+{
+	return range.y > range.x ? FLUID : AIR;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void SetGridType (uint3 id : SV_DispatchThreadID)
+{
+	uint3 grid_max = _GridSize - 1;
+
+	const uint gridType = GetType(_ParticlesRange[Coord2Idx(id)]);
+	const uint xp_type = id.x == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(-1, 0, 0))]);
+	const uint xn_type = id.x == grid_max.x ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(1, 0, 0))]);
+	const uint yp_type = id.y == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(0, -1, 0))]);
+	const uint yn_type = id.y == grid_max.y ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(0, 1, 0))]);
+	const uint zp_type = id.z == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(0, 0, -1))]);
+	const uint zn_type = id.z == grid_max.z ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(0, 0, 1))]);
+
+	float center = 6 - (xp_type >> 1) - (xn_type >> 1) - (yp_type >> 1) - (yn_type >> 1) - (zp_type >> 1) -(zn_type >> 1);
+	_GridCoefficientW[id] = gridType == FLUID ? float4(-center, xp_type & 1, yp_type & 1, zp_type & 1) : 0;
+	_GridTypesW[id] = PackGridTyped(gridType, xp_type,xn_type,yp_type,yn_type,zp_type,zn_type);
+}
+
+float3 _RayOrigin;
+float3 _RayDirection;
+float4 _MouseForceParameter; // x,y,z: Force w: Range
+
+inline float GetMouseForce(float3 position)
+{
+    const float distance_to_mouse_ray = length(cross(_RayDirection, position - _RayOrigin));
+    const float normalized_distance = distance_to_mouse_ray / _MouseForceParameter.w;
+    return smoothstep(1.0, 0.9, normalized_distance);
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void AddForce (uint3 id : SV_DispatchThreadID)
+{
+    // forward Euler time integration
+    float4 velocity = _VelocityOldR[id] + _Gravity * _DeltaTime;
+    
+    // add mouse force
+    const float3 position = id * _CellSize;
+    const float3 position_vx = position + float3(-0.5f * _InvCellSize, 0.0f, 0.0f);
+    const float3 position_vy = position + float3(0.0f, -0.5f * _InvCellSize, 0.0f);
+    const float3 position_vz = position + float3(0.0f, 0.0f, -0.5f * _InvCellSize);
+    float3 mouse_force = float3(GetMouseForce(position_vx), GetMouseForce(position_vy), GetMouseForce(position_vz));
+    mouse_force *= _MouseForceParameter.xyz;
+    velocity.xyz += mouse_force * _DeltaTime;
+    
+    _VelocityW[id] = float4(EnforceBoundaryCondition(velocity, _GridTypesR[id]), velocity.w);
+}
+
+[numthreads(256, 1, 1)]
+void ClearGridWeight (uint3 id : SV_DispatchThreadID)
+{
+	for (int i = 0; i < 7; ++i)
+	{
+		_WeightsSumW[id.x + i * _NumCells] = 0;
+	}
+}

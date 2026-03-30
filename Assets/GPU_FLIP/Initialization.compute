@@ -1,0 +1,58 @@
+
+#pragma use_dxc
+
+#include "FlipUtils.hlsl"
+
+#pragma kernel InitParticles
+#pragma kernel PrepareForRendering
+#pragma kernel Blur
+
+RWStructuredBuffer<Particle> _ParticlesW;
+
+float _Scale;
+float3 _InitMin0;
+float3 _InitMin1;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void InitParticles (uint3 id : SV_DispatchThreadID)
+{
+    Particle p;
+    uint localid = id.x % (_NumParticles / 2);
+    uint groupid = id.x / (_NumParticles / 2);
+    p.packedPosition = EncodePosition(MortonD3Decode(localid) * _CellSize * _Scale 
+        + (groupid > 0 ? _InitMin1 : _InitMin0));
+    p.packedVelocity = EncodeVelocity(0);
+    
+    _ParticlesW[id.x] = p;
+}
+
+StructuredBuffer<Particle> _ParticlesR;
+RWStructuredBuffer<float4> _ParticlesRender;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void PrepareForRendering (uint3 id : SV_DispatchThreadID)
+{
+    Particle p = _ParticlesR[id.x];
+    _ParticlesRender[id.x] = float4(DecodePosition(p.packedPosition), asfloat(p.packedVelocity.x));
+}
+
+Texture3D<float4> _Src;
+RWTexture3D<float4> _Dst;
+float3 _Size;
+SamplerState _LinearClamp;
+
+[numthreads(8, 8, 8)]
+void Blur (uint3 id : SV_DispatchThreadID)
+{
+    float3 uvw = (id + 0.5) / _Size;
+    float2 offset = float2(-0.5f, 0.5f) / _Size;
+    float4 c000 = _Src.SampleLevel(_LinearClamp, uvw + offset.xxx, 0);
+    float4 c001 = _Src.SampleLevel(_LinearClamp, uvw + offset.xxy, 0);
+    float4 c010 = _Src.SampleLevel(_LinearClamp, uvw + offset.xyx, 0);
+    float4 c011 = _Src.SampleLevel(_LinearClamp, uvw + offset.xyy, 0);
+    float4 c100 = _Src.SampleLevel(_LinearClamp, uvw + offset.yxx, 0);
+    float4 c101 = _Src.SampleLevel(_LinearClamp, uvw + offset.yxy, 0);
+    float4 c110 = _Src.SampleLevel(_LinearClamp, uvw + offset.yyx, 0);
+    float4 c111 = _Src.SampleLevel(_LinearClamp, uvw + offset.yyy, 0);
+    _Dst[id] = (c000 + c001 + c010 + c011 + c100 + c101 + c110 + c111) * 0.125;
+}

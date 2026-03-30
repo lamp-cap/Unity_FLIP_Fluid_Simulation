@@ -1,0 +1,145 @@
+/******************************************************************************
+ * GPUSorting
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright Thomas Smith 4/28/2024
+ * https://github.com/b0nes164/GPUSorting
+ *
+******************************************************************************/
+#pragma use_dxc
+#pragma target 6.0
+
+#pragma kernel InitSortInput
+#pragma kernel ClearErrorCount
+#pragma kernel Validate
+
+#define SHOULD_ASCEND
+// #define SORT_PAIRS
+
+#define VAL_PART_SIZE       3840U
+#define VAL_THREADS         256U
+
+RWStructuredBuffer<uint> b_sort;
+
+RWStructuredBuffer<uint> b_sortPayload;
+
+RWStructuredBuffer<uint> b_passHist;
+RWStructuredBuffer<uint> b_errorCount;
+
+uint e_numKeys;
+uint e_threadBlocks;
+uint e_seed;
+uint e_andCount;
+
+groupshared uint g_val[VAL_PART_SIZE + 1];
+
+groupshared uint g_valPayload[VAL_PART_SIZE + 1];
+
+//Hybrid Tausworthe
+//GPU GEMS CH37 Lee Howes + David Thomas
+#define TAUS_STEP_1 ((z1 & 4294967294U) << 12) ^ (((z1 << 13) ^ z1) >> 19)
+#define TAUS_STEP_2 ((z2 & 4294967288U) << 4) ^ (((z2 << 2) ^ z2) >> 25)
+#define TAUS_STEP_3 ((z3 & 4294967280U) << 17) ^ (((z3 << 3) ^ z3) >> 11)
+#define LCG_STEP    (z4 * 1664525 + 1013904223U)
+#define HYBRID_TAUS (z1 ^ z2 ^ z3 ^ z4)
+
+//An Improved Supercomputer Sorting Benchmark
+//Kurt Thearling & Stephen Smith
+//Bitwise AND successive keys together to decrease entropy
+//in a way that is evenly distributed across histogramming
+//passes.
+//Number of Keys ANDed | Entropy
+//        0            |  1.0 bits
+//        1            | .811 bits
+//        2            | .544 bits
+//        3            | .337 bits
+//        4            | .201 bits
+[numthreads(VAL_THREADS, 1, 1)]
+void InitSortInput(int3 id : SV_DispatchThreadID)
+{
+    const uint numKeys = e_numKeys;
+    const uint inc = VAL_THREADS * 256;
+    uint z1 = (id.x << 2) * e_seed;
+    uint z2 = ((id.x << 2) + 1) * e_seed;
+    uint z3 = ((id.x << 2) + 2) * e_seed;
+    uint z4 = ((id.x << 2) + 3) * e_seed;
+    
+    for (uint i = id.x; i < numKeys; i += inc)
+    {
+        z1 = TAUS_STEP_1;
+        z2 = TAUS_STEP_2;
+        z3 = TAUS_STEP_3;
+        z4 = LCG_STEP;
+        const uint t = HYBRID_TAUS;
+        
+        b_sort[i] = t;
+        
+#if defined(SORT_PAIRS)
+        b_sortPayload[i] = t;
+#endif
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ClearErrorCount(int3 id : SV_DispatchThreadID)
+{
+    b_errorCount[0] = 0;
+}
+
+//Assuming values are identical to keys, payloads must also be in sorted order
+[numthreads(VAL_THREADS, 1, 1)]
+void Validate(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    if (gid.x < e_threadBlocks - 1)
+    {
+        const uint t = gid.x * VAL_PART_SIZE;
+        uint i;
+        for (i = gtid.x; i < VAL_PART_SIZE + 1; i += VAL_THREADS)
+        {
+            g_val[i] = b_sort[i + t];
+#if defined(SORT_PAIRS)
+            g_valPayload[i] = b_sortPayload[i + t];
+#endif
+        }
+        GroupMemoryBarrierWithGroupSync();
+        
+        //Reinterpret the payload to match the type of the key it was sorted on
+        for (i = gtid.x; i < VAL_PART_SIZE; i += VAL_THREADS)
+        {
+            uint isInvalid = 0;
+    #if defined(SHOULD_ASCEND)
+            isInvalid |= g_val[i] > g_val[i + 1];
+        #if defined(SORT_PAIRS) 
+            isInvalid |= asuint(g_valPayload[i]) > asuint(g_valPayload[i + 1]);
+        #endif
+    #else
+            isInvalid |= g_val[i] < g_val[i + 1];
+        #if defined(SORT_PAIRS) 
+            isInvalid |= asuint(g_valPayload[i]) < asuint(g_valPayload[i + 1]);
+        #endif
+    #endif
+            if (isInvalid)
+                InterlockedAdd(b_errorCount[0], 1);
+        }
+    }
+    else
+    {
+        for (uint i = gtid.x + gid.x * VAL_PART_SIZE; i < e_numKeys - 1; i += VAL_THREADS)
+        {
+            uint isInvalid = 0;     
+    #if defined(SHOULD_ASCEND)
+            isInvalid |= b_sort[i] > b_sort[i + 1];
+        #if defined(SORT_PAIRS)
+            isInvalid |= asuint(b_sortPayload[i]) > asuint(b_sortPayload[i + 1]);
+        #endif
+    #else
+            isInvalid |= b_sort[i] < b_sort[i + 1];
+        #if defined(SORT_PAIRS)
+            isInvalid |= asuint(b_sortPayload[i]) < asuint(b_sortPayload[i + 1]);
+        #endif
+    #endif
+            if (isInvalid)
+                InterlockedAdd(b_errorCount[0], 1);
+        }
+    }
+}

@@ -1,0 +1,190 @@
+#include "MarchingCubes.hlsl"
+#pragma kernel Clear
+#pragma kernel BuildMesh
+
+float2 OctWrap( float2 v )
+{
+	return ( 1.0 - abs(v.yx) ) * ( v >= 0.0 ? 1.0 : -1.0 );
+}
+ 
+float2 EncodeNormalOct(float3 n)
+{
+	n /= ( abs( n.x ) + abs( n.y ) + abs( n.z ) );
+	n.xy = n.z >= 0.0 ? n.xy : OctWrap( n.xy );
+	n.xy = n.xy * 0.5 + 0.5;
+	return n.xy;
+}
+
+inline uint PackUint3(uint3 v)
+{
+	return v.x | (v.y << 10) | (v.z << 20);
+}
+
+inline uint Morton3DSplitBy3Bits(uint num) 
+{
+	uint x = num & 1023u;
+	x = (x | (x << 16)) & 0xff0000ff;
+	x = (x | (x << 8))  & 0x0f00f00f;
+	x = (x | (x << 4))  & 0xc30c30c3;
+	x = (x | (x << 2))  & 0x49249249;
+	return x;
+}
+
+inline uint Morton3DEncode(uint3 v)
+{
+	return Morton3DSplitBy3Bits(v.x) | (Morton3DSplitBy3Bits(v.y) << 1) | (Morton3DSplitBy3Bits(v.z) << 2);
+}
+inline uint2 EncodePosition(float3 pos)
+{
+	float3 cellPos = pos * 10;
+	return uint2(Morton3DEncode((uint3)floor(cellPos)), PackUint3(round(frac(cellPos) * 1023)));
+}
+inline uint2 PackUNorm2(float2 v)
+{
+	return uint2(asuint(v.x), asuint(v.y));
+}
+
+inline uint2 EncodeNormal(float3 normal)
+{
+	return PackUNorm2(EncodeNormalOct(normal));
+}
+
+SamplerState _LinearClamp;
+
+int3 _Size;
+int _BufferSize;
+float _CellSize;
+float _Target;
+
+Texture3D<float4> _Voxels;
+Texture3D<float4> _Normals;
+
+RWStructuredBuffer<uint4> _Buffer;
+RWStructuredBuffer<uint> _Counter;
+
+[numthreads(64, 1, 1)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x == 0) _Counter[0] = 0;
+}
+
+inline float ReadField(int3 coord)
+{
+	if (all(coord >= 0) && all(coord < _Size)) return _Voxels[coord].w;
+	return 0;
+}
+inline float ReadLinear(float3 coord)
+{
+	if (all(coord >= 0) && all(coord < _Size)) return _Voxels.SampleLevel(_LinearClamp, coord / _Size, 0).w;
+	return 0;
+}
+
+float SampleDensityDelta(int axis, float3 coord)
+{
+	float3 off = 0; off[axis] = 1;
+	float3 uvw0 = (coord + off) / float3(256, 128, 128);
+	float3 uvw1 = (coord - off) / float3(256, 128, 128);
+	float d0 = uvw0[axis] > 1.00001f ? -10: _Voxels.SampleLevel(_LinearClamp, uvw0, 0).a;
+	float d1 = uvw1[axis] <-0.00001f ? -10: _Voxels.SampleLevel(_LinearClamp, uvw1, 0).a;
+	return d1 - d0;
+}
+float3 GetNormal(float3 pos)
+{
+	float3 coord = pos;
+	float dx = SampleDensityDelta(0, coord);
+	float dy = SampleDensityDelta(1, coord);
+	float dz = SampleDensityDelta(2, coord);
+                
+	return normalize(float3(dx, dy, dz));
+}
+
+// GetOffset finds the approximate point of intersection of the surface
+// between two points with the values v1 and v2
+inline float GetOffset(float v1, float v2)
+{
+	float delta = v2 - v1;
+	return (delta == 0.0f) ? 0.5f : (_Target - v1) / delta;
+}
+
+uint4 CreateVertex(float3 position)
+{
+	return uint4(EncodePosition(position * _CellSize + 10), EncodeNormal(GetNormal(position)));
+}
+
+groupshared float value[9*9*9];
+
+// inline int LocalIdx(int3 coord) { return coord.x + coord.y * 9 + coord.z * 81; }
+// inline int3 LocalCoord(int idx) { return int3(idx % 9, idx / 9 % 9, idx / 81); }
+
+inline uint FillCube(int3 coord, out float cube[8])
+{
+	cube[0] = ReadField(coord);
+	cube[1] = ReadField(coord + int3(1,0,0));
+	cube[2] = ReadField(coord + int3(1,1,0));
+	cube[3] = ReadField(coord + int3(0,1,0));
+	cube[4] = ReadField(coord + int3(0,0,1));
+	cube[5] = ReadField(coord + int3(1,0,1));
+	cube[6] = ReadField(coord + int3(1,1,1));
+	cube[7] = ReadField(coord + int3(0,1,1));
+	uint flag = cube[0] <= _Target ? 1 : 0;
+	flag |= cube[1] <= _Target ? 2 : 0;
+	flag |= cube[2] <= _Target ? 4 : 0;
+	flag |= cube[3] <= _Target ? 8 : 0;
+	flag |= cube[4] <= _Target ? 16 : 0;
+	flag |= cube[5] <= _Target ? 32 : 0;
+	flag |= cube[6] <= _Target ? 64 : 0;
+	flag |= cube[7] <= _Target ? 128 : 0;
+	return flag;
+}
+
+int3 LocalCoord(int i)
+{
+	return int3(i&7, (i>>3)&7, i>>6);
+}
+
+[numthreads(128, 1, 1)]
+void BuildMesh(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
+{
+	int3 blockBase = (int3)gid * 8 - 1;
+	float cube[8];
+	for (int iter = 0; iter < 4; ++iter)
+	{
+		int3 coord = blockBase + LocalCoord(gi + iter * 128);
+		if (any(coord > _Size))continue;
+		uint flag = FillCube(coord, cube);
+		uint vertCount = GetVertCount(flag);
+		if (vertCount < 1) continue;
+	
+		float3 pos = coord + 0.5f;
+		int globalOffset = 0;
+		InterlockedAdd(_Counter[0], vertCount, globalOffset);
+		//Save the triangles that were found. There can be up to five per cube
+		for (int i = 0; i < vertCount; i++)
+		{
+			uint vertIdx = GetVertIdx(flag, i);
+			uint2 connection = edgeConnection[vertIdx];
+			float offset = GetOffset(cube[connection.x], cube[connection.y]);
+			float3 position = pos + (vertexOffset[connection.x] + offset * edgeDirection[vertIdx]);
+			_Buffer[globalOffset + i] = CreateVertex(position);
+		}
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
