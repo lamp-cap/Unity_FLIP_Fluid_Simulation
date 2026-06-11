@@ -180,7 +180,7 @@
 			// https://www.shadertoy.com/view/4djSRW
 			float hash13(float3 p3){
 				p3  = frac(p3 * .1031);
-			    p3 += dot(p3, p3.zyx + 33.33);
+			    p3 += dot(p3, p3.zyx + 33.33 + _Time.x);
 			    return frac((p3.x + p3.y) * p3.z);
 			}
             float SampleDensityDelta(int axis, float3 coord)
@@ -318,7 +318,7 @@
 
                 float3 ro = posWS - V;
                 float3 rd = V;
-#if DRAW_VOLUME
+#if 1//DRAW_VOLUME
 				return min(Render(ro, rd), 100);
 #else
 				

@@ -229,8 +229,9 @@ public class GPU_FLIP : MonoBehaviour
             _slowDown = !_slowDown;
         if (Input.GetKeyUp(KeyCode.P))
             _pause = !_pause;
-        if (!_pause)
-            Simulation();
+        
+        Simulation();
+        
         if (drawType == DrawType.Mesh)
             Graphics.DrawProceduralIndirect(meshMat, _bounds, MeshTopology.Triangles, _argsBuffer);
         else
@@ -257,21 +258,24 @@ public class GPU_FLIP : MonoBehaviour
         var cmd = CommandBufferPool.Get("FLIP");
         cmd.Clear();
         
-        cmd.BeginSample("BuildLUT");
-        BuildLut(cmd);
-        cmd.EndSample("BuildLUT");
-        
-        cmd.BeginSample("P2G");
-        ParticleToGrid(cmd);
-        cmd.EndSample("P2G");
-        
-        cmd.BeginSample("Projection");
-        Projection(cmd, 64);
-        cmd.EndSample("Projection");
-        
-        cmd.BeginSample("G2P");
-        GridToParticle(cmd);
-        cmd.EndSample("G2P");
+        if (!_pause)
+        {
+            cmd.BeginSample("BuildLUT");
+            BuildLut(cmd);
+            cmd.EndSample("BuildLUT");
+
+            cmd.BeginSample("P2G");
+            ParticleToGrid(cmd);
+            cmd.EndSample("P2G");
+
+            cmd.BeginSample("Projection");
+            Projection(cmd, 64);
+            cmd.EndSample("Projection");
+
+            cmd.BeginSample("G2P");
+            GridToParticle(cmd);
+            cmd.EndSample("G2P");
+        }
         
         cmd.BeginSample("Rendering");
         if (drawType == DrawType.Mesh)
