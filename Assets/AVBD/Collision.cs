@@ -1,10 +1,12 @@
+using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
 
 namespace AVBD
 {
-    public partial class Manifold : Force
+    public class Collision
     {
         const int MAX_CONTACTS = 8;
         const int MAX_POLY_VERTS = 16;
@@ -17,39 +19,6 @@ namespace AVBD
             AXIS_FACE_A = 0,
             AXIS_FACE_B = 1,
             AXIS_EDGE = 2
-        };
-
-        struct Axis
-        {
-            float3 axis0;
-            float3 axis1;
-            float3 axis2;
-            
-            public float3 this[int index]
-            {
-                get => index switch {
-                        0 => axis0,
-                        1 => axis1,
-                        _ => axis2
-                    };
-                set
-                {
-                    switch (index)
-                    {
-                        case 0: axis0 = value; break;
-                        case 1: axis1 = value; break;
-                        default: axis2 = value; break;
-                    }
-                }
-            }
-        };
-
-        struct OBB
-        {
-            public float3 center;
-            public quaternion rotation;
-            public float3 half;
-            public Axis axis;
         };
 
         struct SatAxis
@@ -73,36 +42,129 @@ namespace AVBD
             public float extentV;
         };
 
-        private static OBB makeOBB(Rigid body)
+        private NativeReference<CollideResult> _result;
+        private NativeReference<bool> _bool;
+
+        public Collision()
         {
-            OBB box = new OBB();
-            box.center = body.positionLin;
-            box.rotation = body.positionAng;
-            box.half = body.size * 0.5f;
-            box.axis[0] = rotate(body.positionAng, float3(1.0f, 0.0f, 0.0f));
-            box.axis[1] = rotate(body.positionAng, float3(0.0f, 1.0f, 0.0f));
-            box.axis[2] = rotate(body.positionAng, float3(0.0f, 0.0f, 1.0f));
-            return box;
+            _result = new NativeReference<CollideResult>(Allocator.Persistent);
+            _bool = new NativeReference<bool>(Allocator.Persistent);
         }
 
-        private static float absDot(in float3 a, in float3 b)
+        public void Dispose()
         {
-            return abs(dot(a, b));
+            _result.Dispose();
+            _bool.Dispose();
         }
 
-        private static float3 supportPoint(in OBB box, in float3 dir)
+        private static bool TestAxis(in Utils.OBB boxA, in Utils.OBB boxB, in float3 delta, in float3 axis)
+        {
+            float lenSq = lengthsq(axis);
+            if (lenSq < 1e-6f)
+                return true;
+
+            float3 n = axis;
+            if (dot(n, delta) < 0.0f)
+                n = -n;
+
+            float distance = abs(dot(delta, n));
+
+            float rA = dot(boxA.half, abs(math.mul(boxA.axis, n)));
+            float rB = dot(boxB.half, abs(math.mul(boxB.axis, n)));
+
+            float separation = distance - (rA + rB);
+            return separation <= 0.0f;
+        }
+        
+        public bool Collide(Rigid bodyA, Rigid bodyB)
+        {
+            new CollideJob(bodyA, bodyB, _bool).Run();
+            return _bool.Value;
+        }
+
+        [BurstCompile]
+        struct CollideJob : IJob
+        {
+            private Utils.OBB _boxA;
+            private Utils.OBB _boxB;
+            private NativeReference<bool> _result;
+            
+            public CollideJob(Rigid a, Rigid b, NativeReference<bool> result)
+            {
+                _boxA = Utils.makeOBB(a);
+                _boxB = Utils.makeOBB(b);
+                result.Value = false;
+                _result = result;
+            }
+            
+            public void Execute()
+            {
+                float3 delta = _boxB.center - _boxA.center;
+            
+                for (int i = 0; i < 3; ++i)
+                {
+                    if (!TestAxis(_boxA, _boxB, delta, _boxA.axis[i]))
+                        return;
+                }
+
+                for (int i = 0; i < 3; ++i)
+                {
+                    if (!TestAxis(_boxA, _boxB, delta, _boxB.axis[i]))
+                        return;
+                }
+
+                for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                {
+                    float3 axis = cross(_boxA.axis[i], _boxB.axis[j]);
+                    if (!TestAxis(_boxA, _boxB, delta, axis))
+                        return;
+                }
+
+                _result.Value = true;
+            }
+        }
+        
+        public int collide(Rigid bodyA, Rigid bodyB, NativeArray<Manifold.Contact> contacts, out float3x3 basisOut)
+        {
+            basisOut = new float3x3();
+            Utils.OBB boxA = Utils.makeOBB(bodyA);
+            Utils.OBB boxB = Utils.makeOBB(bodyB);
+            
+            new SatJob(boxA, boxB, _result).Run();
+            var r = _result.Value;
+
+            if (!r.collided)
+            {
+                return 0;
+            }
+
+            basisOut = Utils.orthonormal(-r.best.normalAB);
+
+            int contactCount = r.best.type switch
+            {
+                AxisType.AXIS_EDGE => buildEdgeContact(bodyA, bodyB, boxA, boxB, r.best.indexA, r.best.indexB,
+                    r.best.normalAB, contacts),
+                AxisType.AXIS_FACE_A => buildFaceManifold(bodyA, bodyB, boxA, boxB, true, r.best.indexA, r.best.normalAB,
+                    contacts),
+                _ => buildFaceManifold(bodyA, bodyB, boxA, boxB, false, r.best.indexB, r.best.normalAB, contacts)
+            };
+            return contactCount;
+        }
+
+        private static float3 supportPoint(in Utils.OBB box, in float3 dir)
         {
             float sx = dot(dir, box.axis[0]) >= 0.0f ? 1.0f : -1.0f;
             float sy = dot(dir, box.axis[1]) >= 0.0f ? 1.0f : -1.0f;
             float sz = dot(dir, box.axis[2]) >= 0.0f ? 1.0f : -1.0f;
 
             return box.center
-                + box.axis[0] * (box.half.x * sx)
-                + box.axis[1] * (box.half.y * sy)
-                + box.axis[2] * (box.half.z * sz);
+                   + box.axis[0] * (box.half.x * sx)
+                   + box.axis[1] * (box.half.y * sy)
+                   + box.axis[2] * (box.half.z * sz);
         }
 
-        private static void getFaceAxes(in OBB box, int axisIndex, out float3 u, out float3 v, out float extentU, out float extentV)
+        private static void getFaceAxes(in Utils.OBB box, int axisIndex, out float3 u, out float3 v, out float extentU, out float extentV)
         {
             if (axisIndex == 0)
             {
@@ -127,7 +189,7 @@ namespace AVBD
             }
         }
 
-        private static void buildFaceFrame(in OBB box, int axisIndex,in float3 outwardNormal, out FaceFrame frame)
+        private static void buildFaceFrame(in Utils.OBB box, int axisIndex,in float3 outwardNormal, out FaceFrame frame)
         {
             float sign = dot(outwardNormal, box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
             frame.axisIndex = axisIndex;
@@ -136,14 +198,14 @@ namespace AVBD
             getFaceAxes(box, axisIndex, out frame.u, out frame.v, out frame.extentU, out frame.extentV);
         }
 
-        private static int chooseIncidentFaceAxis(in OBB box, in float3 referenceNormal)
+        private static int chooseIncidentFaceAxis(in Utils.OBB box, in float3 referenceNormal)
         {
             int axis = 0;
             float best = -float.MaxValue;
 
             for (int i = 0; i < 3; ++i)
             {
-                float d = absDot(box.axis[i], referenceNormal);
+                float d = abs(dot(box.axis[i], referenceNormal));
                 if (d > best)
                 {
                     best = d;
@@ -154,7 +216,7 @@ namespace AVBD
             return axis;
         }
 
-        private static void buildIncidentFace(in OBB box, int axisIndex, float3 referenceNormal, NativeArray<float3> outVerts)
+        private static void buildIncidentFace(in Utils.OBB box, int axisIndex, float3 referenceNormal, NativeArray<float3> outVerts)
         {
             float sign = dot(box.axis[axisIndex], referenceNormal) > 0.0f ? -1.0f : 1.0f;
             float3 faceNormal = box.axis[axisIndex] * sign;
@@ -206,7 +268,7 @@ namespace AVBD
             return outCount;
         }
 
-        private static bool addContact(Rigid bodyA, Rigid bodyB, NativeArray<Contact> contacts, ref int contactCount,
+        private static bool addContact(Rigid bodyA, Rigid bodyB, NativeArray<Manifold.Contact> contacts, ref int contactCount,
             NativeArray<float3> contactMidpoints, float3 xA, float3 xB, int featureKey)
         {
             float3 midpoint = (xA + xB) * 0.5f;
@@ -221,10 +283,10 @@ namespace AVBD
             if (contactCount >= MAX_CONTACTS)
                 return false;
 
-            FeaturePair feature;
+            Manifold.FeaturePair feature;
             feature.key = featureKey;
 
-            Contact c = contacts[contactCount];
+            Manifold.Contact c = contacts[contactCount];
             c.feature = feature;
             c.rA = rotate(conjugate(bodyA.positionAng), xA - bodyA.positionLin);
             c.rB = rotate(conjugate(bodyB.positionAng), xB - bodyB.positionLin);
@@ -235,29 +297,21 @@ namespace AVBD
             return true;
         }
 
-        private static bool testAxis(in OBB boxA, in OBB boxB, float3 delta, float3 axis, AxisType type,
+        private static bool testAxis(in Utils.OBB boxA, in Utils.OBB boxB, float3 delta, float3 axis, AxisType type,
             int indexA, int indexB, ref SatAxis best)
         {
             float lenSq = lengthsq(axis);
             if (lenSq < SAT_AXIS_EPSILON)
                 return true;
 
-            float invLen = 1.0f / sqrt(lenSq);
-            float3 n = axis * invLen;
+            float3 n = axis * rsqrt(lenSq);
             if (dot(n, delta) < 0.0f)
                 n = -n;
 
             float distance = abs(dot(delta, n));
 
-            float rA =
-                boxA.half.x * absDot(n, boxA.axis[0]) +
-                boxA.half.y * absDot(n, boxA.axis[1]) +
-                boxA.half.z * absDot(n, boxA.axis[2]);
-
-            float rB =
-                boxB.half.x * absDot(n, boxB.axis[0]) +
-                boxB.half.y * absDot(n, boxB.axis[1]) +
-                boxB.half.z * absDot(n, boxB.axis[2]);
+            float rA = dot(boxA.half, abs(mul(boxA.axis, n)));
+            float rB = dot(boxB.half, abs(mul(boxB.axis, n)));
 
             float separation = distance - (rA + rB);
             if (separation > 0.0f)
@@ -276,7 +330,7 @@ namespace AVBD
             return true;
         }
 
-        private static void supportEdge(in OBB box, int axisIndex, float3 dir, out float3 edgeA, out float3 edgeB)
+        private static void supportEdge(in Utils.OBB box, int axisIndex, float3 dir, out float3 edgeA, out float3 edgeB)
         {
             int axis1 = (axisIndex + 1) % 3;
             int axis2 = (axisIndex + 2) % 3;
@@ -285,8 +339,8 @@ namespace AVBD
             float sign2 = dot(dir, box.axis[axis2]) >= 0.0f ? 1.0f : -1.0f;
 
             float3 edgeCenter = box.center
-                + box.axis[axis1] * (box.half[axis1] * sign1)
-                + box.axis[axis2] * (box.half[axis2] * sign2);
+                                + box.axis[axis1] * (box.half[axis1] * sign1)
+                                + box.axis[axis2] * (box.half[axis2] * sign2);
 
             edgeA = edgeCenter - box.axis[axisIndex] * box.half[axisIndex];
             edgeB = edgeCenter + box.axis[axisIndex] * box.half[axisIndex];
@@ -349,11 +403,11 @@ namespace AVBD
             c1 = q0 + d2 * t;
         }
 
-        private static int buildFaceManifold(Rigid bodyA, Rigid bodyB, in OBB boxA, in OBB boxB,
-            bool referenceIsA, int referenceAxis, float3 normalAB, NativeArray<Contact> contacts)
+        private static int buildFaceManifold(Rigid bodyA, Rigid bodyB, in Utils.OBB boxA, in Utils.OBB boxB,
+            bool referenceIsA, int referenceAxis, float3 normalAB, NativeArray<Manifold.Contact> contacts)
         {
-            OBB referenceBox = referenceIsA ? boxA : boxB;
-            OBB incidentBox = referenceIsA ? boxB : boxA;
+            Utils.OBB referenceBox = referenceIsA ? boxA : boxB;
+            Utils.OBB incidentBox = referenceIsA ? boxB : boxA;
             float3 referenceOutward = referenceIsA ? normalAB : -normalAB;
 
             FaceFrame referenceFace;
@@ -420,8 +474,8 @@ namespace AVBD
             return contactCount;
         }
 
-        private static int buildEdgeContact(Rigid bodyA, Rigid bodyB, in OBB boxA, in OBB boxB, int axisA, int axisB,
-            float3 normalAB, NativeArray<Contact> contacts)
+        private static int buildEdgeContact(Rigid bodyA, Rigid bodyB, in Utils.OBB boxA, in Utils.OBB boxB, int axisA, int axisB,
+            float3 normalAB, NativeArray<Manifold.Contact> contacts)
         {
             supportEdge(boxA, axisA, normalAB, out var a0, out var a1);
             supportEdge(boxB, axisB, -normalAB, out var b0, out var b1);
@@ -445,64 +499,74 @@ namespace AVBD
             return contactCount;
         }
 
-        private static int collide(Rigid bodyA, Rigid bodyB, NativeArray<Contact> contacts, out float3x3 basisOut)
+        [BurstCompile]
+        private struct SatJob : IJob
         {
-            basisOut = new float3x3();
-            OBB boxA = makeOBB(bodyA);
-            OBB boxB = makeOBB(bodyB);
-            float3 delta = boxB.center - boxA.center;
+            private Utils.OBB _boxA;
+            private Utils.OBB _boxB;
+            private NativeReference<CollideResult> _result;
 
-            SatAxis bestFace = new SatAxis();
-            bestFace.separation = -float.MaxValue;
-            bestFace.valid = false;
-
-            SatAxis bestEdge = new SatAxis();
-            bestEdge.separation = -float.MaxValue;
-            bestEdge.valid = false;
-
-            for (int i = 0; i < 3; ++i)
+            public SatJob(Utils.OBB boxA,
+                Utils.OBB boxB,
+                NativeReference<CollideResult> result)
             {
-                if (!testAxis(boxA, boxB, delta, boxA.axis[i], AxisType.AXIS_FACE_A, i, -1, ref bestFace))
-                    return 0;
+                _boxA = boxA;
+                _boxB = boxB;
+                result.Value = new CollideResult();
+                _result = result;
             }
-
-            for (int i = 0; i < 3; ++i)
+            
+            public void Execute()
             {
-                if (!testAxis(boxA, boxB, delta, boxB.axis[i], AxisType.AXIS_FACE_B, -1, i, ref bestFace))
-                    return 0;
+                float3 delta = _boxB.center - _boxA.center;
+
+                SatAxis bestFace = new SatAxis();
+                bestFace.separation = -float.MaxValue;
+                bestFace.valid = false;
+
+                SatAxis bestEdge = new SatAxis();
+                bestEdge.separation = -float.MaxValue;
+                bestEdge.valid = false;
+
+                for (int i = 0; i < 3; ++i)
+                    if (!testAxis(_boxA, _boxB, delta, _boxA.axis[i], AxisType.AXIS_FACE_A, i, -1, ref bestFace))
+                        return;
+                
+                for (int i = 0; i < 3; ++i)
+                    if (!testAxis(_boxA, _boxB, delta, _boxB.axis[i], AxisType.AXIS_FACE_B, -1, i, ref bestFace))
+                        return;
+                
+                for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                {
+                    float3 axis = cross(_boxA.axis[i], _boxB.axis[j]);
+                    if (!testAxis(_boxA, _boxB, delta, axis, AxisType.AXIS_EDGE, i, j, ref bestEdge))
+                        return;
+                }
+
+                if (!bestFace.valid)
+                    return;
+
+                SatAxis best = bestFace;
+                if (bestEdge.valid)
+                {
+                    float edgeRelTol = 0.95f;
+                    float edgeAbsTol = 0.01f;
+                    if (edgeRelTol * bestEdge.separation > bestFace.separation + edgeAbsTol)
+                        best = bestEdge;
+                }
+
+                var r = _result.Value;
+                r.collided = true;
+                r.best = best;
+                _result.Value = r;
             }
-
-            for (int i = 0; i < 3; ++i)
-            for (int j = 0; j < 3; ++j)
-            {
-                float3 axis = cross(boxA.axis[i], boxB.axis[j]);
-                if (!testAxis(boxA, boxB, delta, axis, AxisType.AXIS_EDGE, i, j, ref bestEdge))
-                    return 0;
-            }
-
-            if (!bestFace.valid)
-                return 0;
-
-            SatAxis best = bestFace;
-            if (bestEdge.valid)
-            {
-                float edgeRelTol = 0.95f;
-                float edgeAbsTol = 0.01f;
-                if (edgeRelTol * bestEdge.separation > bestFace.separation + edgeAbsTol)
-                    best = bestEdge;
-            }
-
-            basisOut = Utils.orthonormal(-best.normalAB);
-
-            return best.type switch
-            {
-                AxisType.AXIS_EDGE => buildEdgeContact(bodyA, bodyB, boxA, boxB, best.indexA, best.indexB,
-                    best.normalAB, contacts),
-                AxisType.AXIS_FACE_A => buildFaceManifold(bodyA, bodyB, boxA, boxB, true, best.indexA, best.normalAB,
-                    contacts),
-                _ => buildFaceManifold(bodyA, bodyB, boxA, boxB, false, best.indexB, best.normalAB, contacts)
-            };
         }
-
+        
+        private struct CollideResult
+        {
+            public bool collided;
+            public SatAxis best;
+        }
     }
 }

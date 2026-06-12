@@ -4,12 +4,13 @@ using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine.Profiling;
 using static Unity.Mathematics.math;
+
 namespace AVBD
 {
-    public partial class Manifold : Force
+    public class Manifold : Force
     {
         // Used to track contact features between frames
-        internal struct FeaturePair
+        public struct FeaturePair
         {
             // struct
             // {
@@ -23,7 +24,7 @@ namespace AVBD
         };
 
         // Contact point information for a single contact
-        internal struct Contact
+        public struct Contact
         {
             public FeaturePair feature;
             public float3 rA; // contact offset in A's local space (relative to center)
@@ -34,7 +35,7 @@ namespace AVBD
             public bool stick;
         };
 
-        internal NativeArray<Contact> contacts;
+        public NativeArray<Contact> contacts;
         public float3x3 basis; // Normal in the first row (pointing from B to A), and tangents in the second and third rows
         public int numContacts;
         public float friction;
@@ -57,7 +58,7 @@ namespace AVBD
             numContacts = 0;
         }
         
-        public override bool initialize()
+        public override bool initialize(Collision collision)
         {
             // Compute friction
             friction = sqrt(bodyA.friction * bodyB.friction);
@@ -65,29 +66,27 @@ namespace AVBD
             // Compute new contacts
             var newContacts = new NativeArray<Contact>(8, Allocator.Temp);
             Profiler.BeginSample("Collide");
-            int newNumContacts = collide(bodyA, bodyB, newContacts, out basis);
+            int newNumContacts = collision.collide(bodyA, bodyB, newContacts, out basis);
             Profiler.EndSample();
 
             // Merge old contact data with new contacts
             for (int i = 0; i < newNumContacts; i++)
+            for (int j = 0; j < numContacts; j++)
             {
-                for (int j = 0; j < numContacts; j++)
+                if (newContacts[i].feature.key == contacts[j].feature.key)
                 {
-                    if (newContacts[i].feature.key == contacts[j].feature.key)
-                    {
-                        float3 newRA = newContacts[i].rA;
-                        float3 newRB = newContacts[i].rB;
-                        var nc = contacts[j];
+                    float3 newRA = newContacts[i].rA;
+                    float3 newRB = newContacts[i].rB;
+                    var nc = contacts[j];
 
-                        // If no static friction in last frame, use the new contact point locations
-                        if (!contacts[j].stick)
-                        {
-                            nc.rA = newRA;
-                            nc.rB = newRB;
-                        }
-                        newContacts[i] = nc;
-                        break;
+                    // If no static friction in last frame, use the new contact point locations
+                    if (!contacts[j].stick)
+                    {
+                        nc.rA = newRA;
+                        nc.rB = newRB;
                     }
+                    newContacts[i] = nc;
+                    break;
                 }
             }
 
@@ -95,8 +94,7 @@ namespace AVBD
             numContacts = newNumContacts;
             if (numContacts > 0 && !contacts.IsCreated)
                 contacts = new NativeArray<Contact>(8, Allocator.Persistent);
-            for (int i = 0; i < numContacts; i++)
-                contacts[i] = newContacts[i];
+            contacts.CopyFrom(newContacts);
 
             newContacts.Dispose();
 

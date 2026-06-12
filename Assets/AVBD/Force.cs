@@ -1,4 +1,6 @@
+using Unity.Burst;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
 
@@ -21,7 +23,7 @@ namespace AVBD
             bodyB?.forces.Add(this);
         }
 
-        public abstract bool initialize();
+        public abstract bool initialize(Collision collision);
         public abstract void updatePrimal(Rigid body, float alpha, NativeReference<Equation6> eq6);
         public abstract void updateDual(float alpha);
 
@@ -68,7 +70,7 @@ namespace AVBD
             torqueArm = lengthsq((bodyA != null ? bodyA.size : float3(0, 0, 0)) + bodyB.size);
         }
 
-        public override bool initialize()
+        public override bool initialize(Collision collision)
         {
             // Store constraint function at beginnning of timestep C(x-)
             // Note: if bodyA is null, it is assumed that the joint connects a body to the world space position rA
@@ -92,74 +94,124 @@ namespace AVBD
 
         public override void updatePrimal(Rigid body, float alpha, NativeReference<Equation6> eq6)
         {
-            var e = eq6.Value;
-            // Linear constraint
-            if (lengthsq(penaltyLin) > 0)
+            new UpdatePrimalJob()
             {
-                // Compute constraint and jacobians
-                float3x3 K = Utils.diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-                float3 C = (bodyA !=null ? Utils.transform(bodyA.positionLin, bodyA.positionAng, rA) : rA)
-                           - Utils.transform(bodyB.positionLin, bodyB.positionAng, rB);
-                
-                // Stabilization
-                if (isinf(stiffnessLin))
-                    C -= C0Lin * alpha;
-
-                // Compute force
-                float3 F = mul(K, C) + lambdaLin;
-
-                // Choose jacobian depending on input body
-                float3x3 jLin = body == bodyA ? float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1) : float3x3(-1, 0, 0, 0, -1, 0, 0, 0, -1);
-                float3x3 jAng = body == bodyA ? Utils.skew(-rotate(bodyA.positionAng, rA)) : Utils.skew(rotate(bodyB.positionAng, rB));
-
-                // Stamp into LHS
-                float3x3 jLinT = transpose(jLin);
-                float3x3 jAngT = transpose(jAng);
-                float3x3 jAngTk = mul(jAngT, K);
-
-                e.lhsLin += mul(mul(jLinT, K), jLin);
-                e.lhsAng += mul(jAngTk, jAng);
-                e.lhsCross += mul(jAngTk, jLin);
-
-                // Diagonal approximation for higher order terms
-                float3 r = body == bodyA ? rotate(bodyA.positionAng, rA) : -rotate(bodyB.positionAng, rB);
-                float3x3 H = 
-                    geometricStiffnessBallSocket(0, r) * F[0] +
-                    geometricStiffnessBallSocket(1, r) * F[1] +
-                    geometricStiffnessBallSocket(2, r) * F[2];
-                e.lhsAng += Utils.diagonalize(H);
-
-                // Stamp into RHS
-                e.rhsLin += mul(jLinT, F);
-                e.rhsAng += mul(jAngT, F);
-            }
-
-            // Angular constraint
-            if (lengthsq(penaltyAng) > 0)
-            {
-                // Compute constraint and jacobians
-                float3x3 K = Utils.diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-                float3 C = ((bodyA != null ? bodyA.positionAng : quaternion(0,0,0,1)).sub(bodyB.positionAng)) * torqueArm;
-
-                // Stabilization
-                if (isinf(stiffnessAng))
-                    C -= C0Ang * alpha;
-
-                // Compute force
-                float3 F = mul(K, C) + lambdaAng;
-
-                // Choose jacobian depending on input body
-                float3x3 jAng = (body == bodyA ? float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1) : float3x3(-1, 0, 0, 0, -1, 0, 0, 0, -1)) * torqueArm;
-
-                // Stamp into LHS
-                e.lhsAng += mul(mul(transpose(jAng), K), jAng);
-
-                // Stamp into RHS
-                e.rhsAng += mul(transpose(jAng), F);
-            }
-            eq6.Value = e;
+                PositionLinA = bodyA.positionLin,
+                PositionAngA = bodyA.positionAng,
+                PositionLinB = bodyB.positionLin,
+                PositionAngB = bodyB.positionAng,
+                Alpha = alpha,
+                IsBodyA = body == bodyA,
+                HasBodyA = bodyA != null,
+                Eq6 = eq6,
+                penaltyLin = penaltyLin,
+                penaltyAng = penaltyAng,
+                lambdaLin = lambdaLin,
+                lambdaAng = lambdaAng,
+                C0Lin = C0Lin,
+                C0Ang = C0Ang,
+                stiffnessLin = stiffnessLin,
+                stiffnessAng = stiffnessAng,
+                rA = rA,
+                rB = rB,
+                torqueArm = torqueArm,
+            }.Run();
         }
 
+        [BurstCompile]
+        private struct UpdatePrimalJob : IJob
+        {
+            public float3 PositionLinA;
+            public float3 PositionLinB;
+            public quaternion PositionAngA;
+            public quaternion PositionAngB;
+            public float Alpha;
+            public bool IsBodyA;
+            public bool HasBodyA;
+            public NativeReference<Equation6> Eq6;
+            public float3 penaltyLin;
+            public float3 penaltyAng;
+            public float3 lambdaLin;
+            public float3 lambdaAng;
+            public float3 C0Lin;
+            public float3 C0Ang;
+            public float stiffnessLin;
+            public float stiffnessAng;
+            public float3 rA;
+            public float3 rB;
+            public float torqueArm;
+
+            public void Execute()
+            {
+                var e = Eq6.Value;
+                // Linear constraint
+                if (lengthsq(penaltyLin) > 0)
+                {
+                    // Compute constraint and jacobians
+                    float3x3 K = Utils.diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
+                    float3 C = (HasBodyA ? Utils.transform(PositionLinA, PositionAngA, rA) : rA)
+                               - Utils.transform(PositionLinB, PositionAngB, rB);
+                    
+                    // Stabilization
+                    if (isinf(stiffnessLin))
+                        C -= C0Lin * Alpha;
+
+                    // Compute force
+                    float3 F = mul(K, C) + lambdaLin;
+
+                    // Choose jacobian depending on input body
+                    float3x3 jLin = IsBodyA ? float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1) : float3x3(-1, 0, 0, 0, -1, 0, 0, 0, -1);
+                    float3x3 jAng = IsBodyA ? Utils.skew(-rotate(PositionAngA, rA)) : Utils.skew(rotate(PositionAngB, rB));
+
+                    // Stamp into LHS
+                    float3x3 jLinT = transpose(jLin);
+                    float3x3 jAngT = transpose(jAng);
+                    float3x3 jAngTk = mul(jAngT, K);
+
+                    e.lhsLin += mul(mul(jLinT, K), jLin);
+                    e.lhsAng += mul(jAngTk, jAng);
+                    e.lhsCross += mul(jAngTk, jLin);
+
+                    // Diagonal approximation for higher order terms
+                    float3 r = IsBodyA ? rotate(PositionAngA, rA) : -rotate(PositionAngB, rB);
+                    float3x3 H = 
+                        geometricStiffnessBallSocket(0, r) * F[0] +
+                        geometricStiffnessBallSocket(1, r) * F[1] +
+                        geometricStiffnessBallSocket(2, r) * F[2];
+                    e.lhsAng += Utils.diagonalize(H);
+
+                    // Stamp into RHS
+                    e.rhsLin += mul(jLinT, F);
+                    e.rhsAng += mul(jAngT, F);
+                }
+
+                // Angular constraint
+                if (lengthsq(penaltyAng) > 0)
+                {
+                    // Compute constraint and jacobians
+                    float3x3 K = Utils.diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
+                    float3 C = ((HasBodyA ? PositionAngA : quaternion(0,0,0,1)).sub(PositionAngB)) * torqueArm;
+
+                    // Stabilization
+                    if (isinf(stiffnessAng))
+                        C -= C0Ang * Alpha;
+
+                    // Compute force
+                    float3 F = mul(K, C) + lambdaAng;
+
+                    // Choose jacobian depending on input body
+                    float3x3 jAng = (IsBodyA ? float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1) : float3x3(-1, 0, 0, 0, -1, 0, 0, 0, -1)) * torqueArm;
+
+                    // Stamp into LHS
+                    e.lhsAng += mul(mul(transpose(jAng), K), jAng);
+
+                    // Stamp into RHS
+                    e.rhsAng += mul(transpose(jAng), F);
+                }
+                Eq6.Value = e;
+            }
+        }
+        
         public override void updateDual(float alpha)
         {
             // Linear constraint
@@ -242,7 +294,7 @@ namespace AVBD
             
         }
 
-        public override bool initialize()
+        public override bool initialize(Collision collision)
         {
             return true;
         }
@@ -307,7 +359,7 @@ namespace AVBD
             
         }
 
-        public override bool initialize(){ return true; }
+        public override bool initialize(Collision collision){ return true; }
 
         public override void updatePrimal(Rigid body, float alpha, NativeReference<Equation6>  eq6)
         {

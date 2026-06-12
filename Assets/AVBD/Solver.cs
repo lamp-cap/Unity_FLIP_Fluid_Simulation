@@ -1,16 +1,14 @@
-using System.Collections;
 using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
-using UnityEngine;
 using UnityEngine.Profiling;
 
 namespace AVBD
 {
     public class Solver
     {
-        public const float dt = 1.0f / 200.0f;       // Timestep
+        public const float dt = 1.0f / 100.0f;       // Timestep
         public const float gravity = -10.0f;  // Gravity
         public const int iterations = 10; // Solver iterations
 
@@ -37,6 +35,7 @@ namespace AVBD
         
         private Stack<Manifold> _pool;
         private NativeReference<Equation6> _eq6;
+        private Collision _collision;
 
         public Solver()
         {
@@ -44,6 +43,7 @@ namespace AVBD
             forces = new List<Force>();
             _pool = new Stack<Manifold>();
             _eq6 = new NativeReference<Equation6>(Allocator.Persistent);
+            _collision = new Collision();
         }
 
         public Rigid pick(float3 origin, float3 dir, out float3 local)
@@ -141,18 +141,18 @@ namespace AVBD
             _pool.Clear();
             forces.Clear();
             bodies.Clear();
+            _collision.Dispose();
         }
 
         private void CreateManifold(Rigid bodyA, Rigid bodyB)
         {
-            Manifold m;
             if (_pool.Count > 0)
             {
-                m = _pool.Pop();
+                var m = _pool.Pop();
                 m.Reset(this, bodyA, bodyB);
             }
             else 
-                m = new Manifold(this, bodyA, bodyB);
+                new Manifold(this, bodyA, bodyB);
         }
 
         public void step()
@@ -168,7 +168,7 @@ namespace AVBD
                     var bodyB = bodies[j];
                     float3 dp = bodyA.positionLin - bodyB.positionLin;
                     float r = bodyA.radius + bodyB.radius;
-                    if (dot(dp, dp) <= r * r && !bodyA.constrainedTo(bodyB))
+                    if (dot(dp, dp) <= r * r && !bodyA.constrainedTo(bodyB) && _collision.Collide(bodyA, bodyB))
                         CreateManifold(bodyA, bodyB);
                 }
             }
@@ -180,7 +180,7 @@ namespace AVBD
             {
                 var f = forces[i];
                 // Initialization can including caching anything that is constant over the step
-                if (f.initialize()) continue;
+                if (f.initialize(_collision)) continue;
                 // Force has returned false meaning it is inactive, so remove it from the solver
                 f.Dispose();
                 forces.RemoveAtSwapBack(i);
@@ -232,26 +232,27 @@ namespace AVBD
                     float3x3 MLin = Utils.diagonal(body.mass, body.mass, body.mass);
                     float3x3 MAng = Utils.diagonal(body.moment.x, body.moment.y, body.moment.z);
 
-                    var eq6 = new Equation6();
-                    eq6.lhsLin = MLin / (dt * dt);
-                    eq6.lhsAng = MAng / (dt * dt);
-                    eq6.lhsCross = float3x3(0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    _eq6.Value = new Equation6()
+                    {
+                        lhsLin = MLin / (dt * dt),
+                        lhsAng = MAng / (dt * dt),
+                        lhsCross = float3x3(0, 0, 0, 0, 0, 0, 0, 0, 0),
+                        rhsLin = mul(MLin / (dt * dt), body.positionLin - body.inertialLin),
+                        rhsAng = mul(MAng / (dt * dt), body.positionAng.sub(body.inertialAng)),
+                    };
 
-                    eq6.rhsLin = mul(MLin / (dt * dt), body.positionLin - body.inertialLin);
-                    eq6.rhsAng = mul(MAng / (dt * dt), body.positionAng.sub(body.inertialAng));
-                    _eq6.Value = eq6;
-
+                    Profiler.BeginSample("Force Primal update");
                     // Iterate over all forces acting on the body
                     foreach (Force force in body.forces)
                     {
                         // Stamp the force and hessian into the linear system
                         force.updatePrimal(body, alpha, _eq6);
                     }
-
-                    eq6 = _eq6.Value;
-
+                    Profiler.EndSample();
+                    
                     // Solve the SPD linear system using LDL and apply the update (Eq. 4)
-                    eq6.solve(out var dxLin, out var dxAng);
+                    _eq6.Value.SolveEq6(out float3 dxLin, out float3 dxAng);
+                    
                     body.positionLin = body.positionLin + dxLin;
                     body.positionAng = body.positionAng.add(dxAng);
                 }

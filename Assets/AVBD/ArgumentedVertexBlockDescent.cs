@@ -1,4 +1,3 @@
-using System;
 using UnityEngine;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
@@ -8,6 +7,7 @@ namespace AVBD
     public class ArgumentedVertexBlockDescent : MonoBehaviour
     {
         public SceneInitType type = SceneInitType.Ground;
+        public bool drawContact;
 
         private Solver _solver;
         // Start is called before the first frame update
@@ -131,7 +131,7 @@ namespace AVBD
                     case (Spring spring):
                         drawSpring(spring); break;
                     case (Manifold manifold):
-                        drawManifold(manifold); break;
+                        if (drawContact) drawManifold(manifold); break;
                 }
             }
         }
@@ -183,7 +183,7 @@ namespace AVBD
 
         static void scenePyramid(Solver solver)
         {
-            const int SIZE = 16;
+            const int SIZE = 20;
             solver.clear();
             new Rigid(solver, new float3(100, 100, 1), 0.0f, 0.5f, float3(0.0f, 0.0f, -0.5f));
 
