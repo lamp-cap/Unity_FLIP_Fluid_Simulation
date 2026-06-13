@@ -1,7 +1,9 @@
+using System.Collections;
 using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Mathematics;
 using static Unity.Mathematics.math;
+using UnityEngine;
 using UnityEngine.Profiling;
 
 namespace AVBD
@@ -146,13 +148,14 @@ namespace AVBD
 
         private void CreateManifold(Rigid bodyA, Rigid bodyB)
         {
+            Manifold m;
             if (_pool.Count > 0)
             {
-                var m = _pool.Pop();
+                m = _pool.Pop();
                 m.Reset(this, bodyA, bodyB);
             }
             else 
-                new Manifold(this, bodyA, bodyB);
+                m = new Manifold(this, bodyA, bodyB);
         }
 
         public void step()
@@ -238,20 +241,18 @@ namespace AVBD
                         lhsAng = MAng / (dt * dt),
                         lhsCross = float3x3(0, 0, 0, 0, 0, 0, 0, 0, 0),
                         rhsLin = mul(MLin / (dt * dt), body.positionLin - body.inertialLin),
-                        rhsAng = mul(MAng / (dt * dt), body.positionAng.sub(body.inertialAng)),
+                        rhsAng = mul(MAng / (dt * dt), body.positionAng.sub(body.inertialAng))
                     };
-
-                    Profiler.BeginSample("Force Primal update");
+                    
                     // Iterate over all forces acting on the body
                     foreach (Force force in body.forces)
                     {
                         // Stamp the force and hessian into the linear system
                         force.updatePrimal(body, alpha, _eq6);
                     }
-                    Profiler.EndSample();
                     
                     // Solve the SPD linear system using LDL and apply the update (Eq. 4)
-                    _eq6.Value.SolveEq6(out float3 dxLin, out float3 dxAng);
+                    _eq6.Value.SolveEq6(out var dxLin, out var dxAng);
                     
                     body.positionLin = body.positionLin + dxLin;
                     body.positionAng = body.positionAng.add(dxAng);

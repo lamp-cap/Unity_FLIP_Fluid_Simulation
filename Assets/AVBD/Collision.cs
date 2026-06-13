@@ -57,25 +57,25 @@ namespace AVBD
             _bool.Dispose();
         }
 
-        private static bool TestAxis(in Utils.OBB boxA, in Utils.OBB boxB, in float3 delta, in float3 axis)
+        private static bool TestAxis(in OBB boxA, in OBB boxB, in float3 delta, in float3 axis)
         {
             float lenSq = lengthsq(axis);
-            if (lenSq < 1e-6f)
+            if (lenSq < SAT_AXIS_EPSILON)
                 return true;
 
-            float3 n = axis;
+            float3 n = axis * rsqrt(lenSq);
             if (dot(n, delta) < 0.0f)
                 n = -n;
 
             float distance = abs(dot(delta, n));
 
-            float rA = dot(boxA.half, abs(math.mul(boxA.axis, n)));
-            float rB = dot(boxB.half, abs(math.mul(boxB.axis, n)));
+            float rA = dot(boxA.half, abs(mul(n, boxA.axis)));
+            float rB = dot(boxB.half, abs(mul(n, boxB.axis)));
 
             float separation = distance - (rA + rB);
             return separation <= 0.0f;
         }
-        
+
         public bool Collide(Rigid bodyA, Rigid bodyB)
         {
             new CollideJob(bodyA, bodyB, _bool).Run();
@@ -85,14 +85,14 @@ namespace AVBD
         [BurstCompile]
         struct CollideJob : IJob
         {
-            private Utils.OBB _boxA;
-            private Utils.OBB _boxB;
+            private OBB _boxA;
+            private OBB _boxB;
             private NativeReference<bool> _result;
             
             public CollideJob(Rigid a, Rigid b, NativeReference<bool> result)
             {
-                _boxA = Utils.makeOBB(a);
-                _boxB = Utils.makeOBB(b);
+                _boxA = OBB.makeOBB(a);
+                _boxB = OBB.makeOBB(b);
                 result.Value = false;
                 _result = result;
             }
@@ -102,16 +102,12 @@ namespace AVBD
                 float3 delta = _boxB.center - _boxA.center;
             
                 for (int i = 0; i < 3; ++i)
-                {
                     if (!TestAxis(_boxA, _boxB, delta, _boxA.axis[i]))
                         return;
-                }
 
                 for (int i = 0; i < 3; ++i)
-                {
                     if (!TestAxis(_boxA, _boxB, delta, _boxB.axis[i]))
                         return;
-                }
 
                 for (int i = 0; i < 3; ++i)
                 for (int j = 0; j < 3; ++j)
@@ -125,11 +121,11 @@ namespace AVBD
             }
         }
         
-        public int collide(Rigid bodyA, Rigid bodyB, NativeArray<Manifold.Contact> contacts, out float3x3 basisOut)
+        public int Collide(Rigid bodyA, Rigid bodyB, NativeArray<Manifold.Contact> contacts, out float3x3 basisOut)
         {
             basisOut = new float3x3();
-            Utils.OBB boxA = Utils.makeOBB(bodyA);
-            Utils.OBB boxB = Utils.makeOBB(bodyB);
+            OBB boxA = OBB.makeOBB(bodyA);
+            OBB boxB = OBB.makeOBB(bodyB);
             
             new SatJob(boxA, boxB, _result).Run();
             var r = _result.Value;
@@ -152,44 +148,27 @@ namespace AVBD
             return contactCount;
         }
 
-        private static float3 supportPoint(in Utils.OBB box, in float3 dir)
+        private static float3 supportPoint(in OBB box, in float3 dir)
         {
-            float sx = dot(dir, box.axis[0]) >= 0.0f ? 1.0f : -1.0f;
-            float sy = dot(dir, box.axis[1]) >= 0.0f ? 1.0f : -1.0f;
-            float sz = dot(dir, box.axis[2]) >= 0.0f ? 1.0f : -1.0f;
+            var s = select(-box.half, box.half, mul(dir, box.axis) >= 0.0f);
 
             return box.center
-                   + box.axis[0] * (box.half.x * sx)
-                   + box.axis[1] * (box.half.y * sy)
-                   + box.axis[2] * (box.half.z * sz);
+                   + box.axis[0] * s.x
+                   + box.axis[1] * s.y
+                   + box.axis[2] * s.z;
         }
 
-        private static void getFaceAxes(in Utils.OBB box, int axisIndex, out float3 u, out float3 v, out float extentU, out float extentV)
+        private static void getFaceAxes(in OBB box, int axisIndex, out float3 u, out float3 v, out float extentU, out float extentV)
         {
-            if (axisIndex == 0)
-            {
-                u = box.axis[1];
-                v = box.axis[2];
-                extentU = box.half.y;
-                extentV = box.half.z;
-            }
-            else if (axisIndex == 1)
-            {
-                u = box.axis[0];
-                v = box.axis[2];
-                extentU = box.half.x;
-                extentV = box.half.z;
-            }
-            else
-            {
-                u = box.axis[0];
-                v = box.axis[1];
-                extentU = box.half.x;
-                extentV = box.half.y;
-            }
+            int a = axisIndex > 0 ? 0 : 1;
+            int b = axisIndex > 1 ? 1 : 2;
+            u = box.axis[a];
+            v = box.axis[b];
+            extentU = box.half[a];
+            extentV = box.half[b];
         }
 
-        private static void buildFaceFrame(in Utils.OBB box, int axisIndex,in float3 outwardNormal, out FaceFrame frame)
+        private static void buildFaceFrame(in OBB box, int axisIndex,in float3 outwardNormal, out FaceFrame frame)
         {
             float sign = dot(outwardNormal, box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
             frame.axisIndex = axisIndex;
@@ -198,7 +177,7 @@ namespace AVBD
             getFaceAxes(box, axisIndex, out frame.u, out frame.v, out frame.extentU, out frame.extentV);
         }
 
-        private static int chooseIncidentFaceAxis(in Utils.OBB box, in float3 referenceNormal)
+        private static int chooseIncidentFaceAxis(in OBB box, in float3 referenceNormal)
         {
             int axis = 0;
             float best = -float.MaxValue;
@@ -216,7 +195,7 @@ namespace AVBD
             return axis;
         }
 
-        private static void buildIncidentFace(in Utils.OBB box, int axisIndex, float3 referenceNormal, NativeArray<float3> outVerts)
+        private static void buildIncidentFace(in OBB box, int axisIndex, in float3 referenceNormal, NativeArray<float3> outVerts)
         {
             float sign = dot(box.axis[axisIndex], referenceNormal) > 0.0f ? -1.0f : 1.0f;
             float3 faceNormal = box.axis[axisIndex] * sign;
@@ -224,13 +203,16 @@ namespace AVBD
 
             getFaceAxes(box, axisIndex, out var u, out var v, out var extentU, out var extentV);
 
-            outVerts[0] = faceCenter + u * extentU + v * extentV;
-            outVerts[1] = faceCenter - u * extentU + v * extentV;
-            outVerts[2] = faceCenter - u * extentU - v * extentV;
-            outVerts[3] = faceCenter + u * extentU - v * extentV;
+            u *= extentU;
+            v *= extentV;
+            
+            outVerts[0] = faceCenter + u + v;
+            outVerts[1] = faceCenter - u + v;
+            outVerts[2] = faceCenter - u - v;
+            outVerts[3] = faceCenter + u - v;
         }
 
-        private static int clipPolygonAgainstPlane(in NativeArray<float3> inVerts, int inCount, float3 planeNormal, float planeOffset, NativeArray<float3> outVerts)
+        private static int clipPolygonAgainstPlane(in NativeArray<float3> inVerts, int inCount, in float3 planeNormal, float planeOffset, NativeArray<float3> outVerts)
         {
             if (inCount <= 0)
                 return 0;
@@ -252,7 +234,7 @@ namespace AVBD
                     float t = 0.0f;
                     float denom = da - db;
                     if (abs(denom) > SAT_AXIS_EPSILON)
-                        t = clamp(da / denom, 0.0f, 1.0f);
+                        t = saturate(da / denom);
 
                     if (outCount < MAX_POLY_VERTS)
                         outVerts[outCount++] = a + (b - a) * t;
@@ -297,7 +279,7 @@ namespace AVBD
             return true;
         }
 
-        private static bool testAxis(in Utils.OBB boxA, in Utils.OBB boxB, float3 delta, float3 axis, AxisType type,
+        private static bool testAxis(in OBB boxA, in OBB boxB, in float3 delta, in float3 axis, AxisType type,
             int indexA, int indexB, ref SatAxis best)
         {
             float lenSq = lengthsq(axis);
@@ -310,8 +292,8 @@ namespace AVBD
 
             float distance = abs(dot(delta, n));
 
-            float rA = dot(boxA.half, abs(mul(boxA.axis, n)));
-            float rB = dot(boxB.half, abs(mul(boxB.axis, n)));
+            float rA = dot(boxA.half, abs(mul(n, boxA.axis)));
+            float rB = dot(boxB.half, abs(mul(n, boxB.axis)));
 
             float separation = distance - (rA + rB);
             if (separation > 0.0f)
@@ -330,7 +312,7 @@ namespace AVBD
             return true;
         }
 
-        private static void supportEdge(in Utils.OBB box, int axisIndex, float3 dir, out float3 edgeA, out float3 edgeB)
+        private static void supportEdge(in OBB box, int axisIndex, in float3 dir, out float3 edgeA, out float3 edgeB)
         {
             int axis1 = (axisIndex + 1) % 3;
             int axis2 = (axisIndex + 2) % 3;
@@ -346,7 +328,7 @@ namespace AVBD
             edgeB = edgeCenter + box.axis[axisIndex] * box.half[axisIndex];
         }
 
-        private static void closestPointsOnSegments(float3 p0, float3 p1, float3 q0, float3 q1, out float3 c0, out float3 c1)
+        private static void closestPointsOnSegments(in float3 p0, in float3 p1, in float3 q0, in float3 q1, out float3 c0, out float3 c1)
         {
             float3 d1 = p1 - p0;
             float3 d2 = q1 - q0;
@@ -367,14 +349,14 @@ namespace AVBD
 
             if (a <= SAT_AXIS_EPSILON)
             {
-                t = clamp(f / e, 0.0f, 1.0f);
+                t = saturate(f / e);
             }
             else
             {
                 float c = dot(d1, r);
                 if (e <= SAT_AXIS_EPSILON)
                 {
-                    s = clamp(-c / a, 0.0f, 1.0f);
+                    s = saturate(-c / a);
                 }
                 else
                 {
@@ -382,19 +364,19 @@ namespace AVBD
                     float denom = a * e - b * b;
 
                     if (abs(denom) > SAT_AXIS_EPSILON)
-                        s = clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+                        s = saturate((b * f - c * e) / denom);
 
                     t = (b * s + f) / e;
 
                     if (t < 0.0f)
                     {
                         t = 0.0f;
-                        s = clamp(-c / a, 0.0f, 1.0f);
+                        s = saturate(-c / a);
                     }
                     else if (t > 1.0f)
                     {
                         t = 1.0f;
-                        s = clamp((b - c) / a, 0.0f, 1.0f);
+                        s = saturate((b - c) / a);
                     }
                 }
             }
@@ -403,11 +385,11 @@ namespace AVBD
             c1 = q0 + d2 * t;
         }
 
-        private static int buildFaceManifold(Rigid bodyA, Rigid bodyB, in Utils.OBB boxA, in Utils.OBB boxB,
+        private static int buildFaceManifold(Rigid bodyA, Rigid bodyB, in OBB boxA, in OBB boxB,
             bool referenceIsA, int referenceAxis, float3 normalAB, NativeArray<Manifold.Contact> contacts)
         {
-            Utils.OBB referenceBox = referenceIsA ? boxA : boxB;
-            Utils.OBB incidentBox = referenceIsA ? boxB : boxA;
+            OBB referenceBox = referenceIsA ? boxA : boxB;
+            OBB incidentBox = referenceIsA ? boxB : boxA;
             float3 referenceOutward = referenceIsA ? normalAB : -normalAB;
 
             FaceFrame referenceFace;
@@ -474,7 +456,7 @@ namespace AVBD
             return contactCount;
         }
 
-        private static int buildEdgeContact(Rigid bodyA, Rigid bodyB, in Utils.OBB boxA, in Utils.OBB boxB, int axisA, int axisB,
+        private static int buildEdgeContact(Rigid bodyA, Rigid bodyB, in OBB boxA, in OBB boxB, int axisA, int axisB,
             float3 normalAB, NativeArray<Manifold.Contact> contacts)
         {
             supportEdge(boxA, axisA, normalAB, out var a0, out var a1);
@@ -502,12 +484,12 @@ namespace AVBD
         [BurstCompile]
         private struct SatJob : IJob
         {
-            private Utils.OBB _boxA;
-            private Utils.OBB _boxB;
+            private OBB _boxA;
+            private OBB _boxB;
             private NativeReference<CollideResult> _result;
 
-            public SatJob(Utils.OBB boxA,
-                Utils.OBB boxB,
+            public SatJob(OBB boxA,
+                OBB boxB,
                 NativeReference<CollideResult> result)
             {
                 _boxA = boxA;

@@ -7,6 +7,7 @@ namespace AVBD
     public class ArgumentedVertexBlockDescent : MonoBehaviour
     {
         public SceneInitType type = SceneInitType.Ground;
+        public bool drawJoint;
         public bool drawContact;
 
         private Solver _solver;
@@ -31,7 +32,7 @@ namespace AVBD
         private void OnDrawGizmos()
         {
             if (_solver != null)
-                drawSolver(_solver);
+                DrawSolver(_solver);
         }
 
         #region Draw Scene
@@ -66,7 +67,7 @@ namespace AVBD
             return Utils.transform(body.positionLin, body.positionAng, local);
         }
 
-        void drawBody(Rigid body)
+        void DrawBody(Rigid body)
         {
             Gizmos.color = new(0.80f, 0.84f, 0.90f);
             // for (int i = 0; i < 12; ++i)
@@ -85,7 +86,7 @@ namespace AVBD
             }
         }
 
-        void drawJoint(Joint joint)
+        void DrawJoint(Joint joint)
         {
             float3 v0 = joint.bodyA != null ? Utils.transform(joint.bodyA.positionLin, joint.bodyA.positionAng, joint.rA).xzy : joint.rA.xzy;
             float3 v1 = Utils.transform(joint.bodyB.positionLin, joint.bodyB.positionAng, joint.rB).xzy;
@@ -94,7 +95,7 @@ namespace AVBD
             Gizmos.DrawLine(v0, v1);
         }
 
-        void drawSpring(Spring spring)
+        void DrawSpring(Spring spring)
         {
             float3 v0 = Utils.transform(spring.bodyA.positionLin, spring.bodyA.positionAng, spring.rA).xzy;
             float3 v1 = Utils.transform(spring.bodyB.positionLin, spring.bodyB.positionAng, spring.rB).xzy;
@@ -103,7 +104,7 @@ namespace AVBD
             Gizmos.DrawLine(v0, v1);
         }
 
-        void drawManifold(Manifold manifold)
+        void DrawManifold(Manifold manifold)
         {
 
             Gizmos.color = new Color(0.75f, 0.0f, 0.0f);
@@ -116,22 +117,22 @@ namespace AVBD
             }
         }
 
-        void drawSolver(Solver state)
+        void DrawSolver(Solver state)
         {
             // Draw dynamic bodies after shadows so they appear cleanly on top.
             foreach (Rigid body in state.bodies)
-                drawBody(body);
+                DrawBody(body);
 
             foreach (Force force in state.forces)
             {
                 switch (force)
                 {
                     case (Joint joint):
-                        drawJoint(joint); break;
+                        if (drawJoint) DrawJoint(joint); break;
                     case (Spring spring):
-                        drawSpring(spring); break;
+                        DrawSpring(spring); break;
                     case (Manifold manifold):
-                        if (drawContact) drawManifold(manifold); break;
+                        if (drawContact) DrawManifold(manifold); break;
                 }
             }
         }

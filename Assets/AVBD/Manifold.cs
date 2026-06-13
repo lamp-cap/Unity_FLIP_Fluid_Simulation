@@ -66,7 +66,7 @@ namespace AVBD
             // Compute new contacts
             var newContacts = new NativeArray<Contact>(8, Allocator.Temp);
             Profiler.BeginSample("Collide");
-            int newNumContacts = collision.collide(bodyA, bodyB, newContacts, out basis);
+            int newNumContacts = collision.Collide(bodyA, bodyB, newContacts, out basis);
             Profiler.EndSample();
 
             // Merge old contact data with new contacts
@@ -94,7 +94,8 @@ namespace AVBD
             numContacts = newNumContacts;
             if (numContacts > 0 && !contacts.IsCreated)
                 contacts = new NativeArray<Contact>(8, Allocator.Persistent);
-            contacts.CopyFrom(newContacts);
+            for (int i = 0; i < numContacts; i++)
+                contacts[i] = newContacts[i];
 
             newContacts.Dispose();
 

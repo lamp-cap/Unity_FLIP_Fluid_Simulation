@@ -12,7 +12,7 @@ namespace AVBD
         public float3 rhsLin;
         public float3 rhsAng;
 
-        public readonly void solve(out float3 xLin, out float3 xAng)
+        public readonly void Solve(out float3 xLin, out float3 xAng)
         {
             xLin = xAng = float3(0);
             // Extract elements from lower triangle storage
@@ -81,6 +81,26 @@ namespace AVBD
             xLin[0] = z1 - L21 * xLin[1] - L31 * xLin[2] - L41 * xAng[0] - L51 * xAng[1] - L61 * xAng[2];
         }
     }
+
+    struct OBB
+    {
+        public float3 center;
+        public quaternion rotation;
+        public float3 half;
+        public float3x3 axis;
+
+        public static OBB makeOBB(Rigid body)
+        {
+            OBB box = new OBB();
+            box.center = body.positionLin;
+            box.rotation = body.positionAng;
+            box.half = body.size * 0.5f;
+            box.axis[0] = rotate(body.positionAng, float3(1.0f, 0.0f, 0.0f));
+            box.axis[1] = rotate(body.positionAng, float3(0.0f, 1.0f, 0.0f));
+            box.axis[2] = rotate(body.positionAng, float3(0.0f, 0.0f, 1.0f));
+            return box;
+        }
+    };
     
     [BurstCompile]
     public static class Utils
@@ -106,45 +126,32 @@ namespace AVBD
                 a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
                 a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
         }
-        
+
         public static float3 sub(in this quaternion a, in quaternion b)
         {
-            return a.value.sub(b.value);
+            return a.value.mul(inverse(b).value).xyz * 2.0f;
         }
-        
-        private static float3 sub(in this float4 a, in float4 b)
-        {
-            return a.mul(inverse(b)).xyz * 2;
-        }
-        
+
         public static quaternion add(in this quaternion a, in float3 b)
         {
             return normalize(a.value + new float4(b.x, b.y, b.z, 0).mul(a.value) * 0.5f);
         }
-        
+
         public static float3x3 outer(in this float3 a, in float3 b)
         {
             return transpose(float3x3(b * a.x, b * a.y, b * a.z));
         }
-        public static float4 conjugate(in this float4 q)
-        {
-            return float4(-q.x, -q.y, -q.z, q.w);
-        }
+        
         public static float3x3 diagonal(float m00, float m11, float m22)
         {
             return float3x3(m00, 0, 0, 0, m11, 0, 0, 0, m22);
         }
-        
-        public static float4 inverse(in float4 q)
-        {
-            return conjugate(q) / lengthsq(q);
-        }
-        
+
         public static float3 transform(in float3 qLin, in quaternion qAng, in float3 v)
         {
             return rotate(qAng, v) + qLin;
         }
-        
+
         public static float3x3 orthonormal(in float3 normal)
         {
             float3 t1 = abs(normal.x) > abs(normal.z)
@@ -154,37 +161,16 @@ namespace AVBD
             float3 t2 = cross(normal, t1);
             return transpose(float3x3(normal, t1, t2));
         }
-        
+
         public static float3x3 diagonalize(in float3x3 m)
         {
             return diagonal(length(m.c0), length(m.c1), length(m.c2));
         }
-        
-        public struct OBB
-        {
-            public float3 center;
-            public quaternion rotation;
-            public float3 half;
-            public float3x3 axis;
-        };
 
-        public static OBB makeOBB(Rigid body)
-        {
-            OBB box = new OBB();
-            box.center = body.positionLin;
-            box.rotation = body.positionAng;
-            box.half = body.size * 0.5f;
-            box.axis[0] = rotate(body.positionAng, float3(1.0f, 0.0f, 0.0f));
-            box.axis[1] = rotate(body.positionAng, float3(0.0f, 1.0f, 0.0f));
-            box.axis[2] = rotate(body.positionAng, float3(0.0f, 0.0f, 1.0f));
-            return box;
-        }
-        
-        
         [BurstCompile]
-        public static void SolveEq6(in this Equation6 eq6, out float3 xLin, out float3 xAng)
+        public static void SolveEq6(in this Equation6 eq, out float3 a, out float3 b)
         {
-            eq6.solve(out xLin, out xAng);
+            eq.Solve(out a, out b);
         }
     }
 }
