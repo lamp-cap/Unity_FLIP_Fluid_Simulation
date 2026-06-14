@@ -121,11 +121,9 @@ namespace AVBD
             }
         }
         
-        public int Collide(Rigid bodyA, Rigid bodyB, NativeArray<Manifold.Contact> contacts, out float3x3 basisOut)
+        public int Collide(in OBB boxA, in OBB boxB, NativeArray<Manifold.Contact> contacts, out float3x3 basisOut)
         {
             basisOut = new float3x3();
-            OBB boxA = OBB.makeOBB(bodyA);
-            OBB boxB = OBB.makeOBB(bodyB);
             
             new SatJob(boxA, boxB, _result).Run();
             var r = _result.Value;
@@ -139,11 +137,11 @@ namespace AVBD
 
             int contactCount = r.best.type switch
             {
-                AxisType.AXIS_EDGE => buildEdgeContact(bodyA, bodyB, boxA, boxB, r.best.indexA, r.best.indexB,
+                AxisType.AXIS_EDGE => buildEdgeContact(boxA, boxB, r.best.indexA, r.best.indexB,
                     r.best.normalAB, contacts),
-                AxisType.AXIS_FACE_A => buildFaceManifold(bodyA, bodyB, boxA, boxB, true, r.best.indexA, r.best.normalAB,
+                AxisType.AXIS_FACE_A => buildFaceManifold(boxA, boxB, true, r.best.indexA, r.best.normalAB,
                     contacts),
-                _ => buildFaceManifold(bodyA, bodyB, boxA, boxB, false, r.best.indexB, r.best.normalAB, contacts)
+                _ => buildFaceManifold(boxA, boxB, false, r.best.indexB, r.best.normalAB, contacts)
             };
             return contactCount;
         }
@@ -250,7 +248,7 @@ namespace AVBD
             return outCount;
         }
 
-        private static bool addContact(Rigid bodyA, Rigid bodyB, NativeArray<Manifold.Contact> contacts, ref int contactCount,
+        private static bool addContact(in OBB boxA, in OBB boxB, NativeArray<Manifold.Contact> contacts, ref int contactCount,
             NativeArray<float3> contactMidpoints, float3 xA, float3 xB, int featureKey)
         {
             float3 midpoint = (xA + xB) * 0.5f;
@@ -270,8 +268,8 @@ namespace AVBD
 
             Manifold.Contact c = contacts[contactCount];
             c.feature = feature;
-            c.rA = rotate(conjugate(bodyA.positionAng), xA - bodyA.positionLin);
-            c.rB = rotate(conjugate(bodyB.positionAng), xB - bodyB.positionLin);
+            c.rA = rotate(conjugate(boxA.rotation), xA - boxA.center);
+            c.rB = rotate(conjugate(boxB.rotation), xB - boxB.center);
             contacts[contactCount] = c;
             contactMidpoints[contactCount] = midpoint;
             ++contactCount;
@@ -385,7 +383,7 @@ namespace AVBD
             c1 = q0 + d2 * t;
         }
 
-        private static int buildFaceManifold(Rigid bodyA, Rigid bodyB, in OBB boxA, in OBB boxB,
+        private static int buildFaceManifold(in OBB boxA, in OBB boxB,
             bool referenceIsA, int referenceAxis, float3 normalAB, NativeArray<Manifold.Contact> contacts)
         {
             OBB referenceBox = referenceIsA ? boxA : boxB;
@@ -443,20 +441,20 @@ namespace AVBD
                 float3 xA = referenceIsA ? pReference : pIncident;
                 float3 xB = referenceIsA ? pIncident : pReference;
 
-                addContact(bodyA, bodyB, contacts, ref contactCount, contactMidpoints, xA, xB, featurePrefix | (i & 0xFF));
+                addContact(boxA, boxB, contacts, ref contactCount, contactMidpoints, xA, xB, featurePrefix | (i & 0xFF));
             }
 
             if (contactCount == 0)
             {
                 float3 xA = supportPoint(boxA, normalAB);
                 float3 xB = supportPoint(boxB, -normalAB);
-                addContact(bodyA, bodyB, contacts, ref contactCount, contactMidpoints, xA, xB, featurePrefix);
+                addContact(boxA, boxB, contacts, ref contactCount, contactMidpoints, xA, xB, featurePrefix);
             }
 
             return contactCount;
         }
 
-        private static int buildEdgeContact(Rigid bodyA, Rigid bodyB, in OBB boxA, in OBB boxB, int axisA, int axisB,
+        private static int buildEdgeContact(in OBB boxA, in OBB boxB, int axisA, int axisB,
             float3 normalAB, NativeArray<Manifold.Contact> contacts)
         {
             supportEdge(boxA, axisA, normalAB, out var a0, out var a1);
@@ -469,13 +467,13 @@ namespace AVBD
             int contactCount = 0;
             var contactMidpoints= new NativeArray<float3>(MAX_CONTACTS,Allocator.Temp);
             int featureKey = ((int)AxisType.AXIS_EDGE << 24) | ((axisA & 0xFF) << 8) | (axisB & 0xFF);
-            addContact(bodyA, bodyB, contacts, ref contactCount, contactMidpoints, xA, xB, featureKey);
+            addContact(boxA, boxB, contacts, ref contactCount, contactMidpoints, xA, xB, featureKey);
 
             if (contactCount == 0)
             {
                 xA = supportPoint(boxA, normalAB);
                 xB = supportPoint(boxB, -normalAB);
-                addContact(bodyA, bodyB, contacts, ref contactCount, contactMidpoints, xA, xB, featureKey);
+                addContact(boxA, boxB, contacts, ref contactCount, contactMidpoints, xA, xB, featureKey);
             }
 
             return contactCount;

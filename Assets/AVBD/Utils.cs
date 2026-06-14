@@ -82,7 +82,7 @@ namespace AVBD
         }
     }
 
-    struct OBB
+    public struct OBB
     {
         public float3 center;
         public quaternion rotation;
