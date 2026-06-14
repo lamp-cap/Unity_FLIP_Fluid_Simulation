@@ -110,7 +110,7 @@ namespace AVBD.RigidOnly
                 }
             
                 // 4. 提取重排后的物体索引
-                for (int i = 0; i < Nodes.Length; i++)
+                for (int i = 0; i < nodeCount; i++)
                 {
                     var node = Nodes[i];
                     if (node.IsLeaf)

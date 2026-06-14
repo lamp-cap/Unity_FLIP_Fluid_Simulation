@@ -1,17 +1,30 @@
 using System.Collections.Generic;
 using Unity.Mathematics;
+using UnityEditor;
 using UnityEngine;
 using static Unity.Mathematics.math;
 using Random = UnityEngine.Random;
 
 namespace AVBD.RigidOnly
 {
+    [CustomEditor(typeof(ArgumentedVertexBlockDescent))]
+    public class AVBDEditor : Editor
+    {
+        public override void OnInspectorGUI()
+        {
+            base.OnInspectorGUI();
+            if (GUILayout.Button("Reset"))
+            {
+                ((ArgumentedVertexBlockDescent)target).ResetScene();
+            }
+        }
+    }
     public class ArgumentedVertexBlockDescent : MonoBehaviour
     {
         public SceneInitType type = SceneInitType.Ground;
         public bool drawContact;
         private Camera _camera;
-        [Range(0, 10)] public float v0 = 5;
+        [Range(0, 20)] public float v0 = 5;
         public Material mat;
         public Mesh cube;
         private ComputeBuffer _buffer;
@@ -33,6 +46,11 @@ namespace AVBD.RigidOnly
                 alignment = TextAnchor.MiddleLeft,
             };
             _toAdd = new Stack<(float3, float3)>();
+        }
+
+        public void ResetScene()
+        {
+            func[(int)type].Invoke(_solver);
         }
 
         // Update is called once per frame
@@ -195,17 +213,18 @@ namespace AVBD.RigidOnly
             solver.CreateRigid(new float3(100, 100, 1), 0.0f, 0.5f, float3(0, 0, 0));
 
             const float angle = TORADIANS * 30.0f;
-            var ramp = solver.CreateRigid(float3(40, 24, 1), 0.0f, 1.0f, float3(0, 0, 3));
-            ramp.positionAng = quaternion(0, sin(angle * 0.5f), 0, cos(angle * 0.5f));
+            var rot = quaternion(0, sin(angle * 0.5f), 0, cos(angle * 0.5f));
+            solver.CreateRigid(float3(40, 24, 1), 0.0f, 1.0f, float3(0, 0, 3), new float3(0), rot);
+            
 
-            float3 rampTangent = normalize(rotate(ramp.positionAng, float3(1, 0, 0)));
-            float3 rampNormal = normalize(rotate(ramp.positionAng, float3(0, 0, 1)));
+            float3 rampTangent = normalize(rotate(rot, float3(1, 0, 0)));
+            float3 rampNormal = normalize(rotate(rot, float3(0, 0, 1)));
 
             for (int i = 0; i <= 10; i++)
             {
                 float friction = i / 10.0f * 0.25f + 0.25f;
                 float y = -10.0f + i * 2.0f;
-                float3 pos = ramp.positionLin + rampTangent * -12.0f + float3(0, y, 0) + rampNormal * 1.05f;
+                float3 pos = float3(0, 0, 3) + rampTangent * -12.0f + float3(0, y, 0) + rampNormal * 1.05f;
                 solver.CreateRigid(float3(1,1,1), 1.0f, friction, pos);
             }
         }

@@ -139,24 +139,35 @@ namespace AVBD.RigidOnly
             return bestBody;
         }
 
-        public Rigid CreateRigid(float3 size, float density, float friction, float3 position)
+        public void CreateRigid(float3 size, float density, float friction, float3 position)
             => CreateRigid(size, density, friction, position, float3(0));
 
-        public Rigid CreateRigid(float3 size, float density, float friction, float3 position, float3 velocity)
+        public void CreateRigid(float3 size, float density, float friction, float3 position, float3 velocity)
         {
             var body = new Rigid(bodies.Length + 1, size, density, friction, position, velocity);
             _bodies.Add(body);
             _csr.Csr.Add(int4(0));
             _boxes.Add(new OBB());
             _cubes.Add(new Box());
-            return body;
+        }
+        
+        public void CreateRigid(float3 size, float density, float friction, float3 position, float3 velocity, quaternion rotation)
+        {
+            var body = new Rigid(bodies.Length + 1, size, density, friction, position, velocity);
+            body.positionAng = rotation;
+            _bodies.Add(body);
+            _csr.Csr.Add(int4(0));
+            _boxes.Add(new OBB());
+            _cubes.Add(new Box());
         }
 
         public void clear()
         {
-            
             forces.Clear();
             bodies.Clear();
+            _csr.Csr.Clear();
+            _boxes.Clear();
+            _cubes.Clear();
         }
 
         public void Dispose()
