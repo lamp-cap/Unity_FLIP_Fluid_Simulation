@@ -29,6 +29,7 @@
 .DS_Store
 .vs/
 .idea/
+.vscode/
 
 # 打包或导出的文件
 *.apk

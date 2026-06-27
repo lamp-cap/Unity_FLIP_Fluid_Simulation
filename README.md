@@ -2,7 +2,7 @@
 FLIP fluid simulation with MGPCG solver in unity
 
 ### Assets/GPU_FLIP
-A Incompressible Flow without viscosity using FLIP written in HLSL
+A Incompressible inviscid Flow using FLIP written in HLSL
 
 4M particles on 256x128x128 grid, simulated on GPU
 

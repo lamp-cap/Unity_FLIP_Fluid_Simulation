@@ -270,12 +270,12 @@ namespace AVBD.RigidOnly
         {
             solver.clear();
             solver.CreateRigid(new float3(150, 150, 1), 0.0f, 1f, float3(0, 0, 0));
-            for (int z = 0; z < 50; z++)
+            for (int z = 0; z < 80; z++)
             {
                 for (int x = 0; x < 10; x++)
                 for (int y = 0; y < 10; y++)
                     solver.CreateRigid(float3(1, 1, 1), 1.0f, 1.0f,
-                        float3(x * 1.5f - 7.5f, y * 1.5f - 7.5f, z * 1.5f + 1.0f));
+                        float3(x * 1.5f - 7.5f, y * 1.5f - 7.5f, z * 1.1f + 1.0f));
                         // Random.onUnitSphere);
             }
         }
