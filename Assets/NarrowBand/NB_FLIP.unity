@@ -151,8 +151,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 9f254d8d3204d374197726b4cb26a83d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  gravity: -9
-  flipness: 0.5
+  gravity: -10
+  flipness: 0.95
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: e18c57763f7bbce4e91ebffe70bc613b, type: 2}
 --- !u!4 &927855522

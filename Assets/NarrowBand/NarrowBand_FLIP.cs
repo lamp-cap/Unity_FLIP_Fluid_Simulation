@@ -34,7 +34,7 @@ namespace NarrowBand
         public const int GridRes = 256;
         public const int NumGrid = GridRes * GridRes;
         private const int Band1 = 2;
-        private const int Band2 = 4;
+        private const int Band2 = 3;
 
         private NativeArray<float2> _gridVelocity;
         private NativeArray<float2> _gridVelocityCopy;
@@ -43,7 +43,7 @@ namespace NarrowBand
         private NativeArray<float> _gridPressure;
         private NativeArray<uint> _gridType;
         private NativeArray<float3> _gridLaplacian;
-        private NativeArray<int> _gridSDF;
+        private NativeArray<float> _gridSDF;
         private NativeArray<int> _start;
         private NativeArray<int> _end;
         
@@ -78,7 +78,7 @@ namespace NarrowBand
             _range = new NativeArray<int2>(NumGrid, Allocator.Persistent);
             _gridDensity = new NativeArray<float>(NumGrid, Allocator.Persistent);
             _gridLaplacian = new NativeArray<float3>(NumGrid, Allocator.Persistent);
-            _gridSDF = new NativeArray<int>(NumGrid, Allocator.Persistent);
+            _gridSDF = new NativeArray<float>(NumGrid, Allocator.Persistent);
             _particleID = new NativeArray<int>(NumParticles, Allocator.Persistent);
             _particlePos = new NativeArray<float4>(NumParticles, Allocator.Persistent);
             _particleVelocity = new NativeArray<float2>(NumParticles, Allocator.Persistent);
@@ -96,7 +96,7 @@ namespace NarrowBand
             //     _particlePos[id] = new float4(pos * CellSize, 0, 1);
             // }
             int2 start = new int2(0, 0);
-            int2 end = new int2(255, 100);
+            int2 end = new int2(150, 150);
             for (int y = 0; y < GridRes; y++)
             for (int x = 0; x < GridRes; x++)
             {
@@ -122,6 +122,13 @@ namespace NarrowBand
                 Ids = _particleID,
                 GridVelocity = _gridVelocityCopy,
                 Ranges = _range,
+            }.Schedule(NumGrid, 32).Complete();
+
+            new SetGridTypeJob
+            {
+                Range = _range,
+                GridType = _gridType,
+                GridLevel = _gridSDF,
             }.Schedule(NumGrid, 32).Complete();
 
             _posBuffer = new ComputeBuffer(NumParticles, sizeof(float) * 4);
@@ -195,22 +202,6 @@ namespace NarrowBand
         private void Simulate()
         {
             int batchCount = 32;
-        
-            Profiler.BeginSample("Advection");
-            new ParticlesAdvectionJob
-            {
-                GridVelocity = _gridVelocity,
-                ParticlePos = _particlePos,
-                ParticleVel = _particleVelocity
-            }.Schedule(_particleCount.Value, batchCount).Complete();
-            
-            new GridsAdvectionJob()
-            {
-                GridVelocity = _gridVelocity,
-                GridVelocityAlt = _gridVelocityCopy,
-                GridTypes = _gridType
-            }.Schedule(NumGrid, batchCount).Complete();
-            Profiler.EndSample();
 
             Profiler.BeginSample("Clear Grid");
             new ClearGridJob()
@@ -261,8 +252,8 @@ namespace NarrowBand
             (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
 
             Profiler.EndSample();
-        
-            Profiler.BeginSample("P2G");
+            
+            Profiler.BeginSample("Resample");
 
             new SetGridTypeJob
             {
@@ -274,12 +265,26 @@ namespace NarrowBand
             new SetGridLevelJob(_gridSDF, _gridType).Schedule(NumGrid, batchCount).Complete();
             
             new ComputeDistanceFieldJob(_gridSDF).Run();
-
-            new ClearGridVelJob()
+            
+            new ParticlesCounterJob(_gridSDF, _range, _particleID, _particleCount).Run();
+            
+            new ResampleParticlesJob()
             {
-                GridVelocty = _gridVelocityCopy,
-                Level = _gridSDF
+                PosRaw = _particlePos,
+                VelRaw = _particleVelocity,
+                PosNew = _particlePosCopy,
+                VelNew = _particleVelocityCopy,
+                Ids = _particleID,
+                GridVelocity = _gridVelocityCopy,
+                Ranges = _range,
             }.Schedule(NumGrid, batchCount).Complete();
+
+            (_particlePos, _particlePosCopy) = (_particlePosCopy, _particlePos);
+            (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
+            
+            Profiler.EndSample();
+        
+            Profiler.BeginSample("P2G");
 
             new ComputeLaplacianJob
             {
@@ -361,26 +366,23 @@ namespace NarrowBand
             }.Schedule(_particleCount.Value, batchCount).Complete();
         
             Profiler.EndSample();
-            
-            Profiler.BeginSample("Resample");
-            
-            new ParticlesCounterJob(_gridSDF, _range, _particleID, _particleCount).Run();
-            
-            new ResampleParticlesJob()
+        
+            Profiler.BeginSample("Advection");
+            new ParticlesAdvectionJob
             {
-                PosRaw = _particlePos,
-                VelRaw = _particleVelocity,
-                PosNew = _particlePosCopy,
-                VelNew = _particleVelocityCopy,
-                Ids = _particleID,
-                GridVelocity = _gridVelocityCopy,
-                Ranges = _range,
-            }.Schedule(NumGrid, batchCount).Complete();
-
-            (_particlePos, _particlePosCopy) = (_particlePosCopy, _particlePos);
-            (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
+                GridVelocity = _gridVelocity,
+                ParticlePos = _particlePos,
+                ParticleVel = _particleVelocity
+            }.Schedule(_particleCount.Value, batchCount).Complete();
             
+            new GridsAdvectionJob()
+            {
+                GridVelocity = _gridVelocity,
+                GridVelocityAlt = _gridVelocityCopy,
+                GridTypes = _gridType
+            }.Schedule(NumGrid, batchCount).Complete();
             Profiler.EndSample();
+            // (_gridVelocity, _gridVelocityCopy) = (_gridVelocityCopy, _gridVelocity);
         }
 
         private void OnDrawGizmos()
@@ -393,16 +395,21 @@ namespace NarrowBand
             for (int y = 0; y < GridRes; y++)
             for (int x = 0; x < GridRes; x++)
             {
-                int level = _gridSDF[Coord2Idx(x, y)];
+                float level = _gridSDF[Coord2Idx(x, y)];
                 if (level < 0) continue;
-                float v = _gridPressure[Coord2Idx(x, y)] * 0.3f;
+                float v = _gridPressure[Coord2Idx(x, y)] * 0.15f + 0.1f;
                 // float2 v = _gridVelocityCopy[Coord2Idx(x, y)] * 0.3f + 0.5f;
-                Gizmos.color = new Color(v, v, 0, 0.5f);
+                Gizmos.color = new Color(v, v, v, 0.5f);
                 Gizmos.DrawCube(new Vector3((x + 0.5f) * CellSize * 0.1f, (y + 0.5f) * CellSize*0.1f, -0.1f), new Vector3(CellSize*0.1f, CellSize*0.1f, 0));
             }
         }
 
         #region Utils
+
+        private static float ReadGrid(int2 coord, NativeArray<float> block)
+        {
+            return block[Coord2Idx(math.clamp(coord, 0, GridRes - 1))];
+        }
 
         private static float2 ReadGrid(int2 coord, NativeArray<float2> block)
         {
@@ -500,19 +507,6 @@ namespace NarrowBand
         }
 
         [BurstCompile]
-        private struct ClearGridVelJob : IJobParallelFor
-        {
-            [ReadOnly] public NativeArray<int> Level;
-            [WriteOnly] public NativeArray<float2> GridVelocty;
-
-            public void Execute(int i)
-            {
-                if (Level[i] < 0)
-                    GridVelocty[i] = float2.zero;
-            }
-        }
-    
-        [BurstCompile]
         private struct HashJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<float4> Ps;
@@ -578,9 +572,9 @@ namespace NarrowBand
         private struct SetGridLevelJob : IJobParallelFor
         {
             [ReadOnly] private NativeArray<uint> _gridTypes;
-            [WriteOnly] private NativeArray<int> _gridLevel;
+            [WriteOnly] private NativeArray<float> _gridLevel;
             
-            public SetGridLevelJob(NativeArray<int> level, NativeArray<uint> gridTypes)
+            public SetGridLevelJob(NativeArray<float> level, NativeArray<uint> gridTypes)
             {
                 _gridLevel = level;
                 _gridTypes = gridTypes;
@@ -601,9 +595,9 @@ namespace NarrowBand
         [BurstCompile]
         private struct ComputeDistanceFieldJob : IJob
         {
-            private NativeArray<int> _gridLevel;
+            private NativeArray<float> _gridLevel;
             
-            public ComputeDistanceFieldJob(NativeArray<int> level)
+            public ComputeDistanceFieldJob(NativeArray<float> level)
             {
                 _gridLevel = level;
             }
@@ -614,7 +608,7 @@ namespace NarrowBand
                 int rightBound = GridRes - 1;
                 for (int i = 0; i < NumGrid; i++)
                 {
-                    int level = _gridLevel[i];
+                    float level = _gridLevel[i];
                     if (level <= 0) continue;
                     int2 coord = Idx2Coord(i);
                     if (coord.x > 0)
@@ -631,7 +625,7 @@ namespace NarrowBand
                 
                 for (int i = NumGrid - 1; i >= 0; i--)
                 {
-                    int level = _gridLevel[i];
+                    float level = _gridLevel[i];
                     if (level <= 0) continue;
                     int2 coord = Idx2Coord(i);
                     if (coord.x < rightBound)
@@ -651,12 +645,12 @@ namespace NarrowBand
         [BurstCompile]
         private struct ParticlesCounterInitJob : IJob
         {
-            [ReadOnly] private NativeArray<int> _gridLevel;
+            [ReadOnly] private NativeArray<float> _gridLevel;
             private NativeArray<int2> _range;
             [WriteOnly] private NativeArray<int> _particleIDs;
             [WriteOnly] private NativeReference<int> _pCount;
             
-            public ParticlesCounterInitJob(NativeArray<int> level, NativeArray<int2> range, NativeArray<int> particleIDs, NativeReference<int> pCount)
+            public ParticlesCounterInitJob(NativeArray<float> level, NativeArray<int2> range, NativeArray<int> particleIDs, NativeReference<int> pCount)
             {
                 _gridLevel = level;
                 _range = range;
@@ -685,12 +679,12 @@ namespace NarrowBand
         [BurstCompile]
         private struct ParticlesCounterJob : IJob
         {
-            [ReadOnly] private NativeArray<int> _gridLevel;
+            [ReadOnly] private NativeArray<float> _gridLevel;
             private NativeArray<int2> _range;
             [WriteOnly] private NativeArray<int> _particleIDs;
             [WriteOnly] private NativeReference<int> _pCount;
             
-            public ParticlesCounterJob(NativeArray<int> level, NativeArray<int2> range, NativeArray<int> particleIDs, NativeReference<int> pCount)
+            public ParticlesCounterJob(NativeArray<float> level, NativeArray<int2> range, NativeArray<int> particleIDs, NativeReference<int> pCount)
             {
                 _gridLevel = level;
                 _range = range;
@@ -825,7 +819,7 @@ namespace NarrowBand
         private struct SetGridTypeJob :IJobParallelFor
         {
             [ReadOnly] public NativeArray<int2> Range;
-            [ReadOnly] public NativeArray<int> GridLevel;
+            [ReadOnly] public NativeArray<float> GridLevel;
             [WriteOnly] public NativeArray<uint> GridType;
 
             public void Execute(int i)
@@ -845,7 +839,7 @@ namespace NarrowBand
                 if (math.any(coord < 0) || math.any(coord > GridRes - 1))
                     return SOLID;
                 int i = Coord2Idx(coord);
-                if (GridLevel[i] >= 2) return FLUID;
+                if (GridLevel[i] >= Band1) return FLUID;
                 int2 range = Range[i];
                 return range.y > range.x ? FLUID : AIR;
             }
@@ -857,21 +851,20 @@ namespace NarrowBand
             [ReadOnly] public NativeArray<float4> ParticlePos;
             [ReadOnly] public NativeArray<float2> ParticleVel;
             [ReadOnly] public NativeArray<int2> Range;
-            [ReadOnly] public NativeArray<int> GridLevel;
+            [ReadOnly] public NativeArray<float> GridLevel;
             public NativeArray<float2> GridVelocity;
             [WriteOnly] public NativeArray<float> GridDensity;
 
             public void Execute(int i)
             {
-                int level = GridLevel[i];
-                if (level >= Band1)
+                int2 coord = Idx2Coord(i);
+                float2 cellCenter = ((float2)coord + 0.5f) * CellSize;
+                float2 sdf = ReadGridFacesBilinear(cellCenter, GridLevel);
+                if (math.all(sdf > Band1))
                 {
                     GridDensity[i] = TargetDensity;
                     return;
                 }
-                int2 coord = Idx2Coord(i);
-                
-                float2 cellCenter = ((float2)coord + 0.5f) * CellSize;
 
                 float2 velocity = float2.zero;
                 float2 sum = 0;
@@ -904,7 +897,9 @@ namespace NarrowBand
                     }
                 }
 
-                velocity = math.select(float2.zero, velocity / sum, sum > 1e-4f);
+                velocity = math.select(GridVelocity[i], velocity / sum, sum > 1e-4f);
+                // float2 oldVel = GridVelocity[i];
+                // velocity = math.select(velocity, oldVel, sdf >= Band1);
                 GridVelocity[i] = velocity;
                 GridDensity[i] = density;
             }
@@ -915,6 +910,27 @@ namespace NarrowBand
                 if (r2 >= 1) return 0;
                 float v = 1 - r2;
                 return v * v * v * 315f / (64 * math.PI);
+            }
+
+            private float2 ReadGridFacesBilinear(float2 pos, NativeArray<float> block)
+            {
+                return new float2(ReadGridFaceBilinear(pos * InvCellSize + new float2(-0.5f, -1f), block),
+                                  ReadGridFaceBilinear(pos * InvCellSize + new float2(-1f, -0.5f), block));
+            }
+            
+            private float ReadGridFaceBilinear(float2 uv, NativeArray<float> block)
+            {
+                uv = math.clamp(uv, 1e-3f, GridRes - 1e-3f);
+                int2 p00 = (int2)math.floor(uv);
+                int2 p11 = p00 + 1;
+                float2 f = uv - p00;
+                float c00 = ReadGrid(p00, block);
+                float c10 = ReadGrid(new int2(p11.x, p00.y), block);
+                float c01 = ReadGrid(new int2(p00.x, p11.y), block);
+                float c11 = ReadGrid(p11, block);
+                float c0 = math.lerp(c00, c10, f.x);
+                float c1 = math.lerp(c01, c11, f.x);
+                return math.lerp(c0, c1, f.y);
             }
         }
     
@@ -1020,8 +1036,8 @@ namespace NarrowBand
                 float2 vel = ParticleVel[i];
                 int2 coord = GetCoord(pos);
 
-                ReadGridFaceBilinear(pos, GridVelocityOld, GridVelocityNew, 
-                    out float2 gOriginVel, out float2 gVel);
+                // ReadGridFaceBilinear(pos, GridVelocityOld, GridVelocityNew, 
+                //     out float2 gOriginVel, out float2 gVel);
                 
                 // float2 p_pic_vel = gVel;
                 // float2 p_flip_vel = vel + (gVel - gOriginVel);
@@ -1036,15 +1052,13 @@ namespace NarrowBand
                     int2 nCoord = new int2(x, y);
                     int idx = Coord2Idx(math.clamp(nCoord, 0, GridRes - 1));
                     
-                    float2 g_vel = GridVelocityNew[idx];
-                    
                     float2 pos_u = (nCoord + new float2(0, 0.5f)) * CellSize;
                     float2 pos_v = (nCoord + new float2(0.5f, 0)) * CellSize;
                     
                     float2 weights = new float2(GetWeight(pos_u - pos, InvCellSize),
                         GetWeight(pos_v - pos, InvCellSize)); 
 
-                    float2 weightedNewV = weights * g_vel;
+                    float2 weightedNewV = weights * GridVelocityNew[idx];
                     float2 weightedOldV = weights * GridVelocityOld[idx];
                     
                     new_v += weightedNewV;
@@ -1190,26 +1204,38 @@ namespace NarrowBand
             public void Execute(int i)
             {
                 int2 coord = Idx2Coord(i);
-                float2 pos = ((float2)coord + 0.5f) * CellSize;
+                float2 cellCenter = ((float2)coord + 0.5f) * CellSize;
                 // using RK4
-                float2 k1 = ReadGridFaceBilinear(pos,  GridVelocity);
-                float2 k2 = ReadGridFaceBilinear(pos - 0.5f * DeltaTime * k1, GridVelocity);
-                float2 k3 = ReadGridFaceBilinear(pos - 0.5f * DeltaTime * k2, GridVelocity);
-                float2 k4 = ReadGridFaceBilinear(pos - DeltaTime * k3, GridVelocity);
-                var velocity = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0f;
+                float2 posFaceX = cellCenter + new float2(-0.5f * CellSize, 0);
+                float2 traceDirX = BackwardTrace(posFaceX, GridVelocity);
+                float vx = ReadGridFaceBilinear(posFaceX - traceDirX * DeltaTime, 0, GridVelocity);
 
+                float2 posFaceY = cellCenter + new float2(0, -0.5f * CellSize);
+                float2 traceDirY = BackwardTrace(posFaceY, GridVelocity);
+                float vy = ReadGridFaceBilinear(posFaceY - traceDirY * DeltaTime, 1, GridVelocity);
+                
                 uint grid_types = GridTypes[i];
-                GridVelocityAlt[i] = EnforceBoundaryCondition(velocity, grid_types);
+                GridVelocityAlt[i] = EnforceBoundaryCondition(new float2(vx, vy), grid_types);
             }
 
-            private float2 ReadGridFaceBilinear(float2 pos, NativeArray<float2> block)
+            private float2 BackwardTrace(float2 pos, NativeArray<float2> block)
             {
-                return new float2(ReadGridFaceBilinear(pos * InvCellSize + new float2(0, -0.5f), 0, block),
-                                  ReadGridFaceBilinear(pos * InvCellSize + new float2(-0.5f, 0), 1, block));
+                float2 k1 = ReadGridFacesBilinear(pos,  block);
+                float2 k2 = ReadGridFacesBilinear(pos - 0.5f * DeltaTime * k1, block);
+                float2 k3 = ReadGridFacesBilinear(pos - 0.5f * DeltaTime * k2, block);
+                float2 k4 = ReadGridFacesBilinear(pos - DeltaTime * k3, block);
+                return (k1 + 2 * k2 + 2 * k3 + k4) / 6.0f;
+            }
+
+            private float2 ReadGridFacesBilinear(float2 pos, NativeArray<float2> block)
+            {
+                return new float2(ReadGridFaceBilinear(pos, 0, block),
+                                  ReadGridFaceBilinear(pos, 1, block));
             }
             
-            private float ReadGridFaceBilinear(float2 uv, int axis, NativeArray<float2> block)
+            private float ReadGridFaceBilinear(float2 pos, int axis, NativeArray<float2> block)
             {
+                float2 uv = pos * InvCellSize + new float2(axis == 0 ? 0 : -0.5f, axis == 1 ? 0 : -0.5f);
                 uv = math.clamp(uv, 1e-3f, GridRes - 1e-3f);
                 int2 p00 = (int2)math.floor(uv);
                 int2 p11 = p00 + 1;
@@ -1254,60 +1280,6 @@ namespace NarrowBand
             }
         }
 
-        [BurstCompile]
-        private struct ParticleToGrid2Job : IJobParallelFor
-        {
-            [ReadOnly] public NativeArray<float4> ParticlePos;
-            [ReadOnly] public NativeArray<float2> ParticleVel;
-            [ReadOnly] public NativeArray<int2> Range;
-            [ReadOnly] public NativeArray<int> GridLevel;
-            public NativeArray<float2> GridVelocity;
-
-            public void Execute(int i)
-            {
-                int level = GridLevel[i];
-                if (level >= Band1)
-                {
-                    return;
-                }
-
-                int2 coord = Idx2Coord(i);
-                
-                float2 cellCenter = ((float2)coord + 0.5f) * CellSize;
-
-                float2 velocity = float2.zero;
-                float2 sum = 0;
-                float2 position_vx = cellCenter + new float2(-0.5f * CellSize, 0.0f);
-                float2 position_vy = cellCenter + new float2(0.0f, -0.5f * CellSize);
-
-                for (int x = math.max(coord.x - 2, 0); x <= math.min(coord.x + 1, GridRes - 1); ++x)
-                for (int y = math.max(coord.y - 2, 0); y <= math.min(coord.y + 1, GridRes - 1); ++y)
-                {
-                    var neighborIdx = Coord2Idx(x, y);
-                    int2 range = Range[neighborIdx];
-                    for (int j = range.x; j < range.y; j++)
-                    {
-                        float4 p = ParticlePos[j];
-                        float2 n_x = p.xy;
-                        var n_v = ParticleVel[j];
-                        
-                        float2 weight = new float2(
-                            GetWeight(position_vx - n_x, InvCellSize),
-                            GetWeight(position_vy - n_x, InvCellSize));
-                        
-                        sum += weight;
-                        
-                        velocity.x += weight.x * n_v.x;
-                        velocity.y += weight.y * n_v.y;
-                    
-                    }
-                }
-
-                velocity = math.select(float2.zero, velocity / sum, sum > 1e-4f);
-                GridVelocity[i] = velocity;
-            }
-        }
-    
         public void Test()
         {
             var pos = new float2(5 + UnityEngine.Random.value, 6 + UnityEngine.Random.value);
