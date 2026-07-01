@@ -111,7 +111,7 @@ namespace AVBD.Cloth
             // ---- 参数 ----
             _params = new ClothSolverParameters
             {
-                dt = 1f / 60f,
+                dt = 1f / 120f,
                 numSubsteps = substeps,
                 iterations = iterations,
                 miu = miu,
@@ -176,7 +176,7 @@ namespace AVBD.Cloth
             _params.iterations = iterations;
             _params.numSubsteps = substeps;
             _params.useBurst = useBurst;
-            _params.dt = useFixedTimestep ? 1f / 120f : Mathf.Min(Time.deltaTime, 1f / 30f);
+            _params.dt = 1f / 500f;
 
             _solver.Step();
 

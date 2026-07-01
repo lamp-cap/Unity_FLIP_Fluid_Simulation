@@ -1,6 +1,5 @@
 using Unity.Collections;
 using Unity.Mathematics;
-using static Unity.Mathematics.math;
 
 namespace AVBD.Cloth
 {

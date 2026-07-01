@@ -126,25 +126,18 @@ namespace AVBD.Cloth
 
             float3 newPos = Positions[v] + P.stepSize * dx;
 
-            // 保守边界截断
+            // 保守边界截断(对应 applyConservativeBoundTruncation)。
+            // bound 恒 >= 0:位移超出即截断回边界内,并标记下次迭代重检测。
             if (P.handleCollision != 0)
             {
                 float bound = ConservativeBounds[v];
-                if (bound < 0f)
+                float3 disp = newPos - PositionsAtPrevCD[v];
+                float dispLen = length(disp);
+                if (dispLen > bound && dispLen > 1e-12f)
                 {
-                    // 接触/穿透层哨兵:不截断(让排斥力推出),但标记需重检测继续跟踪
+                    disp *= (bound / dispLen);
+                    newPos = PositionsAtPrevCD[v] + disp;
                     TruncFlags[i] = 1;
-                }
-                else
-                {
-                    float3 disp = newPos - PositionsAtPrevCD[v];
-                    float dispLen = length(disp);
-                    if (dispLen > bound && dispLen > 1e-12f)
-                    {
-                        disp *= (bound / dispLen);
-                        newPos = PositionsAtPrevCD[v] + disp;
-                        TruncFlags[i] = 1;
-                    }
                 }
             }
 
@@ -264,8 +257,16 @@ namespace AVBD.Cloth
         void AccumulateVFContact(in ClothCollision.VFContact c, int order, float dt,
             ref float3 force, ref float3x3 hessian)
         {
-            float dis = c.dist;
+            // 用当前位置 + 冻结重心实时重算法向/距离(对应参考 accumulateVFContactForceAndHessian
+            // 的 n=(x-contactPoint).normalized()),避免冻结伪法向锁死在穿透侧导致稳定穿模。
+            int3 fvN = FaceVerts[c.face];
+            float3 contactPoint = c.bary.x * Positions[fvN.x]
+                                + c.bary.y * Positions[fvN.y]
+                                + c.bary.z * Positions[fvN.z];
+            float3 diff = Positions[c.v] - contactPoint; // 接触点 -> 顶点
+            float dis = length(diff);
             if (dis >= P.contactRadius + P.thickness) return;
+            float3 n = dis > 1e-8f ? diff / dis : c.normal;
 
             float4 bs = new float4(-c.bary.x, -c.bary.y, -c.bary.z, 1f);
             float b = bs[order];
@@ -273,7 +274,6 @@ namespace AVBD.Cloth
             ClothCollision.RepulsiveForce(dis, P.thickness, P.contactRadius, P.contactStiffness,
                 out float dEdD, out float d2EdDdD);
             float lambda = -dEdD;
-            float3 n = c.normal;
 
             force += b * lambda * n;
             hessian += d2EdDdD * b * b * Outer(n, n);
@@ -297,10 +297,17 @@ namespace AVBD.Cloth
         void AccumulateEEContact(in ClothCollision.EEContact c, int order, float dt,
             ref float3 force, ref float3x3 hessian)
         {
-            float dis = c.dist;
+            // 用当前位置 + 冻结线段参数实时重算最近点/法向/距离
+            // (对应参考 accumulateEEContactForceAndHessian: n=diff/dis, diff=c1-c2)。
+            var ei1N = Edges[c.e1];
+            var ei2N = Edges[c.e2];
+            float3 c1N = (1f - c.mu1) * Positions[ei1N.eV1] + c.mu1 * Positions[ei1N.eV2];
+            float3 c2N = (1f - c.mu2) * Positions[ei2N.eV1] + c.mu2 * Positions[ei2N.eV2];
+            float3 diff = c1N - c2N; // 边2接触点 -> 边1接触点
+            float dis = length(diff);
             if (dis >= P.contactRadius + P.thickness) return;
+            float3 n = dis > 1e-8f ? diff / dis : c.normal;
 
-            float3 n = c.normal;
             float4 bs = new float4(1f - c.mu1, c.mu1, -1f + c.mu2, -c.mu2);
             float b = bs[order];
 
@@ -320,7 +327,7 @@ namespace AVBD.Cloth
                 float3x2 T = new float3x2(v1, t1);
                 float3 c1p = (1f - c.mu1) * PositionsPrev[ei1.eV1] + c.mu1 * PositionsPrev[ei1.eV2];
                 float3 c2p = (1f - c.mu2) * PositionsPrev[ei2.eV1] + c.mu2 * PositionsPrev[ei2.eV2];
-                float3 rel = (c.c1 - c.c2) - (c1p - c2p);
+                float3 rel = (c1N - c2N) - (c1p - c2p);
                 float2 u = new float2(dot(T.c0, rel), dot(T.c1, rel));
                 ClothCollision.Friction(P.frictionMu, lambda, T, u, P.frictionEpsV * dt,
                     out float3 ff, out float3x3 fh);
@@ -352,34 +359,35 @@ namespace AVBD.Cloth
         void AccumulateAnalyticColliders(int v, float dt, ref float3 force, ref float3x3 hessian)
         {
             float3 p = Positions[v];
-            float k = P.contactStiffness;
-            float r = P.thickness;
 
             for (int i = 0; i < Colliders.Length; i++)
             {
                 var col = Colliders[i];
                 col.Query(p, out float3 closest, out float3 n, out float dist);
 
-                float penetration = r - dist;
-                if (penetration > 0f)
-                {
-                    float lambda = k * penetration;
-                    force += lambda * n;
-                    hessian += k * Outer(n, n);
+                // 与自碰撞一致:在 dist < contactRadius + thickness 的接触带内即施排斥力,
+                // 用同一个 RepulsiveForce(线性 penalty)。dist 为带符号距离(穿透为负),
+                // n 指向碰撞体外侧。这样布料在接触带外缘就被平滑推开,不必先陷进去。
+                if (dist >= P.contactRadius + P.thickness) continue;
 
-                    if (P.applyFriction != 0)
-                    {
-                        float3 dx = p - PositionsPrev[v];
-                        float3 axis = abs(n.x) < 0.9f ? new float3(1, 0, 0) : new float3(0, 1, 0);
-                        float3 t0 = normalizesafe(cross(n, axis));
-                        float3 t1 = normalizesafe(cross(n, t0));
-                        float3x2 T = new float3x2(t0, t1);
-                        float2 u = new float2(dot(t0, dx), dot(t1, dx));
-                        ClothCollision.Friction(col.FrictionDynamic, lambda, T, u, col.FrictionEpsV * dt,
-                            out float3 ff, out float3x3 fh);
-                        force += ff;
-                        hessian += fh;
-                    }
+                ClothCollision.RepulsiveForce(dist, P.thickness, P.contactRadius, P.contactStiffness,
+                    out float dEdD, out float d2EdDdD);
+                float lambda = -dEdD;
+                force += lambda * n;
+                hessian += d2EdDdD * Outer(n, n);
+
+                if (P.applyFriction != 0)
+                {
+                    float3 dx = p - PositionsPrev[v];
+                    float3 axis = abs(n.x) < 0.9f ? new float3(1, 0, 0) : new float3(0, 1, 0);
+                    float3 t0 = normalizesafe(cross(n, axis));
+                    float3 t1 = normalizesafe(cross(n, t0));
+                    float3x2 T = new float3x2(t0, t1);
+                    float2 u = new float2(dot(t0, dx), dot(t1, dx));
+                    ClothCollision.Friction(col.FrictionDynamic, lambda, T, u, col.FrictionEpsV * dt,
+                        out float3 ff, out float3x3 fh);
+                    force += ff;
+                    hessian += fh;
                 }
             }
         }

@@ -1,6 +1,7 @@
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
+using UnityEngine.Profiling;
 using static Unity.Mathematics.math;
 
 namespace AVBD.Cloth
@@ -136,6 +137,7 @@ namespace AVBD.Cloth
 
             for (int iter = 0; iter < P.iterations; iter++)
             {
+                Profiler.BeginSample("Iteration");
                 if (iter == 0)
                 {
                     ApplyInitialGuess(dtSub);
@@ -159,39 +161,13 @@ namespace AVBD.Cloth
                         State.ConservativeBounds[v] = float.MaxValue;
                 }
 
-                // 按颜色分组做 Gauss-Seidel
-                if (P.useBurst)
-                    SolveGroupsBurst(dtSub);
-                else
-                    SolveGroupsScalar(dtSub);
+                SolveGroupsBurst(dtSub);
+                Profiler.EndSample();
             }
 
             UpdateVelocity(dtSub);
         }
-
-        // ---- 标量路径:主线程逐组逐顶点(便于断点调试) ----
-        void SolveGroupsScalar(float dtSub)
-        {
-            for (int c = 0; c < Topo.NumColors; c++)
-            {
-                int start = Topo.ColorStart[c];
-                int end = Topo.ColorStart[c + 1];
-
-                for (int idx = start; idx < end; idx++)
-                {
-                    int v = Topo.ColorVertices[idx];
-                    if (Topo.FixedMask[v]) continue;
-                    VBDStepVertex(v, dtSub);
-                }
-                for (int idx = start; idx < end; idx++)
-                {
-                    int v = Topo.ColorVertices[idx];
-                    if (Topo.FixedMask[v]) continue;
-                    State.Positions[v] = State.PositionsNext[v];
-                }
-            }
-        }
-
+        
         // ---- Burst 路径:每个颜色组一个 IJobParallelFor(组内并行,组间串行,保持 GS 语义) ----
         void SolveGroupsBurst(float dtSub)
         {
@@ -307,259 +283,7 @@ namespace AVBD.Cloth
                 State.ExternalForces[v] = float3(0,0,0);
             }
         }
-
-        // ===============================================================
-        // VBDStepWithExistingCollisions(vId)
-        // 累加 力/Hessian: 接触(已检测) + 惯性 + StVK + 弯曲 + 边界
-        // 解 H dx = f,截断到保守边界,写 PositionsNext
-        // ===============================================================
-        void VBDStepVertex(int v, float dt)
-        {
-            float3 force = float3(0,0,0);
-            float3x3 hessian = new float3x3();
-
-            // ---- 接触力(复用已检测结果) ----
-            if (P.handleCollision && Collision != null)
-            {
-                AccumulateContacts(v, dt, ref force, ref hessian);
-            }
-
-            // ---- 惯性项: m/dt^2 * (y - x) ----
-            float m = Topo.VertexMass[v];
-            float invDt2 = 1f / (dt * dt);
-            float3 xi = State.Positions[v];
-            force += (m * invDt2) * (State.Inertia[v] - xi);
-            hessian.c0.x += m * invDt2;
-            hessian.c1.y += m * invDt2;
-            hessian.c2.z += m * invDt2;
-
-            // ---- 材料力(StVK 膜 + 弯曲) ----
-            AccumulateMaterial(v, dt, ref force, ref hessian);
-
-            // ---- 解析碰撞体(胶囊/球/平面) ----
-            if (Colliders != null && Colliders.Count > 0)
-            {
-                AccumulateAnalyticColliders(v, dt, ref force, ref hessian);
-            }
-
-            // ---- 解 H dx = f ----
-            if (!ClothMath.Solve3x3PSD(hessian, force, out float3 dx))
-            {
-                State.PositionsNext[v] = State.Positions[v];
-                return;
-            }
-
-            float3 newPos = State.Positions[v] + P.stepSize * dx;
-
-            // 保守边界截断 -> 触发下次迭代重检测
-            if (P.handleCollision && Collision != null)
-            {
-                bool truncated = ClothCollision.ApplyConservativeBoundTruncation(State, v, ref newPos);
-                if (truncated) _collisionDetectionRequired = true;
-            }
-
-            State.PositionsNext[v] = newPos;
-        }
-
-        // accumlateMaterialForceAndHessian = StVK + Bending
-        void AccumulateMaterial(int v, float dt, ref float3 force, ref float3x3 hessian)
-        {
-            float3x3 hBefore = hessian;
-
-            // ---- StVK 膜能 (accumlateStVKForceAndHessian) ----
-            int fStart = Topo.VertexFaceStart[v];
-            int fEnd = Topo.VertexFaceStart[v + 1];
-            for (int i = fStart; i < fEnd; i++)
-            {
-                int2 fo = Topo.VertexFaceList[i];
-                int f = fo.x;
-                int order = fo.y;
-                int3 fv = Topo.FaceVerts[f];
-                ClothMath.AccumulateStVKFace(
-                    State.Positions[fv.x], State.Positions[fv.y], State.Positions[fv.z],
-                    Topo.DmInv[f], Topo.FaceRestArea[f],
-                    P.lambda, P.miu, order,
-                    ref force, ref hessian);
-            }
-
-            // StVK 阻尼: dampingH = (H - H0) * damping/dt; force -= dampingH*(x - xPrev); H += dampingH
-            if (P.dampingStVK > 0f)
-            {
-                float3x3 dampingH = (hessian - hBefore) * (P.dampingStVK / dt);
-                float3 disp = State.Positions[v] - State.PositionsPrev[v];
-                force -= mul(dampingH, disp);
-                hessian += dampingH;
-            }
-
-            // ---- 弯曲能 (accumlateBendingForceAndHessian) ----
-            AccumulateBending(v, dt, ref force, ref hessian);
-        }
-
-        // accumlateBendingForceAndHessian
-        void AccumulateBending(int v, float dt, ref float3 force, ref float3x3 hessian)
-        {
-            float ks = P.bendingStiffness;
-            if (ks <= 0f) return;
-            float damping = P.dampingBending;
-
-            int eStart = Topo.VertexEdgeStart[v];
-            int eEnd = Topo.VertexEdgeStart[v + 1];
-            for (int i = eStart; i < eEnd; i++)
-            {
-                int2 eo = Topo.VertexEdgeList[i];
-                int e = eo.x;
-                int order = eo.y; // 0..3 对应 [eV1, eV2, eV12Next, eV21Next]
-                var ei = Topo.Edges[e];
-                if (ei.fId2 == -1) continue; // boundary
-
-                float4x4 Q = Topo.EdgeQ[e];
-
-                // Xs 行: x0..x3
-                float3 x0 = State.Positions[ei.eV1];
-                float3 x1 = State.Positions[ei.eV2];
-                float3 x2 = State.Positions[ei.eV12Next];
-                float3 x3 = State.Positions[ei.eV21Next];
-
-                // 退化三角形跳过(对应 degenerateTriangleThres)
-                if (P.degenerateTriangleThresEnabled)
-                {
-                    float3 n1 = cross(x1 - x0, x2 - x0);
-                    float3 n2 = cross(x2 - x3, x1 - x3);
-                    float thr = P.degenerateTriangleThres * P.degenerateTriangleThres;
-                    if (lengthsq(n1) < thr || lengthsq(n2) < thr) continue;
-                }
-
-                // dE_dXs.row(order) = ks * (Q * Xs).row(order)
-                //   (Q*Xs) row(order) = sum_j Q(order,j) * Xs.row(j)
-                // Q[col][row]: 行 order 的元素 Q(order, 0..3) = Q[0][order], Q[1][order], Q[2][order], Q[3][order]
-                float qr0 = Q[0][order];
-                float qr1 = Q[1][order];
-                float qr2 = Q[2][order];
-                float qr3 = Q[3][order];
-                float3 dE_row = ks * (qr0 * x0 + qr1 * x1 + qr2 * x2 + qr3 * x3);
-
-                float qDiag = Q[order][order];
-                float3x3 hTemp = (ks * qDiag) * new float3x3(1,0,0,0,1,0,0,0,1);
-
-                // force -= dE_row + hTemp*(x_v - xPrev_v)*(damping/dt)
-                float3 dispV = State.Positions[v] - State.PositionsPrev[v];
-                if (damping > 0f)
-                {
-                    force -= dE_row + mul(hTemp, dispV) * (damping / dt);
-                    hessian += hTemp * (1f + damping / dt);
-                }
-                else
-                {
-                    force -= dE_row;
-                    hessian += hTemp;
-                }
-            }
-        }
-
-        // 复用已检测的接触结果累加到顶点 v
-        void AccumulateContacts(int v, float dt, ref float3 force, ref float3x3 hessian)
-        {
-            // VF:从顶点 key 直接取接触结构体
-            if (Collision.VertexToVF.TryGetFirstValue(v, out var c, out var it))
-            {
-                do
-                {
-                    int order = VFOrder(c, v);
-                    Collision.AccumulateVFContact(c, order, Topo, State,
-                        P.thickness, P.contactRadius, P.contactStiffness,
-                        P.applyFriction, P.frictionMu, P.frictionEpsV, dt,
-                        ref force, ref hessian);
-                }
-                while (Collision.VertexToVF.TryGetNextValue(out c, ref it));
-            }
-
-            // EE
-            if (Collision.VertexToEE.TryGetFirstValue(v, out var ce, out var it2))
-            {
-                do
-                {
-                    int order = EEOrder(ce, v);
-                    if (order < 0) continue;
-                    Collision.AccumulateEEContact(ce, order, Topo, State,
-                        P.thickness, P.contactRadius, P.contactStiffness,
-                        P.applyFriction, P.frictionMu, P.frictionEpsV, dt,
-                        ref force, ref hessian);
-                }
-                while (Collision.VertexToEE.TryGetNextValue(out ce, ref it2));
-            }
-        }
-
-        int VFOrder(in ClothCollision.VFContact c, int v)
-        {
-            if (c.v == v) return 3; // V 侧
-            int3 fv = Topo.FaceVerts[c.face];
-            if (fv.x == v) return 0;
-            if (fv.y == v) return 1;
-            return 2;
-        }
-
-        int EEOrder(in ClothCollision.EEContact c, int v)
-        {
-            var e1 = Topo.Edges[c.e1];
-            var e2 = Topo.Edges[c.e2];
-            if (e1.eV1 == v) return 0;
-            if (e1.eV2 == v) return 1;
-            if (e2.eV1 == v) return 2;
-            if (e2.eV2 == v) return 3;
-            return -1;
-        }
-
-        // 解析碰撞体:排斥 penalty + 摩擦
-        void AccumulateAnalyticColliders(int v, float dt, ref float3 force, ref float3x3 hessian)
-        {
-            float3 p = State.Positions[v];
-            float k = P.contactStiffness;
-            float r = P.thickness; // 布料半厚作为接触偏移
-
-            for (int i = 0; i < Colliders.Count; i++)
-            {
-                var col = Colliders.Colliders[i];
-                col.Query(p, out float3 closest, out float3 n, out float dist);
-
-                float penetration = r - dist; // dist<r 时为正(需要排斥)
-                if (penetration > 0f)
-                {
-                    float lambda = k * penetration;
-                    force += lambda * n;
-                    hessian += k * ClothMathOuter(n, n);
-
-                    if (P.applyFriction)
-                    {
-                        float3 dx = p - State.PositionsPrev[v];
-                        // 切空间基底
-                        float3 t0 = normalizesafe(OrthoVector(n));
-                        float3 t1 = normalizesafe(cross(n, t0));
-                        float3x2 T = new float3x2(t0, t1);
-                        float2 u = new float2(dot(t0, dx), dot(t1, dx));
-                        ClothCollision.Friction(col.FrictionDynamic, lambda, T, u, col.FrictionEpsV * dt,
-                            out float3 ff, out float3x3 fh);
-                        force += ff;
-                        hessian += fh;
-                    }
-                }
-            }
-        }
-
-        static float3 OrthoVector(float3 n)
-        {
-            // 取与 n 不平行的轴叉乘
-            float3 a = abs(n.x) < 0.9f ? new float3(1, 0, 0) : new float3(0, 1, 0);
-            return cross(n, a);
-        }
-
-        static float3x3 ClothMathOuter(float3 a, float3 b)
-        {
-            return new float3x3(
-                a.x * b.x, a.x * b.y, a.x * b.z,
-                a.y * b.x, a.y * b.y, a.y * b.z,
-                a.z * b.x, a.z * b.y, a.z * b.z);
-        }
-
+        
         // ===============================================================
         // updateVelocity: v = (x - xPrev)/dt + 阻尼
         // ===============================================================

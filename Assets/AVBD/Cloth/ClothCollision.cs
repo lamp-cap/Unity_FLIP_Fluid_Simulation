@@ -2,6 +2,7 @@ using Unity.Burst;
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
+using UnityEngine.Profiling;
 using static Unity.Mathematics.math;
 
 namespace AVBD.Cloth
@@ -61,10 +62,7 @@ namespace AVBD.Cloth
         // 计数 pass 用:每个图元产生的接触数(主线程求和后据此扩容,避免 ParallelWriter 溢出)
         private NativeArray<int> _vfCounts;   // 长度 = numVertices
         private NativeArray<int> _eeCounts;   // 长度 = numEdges
-
-        // 是否用 Burst 并行做检测(可关闭走标量路径调试)
-        public bool UseBurst = true;
-
+        
         public void Allocate(int numVertices, int numFaces, int numEdges)
         {
             Dispose();
@@ -90,64 +88,43 @@ namespace AVBD.Cloth
         // Burst 路径:面 / 边各一个 IJobParallelFor,并发跑后 Complete。
         public void UpdatePrimitiveBounds(ClothTopology topo, NativeArray<float3> pos, float margin)
         {
-            if (UseBurst)
+            var faceHandle =  new FaceBoundsJob
             {
-                var faceJob = new FaceBoundsJob
-                {
-                    Pos = pos,
-                    FaceVerts = topo.FaceVerts,
-                    Margin = margin,
-                    PrimMin = _faceBVH.PrimMin,
-                    PrimMax = _faceBVH.PrimMax,
-                };
-                var faceHandle = faceJob.Schedule(topo.NumFaces, 64);
+                Pos = pos,
+                FaceVerts = topo.FaceVerts,
+                Margin = margin,
+                PrimMin = _faceBVH.PrimMin,
+                PrimMax = _faceBVH.PrimMax,
+            }.Schedule(topo.NumFaces, 64);
 
-                var edgeJob = new EdgeBoundsJob
-                {
-                    Pos = pos,
-                    Edges = topo.Edges,
-                    Margin = margin,
-                    PrimMin = _edgeBVH.PrimMin,
-                    PrimMax = _edgeBVH.PrimMax,
-                };
-                var edgeHandle = edgeJob.Schedule(topo.NumEdges, 64);
-
-                JobHandle.CombineDependencies(faceHandle, edgeHandle).Complete();
-                return;
-            }
-
-            // 标量路径
-            float3 m = new float3(margin);
-            for (int f = 0; f < topo.NumFaces; f++)
+            var edgeHandle = new EdgeBoundsJob
             {
-                int3 fv = topo.FaceVerts[f];
-                float3 a = pos[fv.x], b = pos[fv.y], c = pos[fv.z];
-                _faceBVH.PrimMin[f] = min(min(a, b), c) - m;
-                _faceBVH.PrimMax[f] = max(max(a, b), c) + m;
-            }
-            for (int e = 0; e < topo.NumEdges; e++)
-            {
-                var ei = topo.Edges[e];
-                float3 a = pos[ei.eV1], b = pos[ei.eV2];
-                _edgeBVH.PrimMin[e] = min(a, b) - m;
-                _edgeBVH.PrimMax[e] = max(a, b) + m;
-            }
+                Pos = pos,
+                Edges = topo.Edges,
+                Margin = margin,
+                PrimMin = _edgeBVH.PrimMin,
+                PrimMax = _edgeBVH.PrimMax,
+            }.Schedule(topo.NumEdges, 64);
+
+            JobHandle.CombineDependencies(faceHandle, edgeHandle).Complete();
         }
 
-        /// <summary>每帧开始:完全重建两棵 BVH。</summary>
+        /// <summary>每帧开始:完全重建两棵 BVH。两棵树并发构建。</summary>
         public void RebuildBVH(ClothTopology topo, NativeArray<float3> pos, float margin)
         {
             UpdatePrimitiveBounds(topo, pos, margin);
-            _faceBVH.Build();
-            _edgeBVH.Build();
+            var faceHandle = _faceBVH.ScheduleBuild();
+            var edgeHandle = _edgeBVH.ScheduleBuild();
+            JobHandle.CombineDependencies(faceHandle, edgeHandle).Complete();
         }
 
-        /// <summary>迭代中:只 refit bounds。</summary>
+        /// <summary>迭代中:只 refit bounds。两棵树并发 refit。</summary>
         public void RefitBVH(ClothTopology topo, NativeArray<float3> pos, float margin)
         {
             UpdatePrimitiveBounds(topo, pos, margin);
-            _faceBVH.Refit();
-            _edgeBVH.Refit();
+            var faceHandle = _faceBVH.ScheduleRefit();
+            var edgeHandle = _edgeBVH.ScheduleRefit();
+            JobHandle.CombineDependencies(faceHandle, edgeHandle).Complete();
         }
 
         /// <summary>
@@ -162,15 +139,16 @@ namespace AVBD.Cloth
         {
             var pos = state.Positions;
             // BVH 重建仍在主线程(递归 + 每帧/每次重检测一次,非热点)
+            Profiler.BeginSample("Build BVH");
             RebuildBVH(topo, pos, queryRadius);
+            Profiler.EndSample();
 
             VertexToVF.Clear();
             VertexToEE.Clear();
 
-            if (UseBurst)
-                DetectBurst(topo, state, queryRadius, thickness, relax, colliders, colliderCount);
-            else
-                DetectScalar(topo, state, queryRadius, thickness, relax, colliders, colliderCount);
+            Profiler.BeginSample("Detect Collisions");
+            DetectBurst(topo, state, queryRadius, thickness, relax, colliders, colliderCount);
+            Profiler.EndSample();
         }
 
         // ---- Burst 路径:先数后填,避免 ParallelWriter 容量溢出("HashMap is full")----
@@ -182,8 +160,9 @@ namespace AVBD.Cloth
             float queryRadius, float thickness, float relax,
             NativeArray<AnalyticCollider> colliders, int colliderCount)
         {
+            Profiler.BeginSample("Query Collisions Counter");
             // ---- 1) 计数 pass ----
-            var vfCountJob = new VFCountJob
+            var vfCountHandle = new VFCountJob
             {
                 Pos = state.Positions,
                 FaceVerts = topo.FaceVerts,
@@ -193,10 +172,9 @@ namespace AVBD.Cloth
                 NeighborStart = topo.VertexNeighborStart,
                 NeighborList = topo.VertexNeighborList,
                 Counts = _vfCounts,
-            };
-            var vfCountHandle = vfCountJob.Schedule(topo.NumVertices, 32);
+            }.Schedule(topo.NumVertices, 8);
 
-            var eeCountJob = new EECountJob
+            var eeCountHandle = new EECountJob
             {
                 Pos = state.Positions,
                 Edges = topo.Edges,
@@ -206,8 +184,7 @@ namespace AVBD.Cloth
                 NeighborStart = topo.VertexNeighborStart,
                 NeighborList = topo.VertexNeighborList,
                 Counts = _eeCounts,
-            };
-            var eeCountHandle = eeCountJob.Schedule(topo.NumEdges, 32);
+            }.Schedule(topo.NumEdges, 8);
             JobHandle.CombineDependencies(vfCountHandle, eeCountHandle).Complete();
 
             // ---- 2) 求和 + 扩容 ----
@@ -221,25 +198,24 @@ namespace AVBD.Cloth
             int eeNeeded = eeTotal * 4 + 16;
             if (VertexToVF.Capacity < vfNeeded) VertexToVF.Capacity = vfNeeded;
             if (VertexToEE.Capacity < eeNeeded) VertexToEE.Capacity = eeNeeded;
+            
+            Profiler.EndSample();
 
+            Profiler.BeginSample("Query Collisions");
             // ---- 3) 填充 pass ----
-            var vfJob = new VFDetectJob
+            var vfHandle = new VFDetectJob
             {
                 Pos = state.Positions,
                 FaceVerts = topo.FaceVerts,
-                FaceAdjacent = topo.FaceAdjacent,
-                VertexFaceStart = topo.VertexFaceStart,
-                VertexFaceList = topo.VertexFaceList,
                 FaceNodes = _faceBVH.Nodes,
                 FaceNumPrim = _faceBVH.NumPrimitives,
                 QueryRadius = queryRadius,
                 NeighborStart = topo.VertexNeighborStart,
                 NeighborList = topo.VertexNeighborList,
                 Out = VertexToVF.AsParallelWriter(),
-            };
-            var vfHandle = vfJob.Schedule(topo.NumVertices, 32);
+            }.Schedule(topo.NumVertices, 8);
 
-            var eeJob = new EEDetectJob
+            var eeHandle = new EEDetectJob
             {
                 Pos = state.Positions,
                 Edges = topo.Edges,
@@ -249,14 +225,15 @@ namespace AVBD.Cloth
                 NeighborStart = topo.VertexNeighborStart,
                 NeighborList = topo.VertexNeighborList,
                 Out = VertexToEE.AsParallelWriter(),
-            };
-            var eeHandle = eeJob.Schedule(topo.NumEdges, 32);
+            }.Schedule(topo.NumEdges, 8);
 
             JobHandle.CombineDependencies(vfHandle, eeHandle).Complete();
+            
+            Profiler.EndSample();
 
             // 保守边界重算:依赖两张反查表(已 Complete),并行读。
-            // 安全距离同时纳入"到解析碰撞体的距离",使截断也能保护布料-碰撞体穿透
-            // (Offset Geometric Contact:每次检测算安全距离,迭代中位移超出即截断 + 重检测)。
+            // 只统计布料自/间碰撞的安全距离(VF/EE)。解析碰撞体不并入保守边界:
+            // 它每次迭代都用当前位置重新求值并施加排斥力,不需要 CCD 式的位移截断保护。
             var boundsJob = new ConservativeBoundsJob
             {
                 Pos = state.Positions,
@@ -265,121 +242,12 @@ namespace AVBD.Cloth
                 QueryRadius = queryRadius,
                 Thickness = thickness,
                 Relax = relax,
-                Colliders = colliders,
-                ColliderCount = colliderCount,
                 ConservativeBounds = state.ConservativeBounds,
                 PositionsAtPrevCD = state.PositionsAtPrevCD,
             };
             boundsJob.Schedule(topo.NumVertices, 64).Complete();
         }
-
-        // ---- 标量路径(调试用):逐顶点/逐边串行,行为与 Burst 路径一致 ----
-        void DetectScalar(ClothTopology topo, ClothState state,
-            float queryRadius, float thickness, float relax,
-            NativeArray<AnalyticCollider> colliders, int colliderCount)
-        {
-            var pos = state.Positions;
-            var nbStart = topo.VertexNeighborStart;
-            var nbList = topo.VertexNeighborList;
-            var stack = new NativeList<int>(64, Allocator.Temp);
-            var hits = new NativeList<int>(64, Allocator.Temp);
-
-            for (int v = 0; v < topo.NumVertices; v++)
-            {
-                float3 p = pos[v];
-                float3 q = new float3(queryRadius);
-                ClothLBVH.QueryAABBStatic(_faceBVH.Nodes, _faceBVH.NumPrimitives, p - q, p + q, ref stack, ref hits);
-                for (int h = 0; h < hits.Length; h++)
-                {
-                    int f = hits[h];
-                    int3 fv = topo.FaceVerts[f];
-                    // 排除 v 自身及其一环拓扑邻居所在的面(否则静止平铺态产生假接触)
-                    if (ClothTopology.IsNeighbor(nbStart, nbList, v, fv.x) ||
-                        ClothTopology.IsNeighbor(nbStart, nbList, v, fv.y) ||
-                        ClothTopology.IsNeighbor(nbStart, nbList, v, fv.z)) continue;
-                    ClosestPointOnTriangle(p, pos[fv.x], pos[fv.y], pos[fv.z], out float3 closest, out float3 bary);
-                    float3 diff = p - closest;
-                    float d = length(diff);
-                    if (d < queryRadius)
-                    {
-                        // OGC 特征法向(面/边/顶点角度加权),已按 p-closest 定号
-                        float3 n = VFFeatureNormal(p, closest, f, bary,
-                            topo.FaceVerts, topo.FaceAdjacent,
-                            topo.VertexFaceStart, topo.VertexFaceList, pos);
-                        var c = new VFContact { v = v, face = f, bary = bary, normal = n, dist = d };
-                        VertexToVF.Add(v, c);
-                        VertexToVF.Add(fv.x, c);
-                        VertexToVF.Add(fv.y, c);
-                        VertexToVF.Add(fv.z, c);
-                    }
-                }
-            }
-
-            for (int e1 = 0; e1 < topo.NumEdges; e1++)
-            {
-                var ei1 = topo.Edges[e1];
-                float3 a1 = pos[ei1.eV1], b1 = pos[ei1.eV2];
-                float3 lo = min(a1, b1) - new float3(queryRadius);
-                float3 hi = max(a1, b1) + new float3(queryRadius);
-                ClothLBVH.QueryAABBStatic(_edgeBVH.Nodes, _edgeBVH.NumPrimitives, lo, hi, ref stack, ref hits);
-                for (int h = 0; h < hits.Length; h++)
-                {
-                    int e2 = hits[h];
-                    if (e2 <= e1) continue;
-                    var ei2 = topo.Edges[e2];
-                    // 排除任一端点互为一环邻居(含共享端点)的边对
-                    if (ClothTopology.IsNeighbor(nbStart, nbList, ei1.eV1, ei2.eV1) ||
-                        ClothTopology.IsNeighbor(nbStart, nbList, ei1.eV1, ei2.eV2) ||
-                        ClothTopology.IsNeighbor(nbStart, nbList, ei1.eV2, ei2.eV1) ||
-                        ClothTopology.IsNeighbor(nbStart, nbList, ei1.eV2, ei2.eV2)) continue;
-
-                    float3 a2 = pos[ei2.eV1], b2 = pos[ei2.eV2];
-                    ClosestPointsBetweenSegments(a1, b1, a2, b2, out float3 cc1, out float3 cc2, out float mu1, out float mu2);
-                    float3 diff = cc1 - cc2;
-                    float d = length(diff);
-                    if (d < queryRadius)
-                    {
-                        // OGC EE 法向:两边方向叉乘(良态时),按 diff 定号;近平行退化回退 diff/d
-                        float3 n = EEFeatureNormal(b1 - a1, b2 - a2, diff, d);
-                        var c = new EEContact { e1 = e1, e2 = e2, mu1 = mu1, mu2 = mu2, c1 = cc1, c2 = cc2, normal = n, dist = d };
-                        VertexToEE.Add(ei1.eV1, c);
-                        VertexToEE.Add(ei1.eV2, c);
-                        VertexToEE.Add(ei2.eV1, c);
-                        VertexToEE.Add(ei2.eV2, c);
-                    }
-                }
-            }
-
-            for (int v = 0; v < topo.NumVertices; v++)
-            {
-                float dMin = queryRadius;
-                if (VertexToVF.TryGetFirstValue(v, out VFContact cvf, out var it))
-                {
-                    do { dMin = min(dMin, cvf.dist); }
-                    while (VertexToVF.TryGetNextValue(out cvf, ref it));
-                }
-                if (VertexToEE.TryGetFirstValue(v, out EEContact cee, out var it2))
-                {
-                    do { dMin = min(dMin, cee.dist); }
-                    while (VertexToEE.TryGetNextValue(out cee, ref it2));
-                }
-                // 解析碰撞体纳入安全距离:带符号最近距离(穿透为负,会使 gap 变负)。
-                for (int i = 0; i < colliderCount; i++)
-                {
-                    colliders[i].Query(pos[v], out _, out _, out float cd);
-                    dMin = min(dMin, cd);
-                }
-                float safe = dMin - thickness;
-                // safe<=0:已进入接触偏移层(或已穿透)。写哨兵 -1 表示本次迭代豁免截断,
-                // 让排斥力把顶点推出,而不是被 bound=0 冻结。
-                state.ConservativeBounds[v] = safe <= 0f ? -1f : safe * relax;
-                state.PositionsAtPrevCD[v] = pos[v];
-            }
-
-            stack.Dispose();
-            hits.Dispose();
-        }
-
+        
         // ===============================================================
         // 接触力/Hessian(VBDStep 内对单个顶点调用)
         // 排斥力:线性 penalty,对应 computeContactRepulsiveForce case 0。
@@ -430,123 +298,7 @@ namespace AVBD.Cloth
                 a.y * b.x, a.y * b.y, a.y * b.z,
                 a.z * b.x, a.z * b.y, a.z * b.z);
         }
-
-        /// <summary>
-        /// 累加一个 VF 接触对顶点 v 的力/Hessian。
-        /// contactVertexOrder:v 在该接触里的角色 —— 3 表示 v 是 V 侧顶点,
-        /// 0/1/2 表示 v 是 F 侧三角形的第几个顶点。
-        /// 对应 accumulateVFContactForceAndHessian。
-        /// </summary>
-        public void AccumulateVFContact(
-            in VFContact c, int contactVertexOrder,
-            ClothTopology topo, ClothState state,
-            float thickness, float contactRadius, float k,
-            bool applyFriction, float frictionMu, float frictionEpsV, float dt,
-            ref float3 force, ref float3x3 hessian)
-        {
-            float dis = c.dist;
-            if (dis >= contactRadius + thickness) return;
-
-            // b 权重:V 侧为 +1,F 侧三个顶点为 -bary
-            float4 bs = new float4(-c.bary.x, -c.bary.y, -c.bary.z, 1f);
-            float b = bs[contactVertexOrder];
-
-            RepulsiveForce(dis, thickness, contactRadius, k, out float dEdD, out float d2EdDdD);
-            float lambda = -dEdD;
-            float3 n = c.normal;
-
-            force += b * lambda * n;
-            hessian += d2EdDdD * b * b * Outer(n, n);
-
-            if (applyFriction)
-            {
-                // 切向相对位移(简化:用 V 侧顶点相对位移在切空间投影)
-                int vSide = c.v;
-                float3 dx = state.Positions[vSide] - state.PositionsPrev[vSide];
-                int3 fv = topo.FaceVerts[c.face];
-                // 切空间基底
-                float3 e0 = normalizesafe(state.Positions[fv.y] - state.Positions[fv.x]);
-                float3 t1 = normalizesafe(cross(e0, n));
-                float3x2 T = new float3x2(e0, t1);
-                float2 u = new float2(dot(T.c0, dx), dot(T.c1, dx));
-                Friction(frictionMu, lambda, T, u, frictionEpsV * dt, out float3 ff, out float3x3 fh);
-                force += b * ff;
-                hessian += b * b * fh;
-            }
-        }
-
-        /// <summary>
-        /// 累加一个 EE 接触对顶点的力/Hessian。
-        /// contactVertexOrder:顶点在 [e1.v1, e1.v2, e2.v1, e2.v2] 中的序号(0..3)。
-        /// 对应 accumulateEEContactForceAndHessian。
-        /// </summary>
-        public void AccumulateEEContact(
-            in EEContact c, int contactVertexOrder,
-            ClothTopology topo, ClothState state,
-            float thickness, float contactRadius, float k,
-            bool applyFriction, float frictionMu, float frictionEpsV, float dt,
-            ref float3 force, ref float3x3 hessian)
-        {
-            float dis = c.dist;
-            if (dis >= contactRadius + thickness) return;
-
-            float3 n = c.normal;
-            // b: [1-mu1, mu1, -1+mu2, -mu2]
-            float4 bs = new float4(1f - c.mu1, c.mu1, -1f + c.mu2, -c.mu2);
-            float b = bs[contactVertexOrder];
-
-            RepulsiveForce(dis, thickness, contactRadius, k, out float dEdD, out float d2EdDdD);
-            float lambda = -dEdD;
-
-            force += b * lambda * n;
-            hessian += d2EdDdD * b * b * Outer(n, n);
-
-            if (applyFriction)
-            {
-                var ei1 = topo.Edges[c.e1];
-                float3 v1 = normalizesafe(state.Positions[ei1.eV2] - state.Positions[ei1.eV1]);
-                float3 t1 = normalizesafe(cross(v1, n));
-                float3x2 T = new float3x2(v1, t1);
-                // 相对位移(用接触点近似)
-                float3 dx = (c.c1 - c.c2);
-                float3 dxPrev;
-                {
-                    var ei2 = topo.Edges[c.e2];
-                    float3 c1p = (1f - c.mu1) * state.PositionsPrev[ei1.eV1] + c.mu1 * state.PositionsPrev[ei1.eV2];
-                    float3 c2p = (1f - c.mu2) * state.PositionsPrev[ei2.eV1] + c.mu2 * state.PositionsPrev[ei2.eV2];
-                    dxPrev = c1p - c2p;
-                }
-                float3 rel = dx - dxPrev;
-                float2 u = new float2(dot(T.c0, rel), dot(T.c1, rel));
-                Friction(frictionMu, lambda, T, u, frictionEpsV * dt, out float3 ff, out float3x3 fh);
-                force += b * ff;
-                hessian += b * b * fh;
-            }
-        }
-
-        /// <summary>
-        /// applyConservativeBoundTruncation:若累计位移超出保守边界,截断到边界内。
-        /// 返回是否需要触发下次迭代重检测。
-        /// bound < 0 是哨兵:顶点已进入接触偏移层(或已穿透解析碰撞体),
-        /// 本次不截断(让排斥力自由推出),但仍返回 true 强制下次重检测继续跟踪安全距离。
-        /// </summary>
-        public static bool ApplyConservativeBoundTruncation(
-            ClothState state, int v, ref float3 newPos)
-        {
-            float bound = state.ConservativeBounds[v];
-            if (bound < 0f) return true; // 接触/穿透层:豁免截断,但需重检测
-
-            float3 disp = newPos - state.PositionsAtPrevCD[v];
-            float dispLen = length(disp);
-            if (dispLen > bound && dispLen > 1e-12f)
-            {
-                disp *= (bound / dispLen);
-                newPos = state.PositionsAtPrevCD[v] + disp;
-                return true;
-            }
-            return false;
-        }
-
+        
         // ===============================================================
         // 几何工具
         // ===============================================================
@@ -621,15 +373,13 @@ namespace AVBD.Cloth
         }
 
         // ===============================================================
-        // OGC 特征法向(angle-weighted pseudonormal)
+        // VF 接触法向(OGC 论文规则)
         // ---------------------------------------------------------------
-        // 按最近点落在三角形的"面 / 边 / 顶点"特征上,取对应特征的法向:
-        //   - 面内:面法向
-        //   - 边上:该边两个相邻面法向的角度加权(= 二面角平分方向)
-        //   - 顶点上:该顶点所有邻接面法向按张角加权
-        // 这样接触片内的法向场分段光滑、无切向噪声(原来的 (p-closest)/d 在
-        // 边/顶点特征上是辐射方向,相邻顶点法向不一致 -> 剪切力 -> 皱)。
-        // 自碰撞无全局内外,最后用 sign(dot(N, p-closest)) 翻到指向查询点一侧。
+        // 按最近点落在三角形的"面 / 边 / 顶点"特征上取法向:
+        //   - 面内:面法向(良态、唯一,不受查询点辐射噪声影响)
+        //   - 边 / 顶点:直接用最近点连线方向 (p-closest)/d
+        // 边/顶点特征上没有唯一的"表面法向",论文直接取连线方向即排斥方向,
+        // 省掉了角度加权伪法向那套昂贵计算。
         // ===============================================================
 
         /// <summary>面 f 的单位法向(当前位形)。</summary>
@@ -639,104 +389,50 @@ namespace AVBD.Cloth
             return normalizesafe(cross(pos[fv.y] - pos[fv.x], pos[fv.z] - pos[fv.x]));
         }
 
-        /// <summary>面 f 在顶点 vert 处的内角(用于角度加权)。</summary>
-        static float FaceCornerAngle(int f, int vert, NativeArray<int3> faceVerts, NativeArray<float3> pos)
-        {
-            int3 fv = faceVerts[f];
-            int o0 = vert, o1, o2;
-            if (fv.x == vert) { o1 = fv.y; o2 = fv.z; }
-            else if (fv.y == vert) { o1 = fv.z; o2 = fv.x; }
-            else { o1 = fv.x; o2 = fv.y; }
-            float3 e1 = normalizesafe(pos[o1] - pos[o0]);
-            float3 e2 = normalizesafe(pos[o2] - pos[o0]);
-            return acos(clamp(dot(e1, e2), -1f, 1f));
-        }
-
         /// <summary>
-        /// VF 接触的 OGC 特征法向。bary 来自 ClosestPointOnTriangle。
-        /// faceAdj: 面跨边邻接(ClothTopology.FaceAdjacent);vfStart/vfList: 顶点->邻接面 CSR。
-        /// 返回已按 (p-closest) 定号的单位法向。
+        /// VF 接触法向。bary 来自 ClosestPointOnTriangle。
+        /// 最近点在面内 -> 面法向(按 p-closest 定号);在边/顶点 -> 最近点连线方向。
         /// </summary>
         public static float3 VFFeatureNormal(
             float3 p, float3 closest, int face, float3 bary,
-            NativeArray<int3> faceVerts, NativeArray<int3> faceAdj,
-            NativeArray<int> vfStart, NativeArray<int2> vfList,
-            NativeArray<float3> pos)
+            NativeArray<int3> faceVerts, NativeArray<float3> pos)
         {
             const float eps = 1e-4f;
-            int3 fv = faceVerts[face];
 
-            // 落在某个顶点上:两个 bary 分量 ~0
-            int nearZero = (bary.x < eps ? 1 : 0) + (bary.y < eps ? 1 : 0) + (bary.z < eps ? 1 : 0);
+            // 任一 bary 分量 ~0 即落在边或顶点特征上
+            bool onBoundary = bary.x < eps || bary.y < eps || bary.z < eps;
 
-            float3 N;
-            if (nearZero >= 2)
-            {
-                // 顶点特征:取该顶点所有邻接面的角度加权法向
-                int vert = bary.x >= eps ? fv.x : (bary.y >= eps ? fv.y : fv.z);
-                N = float3(0);
-                int s = vfStart[vert], e = vfStart[vert + 1];
-                for (int i = s; i < e; i++)
-                {
-                    int nf = vfList[i].x;
-                    N += FaceCornerAngle(nf, vert, faceVerts, pos) * FaceNormal(nf, faceVerts, pos);
-                }
-                N = normalizesafe(N);
-            }
-            else if (nearZero == 1)
-            {
-                // 边特征:零分量对应的"对角顶点",其相对的边即最近边。
-                // FaceAdjacent 顺序: (x,y)->.x, (y,z)->.y, (z,x)->.z
-                int adj;
-                if (bary.z < eps) adj = faceAdj[face].x;      // 边 (x,y)
-                else if (bary.x < eps) adj = faceAdj[face].y; // 边 (y,z)
-                else adj = faceAdj[face].z;                   // 边 (z,x)
-
-                float3 nf = FaceNormal(face, faceVerts, pos);
-                if (adj >= 0)
-                {
-                    // 角度加权:两个面法向各按其在该边的相对张角加权。
-                    // 共享边上两面权重相近,近似用面法向等权平均即可得到平分方向;
-                    // 这里用面法向之和归一(等价于半角平分,数值稳定)。
-                    float3 na = FaceNormal(adj, faceVerts, pos);
-                    N = normalizesafe(nf + na);
-                    if (lengthsq(N) < 1e-12f) N = nf; // 两面几乎反向(退化)
-                }
-                else N = nf; // 边界边
-            }
-            else
-            {
-                // 面内特征:面法向
-                N = FaceNormal(face, faceVerts, pos);
-            }
-
-            // 按当前相对位置定号:指向查询点一侧
             float3 dir = p - closest;
+            if (onBoundary)
+            {
+                // 边/顶点特征:用最近点连线方向(退化时回退面法向定号)
+                float dlen = length(dir);
+                if (dlen > 1e-8f) return dir / dlen;
+                float3 nf = FaceNormal(face, faceVerts, pos);
+                return dot(nf, dir) < 0f ? -nf : nf;
+            }
+
+            // 面内特征:面法向,按 p-closest 定号指向查询点一侧
+            float3 N = FaceNormal(face, faceVerts, pos);
             if (dot(N, dir) < 0f) N = -N;
             return N;
         }
 
         /// <summary>
-        /// EE 接触法向。理想方向是两边方向的叉乘(垂直于两条边),
-        /// 良态时比 (c1-c2)/d 更稳(端点特征/近接触时辐射方向有噪声);
-        /// 两边近平行(叉乘退化)时回退到 diff/d。最后按 diff 定号(指向边 1 一侧)。
-        /// d1=b1-a1, d2=b2-a2, diff=c1-c2, dlen=length(diff)。
+        /// EE 接触法向(OGC 论文规则):两条边上最近点连线方向 (c1-c2)/d。
+        /// 与 EEContact.normal / 受力代码的约定一致(diff=c1-c2,指向边 1 最近点一侧)。
+        /// diff=c1-c2, dlen=length(diff);两边相交(dlen≈0)退化时回退两边方向叉乘。
+        /// d1=b1-a1, d2=b2-a2 仅用于退化回退。
         /// </summary>
         public static float3 EEFeatureNormal(float3 d1, float3 d2, float3 diff, float dlen)
         {
+            // 最近点连线方向即排斥方向
+            if (dlen > 1e-8f) return diff / dlen;
+            // 退化(两边相交,最近点重合):回退到垂直两边的方向
             float3 cr = cross(d1, d2);
             float crLen2 = lengthsq(cr);
-            // 叉乘长度^2 相对两边长度积的比值,判断是否近平行
-            float scale = lengthsq(d1) * lengthsq(d2);
-            if (crLen2 > 1e-12f && crLen2 > 1e-8f * scale)
-            {
-                float3 N = cr * rsqrt(crLen2);
-                // 按 diff 定号(diff 退化时保持叉乘方向)
-                if (dlen > 1e-8f && dot(N, diff) < 0f) N = -N;
-                return N;
-            }
-            // 近平行:回退辐射方向
-            return dlen > 1e-8f ? diff / dlen : normalizesafe(cross(d1, float3(0, 1, 0)));
+            if (crLen2 > 1e-12f) return cr * rsqrt(crLen2);
+            return normalizesafe(cross(d1, float3(0, 1, 0)));
         }
 
         public void Dispose()
@@ -895,9 +591,6 @@ namespace AVBD.Cloth
     {
         [ReadOnly] public NativeArray<float3> Pos;
         [ReadOnly] public NativeArray<int3> FaceVerts;
-        [ReadOnly] public NativeArray<int3> FaceAdjacent;
-        [ReadOnly] public NativeArray<int> VertexFaceStart;
-        [ReadOnly] public NativeArray<int2> VertexFaceList;
         [ReadOnly] public NativeArray<ClothLBVH.Node> FaceNodes;
         [ReadOnly] public NativeArray<int> NeighborStart;
         [ReadOnly] public NativeArray<int> NeighborList;
@@ -929,10 +622,9 @@ namespace AVBD.Cloth
                 float d = length(diff);
                 if (d < QueryRadius)
                 {
-                    // OGC 特征法向(面/边/顶点角度加权),已按 p-closest 定号
+                    // OGC VF 法向:面内取面法向,边/顶点取最近点连线方向
                     float3 n = ClothCollision.VFFeatureNormal(
-                        p, closest, f, bary, FaceVerts, FaceAdjacent,
-                        VertexFaceStart, VertexFaceList, Pos);
+                        p, closest, f, bary, FaceVerts, Pos);
                     var c = new ClothCollision.VFContact { v = v, face = f, bary = bary, normal = n, dist = d };
                     Out.Add(v, c);
                     Out.Add(fv.x, c);
@@ -1008,8 +700,6 @@ namespace AVBD.Cloth
         [ReadOnly] public NativeArray<float3> Pos;
         [ReadOnly] public NativeParallelMultiHashMap<int, ClothCollision.VFContact> VertexToVF;
         [ReadOnly] public NativeParallelMultiHashMap<int, ClothCollision.EEContact> VertexToEE;
-        [ReadOnly] public NativeArray<AnalyticCollider> Colliders;
-        public int ColliderCount;
         public float QueryRadius;
         public float Thickness;
         public float Relax;
@@ -1018,7 +708,7 @@ namespace AVBD.Cloth
 
         public void Execute(int v)
         {
-            // gap = 到最近图元的距离。自碰撞为非负距离,解析碰撞体为带符号距离(穿透为负)。
+            // gap = 到最近布料图元(VF/EE)的距离(非负)。
             float gap = QueryRadius;
             if (VertexToVF.TryGetFirstValue(v, out ClothCollision.VFContact cvf, out var it))
             {
@@ -1030,17 +720,11 @@ namespace AVBD.Cloth
                 do { gap = min(gap, cee.dist); }
                 while (VertexToEE.TryGetNextValue(out cee, ref it2));
             }
-            // 解析碰撞体纳入安全距离:带符号最近距离(穿透为负,会使 gap 变负)。
-            for (int i = 0; i < ColliderCount; i++)
-            {
-                Colliders[i].Query(Pos[v], out _, out _, out float cd);
-                gap = min(gap, cd);
-            }
 
-            float safe = gap - Thickness;
-            // safe<=0:已进入接触偏移层(或已穿透)。不能用 0 冻结顶点,否则排斥力推不出去。
-            // 写哨兵 -1 表示"本次迭代豁免截断",由消费端跳过截断并强制下次重检测继续跟踪。
-            ConservativeBounds[v] = safe <= 0f ? -1f : safe * Relax;
+            // 保守边界只跟踪布料自/间碰撞。解析碰撞体每次迭代用当前位置重求值并施力,
+            // 不并入保守边界(对应参考 applyCollisionDetection 末尾: max(0, dMin-thickness)*relax)。
+            float safe = max(0f, gap - Thickness);
+            ConservativeBounds[v] = safe * Relax;
             PositionsAtPrevCD[v] = Pos[v];
         }
     }

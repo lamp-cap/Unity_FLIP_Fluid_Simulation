@@ -250,8 +250,8 @@ MonoBehaviour:
   sizeX: 1
   sizeZ: 1
   cloth0Height: 2
-  cloth1Height: 4
-  cloth1OffsetZ: 0.15
+  cloth1Height: 3
+  cloth1OffsetZ: 0
   capsuleHalfLength: 0.6
   capsuleRadius: 0.25
   capsuleCenter:
@@ -267,7 +267,7 @@ MonoBehaviour:
   contactStiffness: 1000
   thickness: 0.01
   contactRadius: 0.02
-  queryRadius: 0.06
+  queryRadius: 0.05
   selfCollision: 1
   useFixedTimestep: 1
   useBurst: 1
