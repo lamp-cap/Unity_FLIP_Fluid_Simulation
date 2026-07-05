@@ -1,12 +1,15 @@
-#ifndef FLIP_UTILS_HLSL
-#define FLIP_UTILS_HLSL
+#ifndef NB_FLIP_UTILS_HLSL
+#define NB_FLIP_UTILS_HLSL
 
 #define GROUP_THREADS_X 128
-#define GROUP_THREADS_D3 8, 4, 4
+#define GROUP_THREADS_D3 8, 8, 8
 
 #define AIR 0
 #define FLUID 1
 #define SOLID 2
+
+#define Band1 2
+#define Band2 3
 
 struct Particle
 {

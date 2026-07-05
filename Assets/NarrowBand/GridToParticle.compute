@@ -1,13 +1,18 @@
 #pragma use_dxc
 
-#include "FlipUtils.hlsl"
+#include "NBFlipUtils.hlsl"
 
 #pragma kernel G2P
 #pragma kernel Advection
+#pragma kernel GridAdvection
 
 RWStructuredBuffer<Particle> _Particles;
 
+Texture3D<uint> _GridTypesR;
+
 Texture3D<float4> _VelocityOldR;
+RWTexture3D<float4> _VelocityOldW;
+
 Texture3D<float4> _VelocityR;
 
 float _Flipness;
@@ -78,4 +83,41 @@ void Advection (uint3 id : SV_DispatchThreadID)
 
     p.packedPosition = EncodePosition(pos);
     _Particles[p_id] = p;
+}
+
+inline float ReadGridFaceBilinear(float3 pos, int axis, Texture3D<float4> gridData)
+{
+    float3 offset = 0;
+    offset[axis] = 0.5f;
+    return gridData.SampleLevel(my_linear_clamp_sampler, (pos * _InvCellSize + offset) / _GridSize, 0)[axis];
+}
+
+float3 BackwardTrace(float3 pos, Texture3D<float4> block)
+{
+    float3 k1 = SampleGrid(pos, block);
+    float3 k2 = SampleGrid(pos - 0.5f * _DeltaTime * k1, block);
+    float3 k3 = SampleGrid(pos - 0.75f * _DeltaTime * k2, block);
+    return 2.0f / 9.0f * k1 + 1.0f / 3.0f * k2 + 4.0f / 9.0f * k3;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void GridAdvection (uint3 id : SV_DispatchThreadID)
+{
+    int3 coord = id;
+    float3 cellCenter = ((float3)coord + 0.5f) * _CellSize;
+    // using RK3
+    float3 posFaceX = cellCenter + float3(-0.5f * _CellSize, 0, 0);
+    float3 traceDirX = BackwardTrace(posFaceX, _VelocityR);
+    float vx = ReadGridFaceBilinear(posFaceX - traceDirX * _DeltaTime, 0, _VelocityR);
+
+    float3 posFaceY = cellCenter + float3(0, -0.5f * _CellSize, 0);
+    float3 traceDirY = BackwardTrace(posFaceY, _VelocityR);
+    float vy = ReadGridFaceBilinear(posFaceY - traceDirY * _DeltaTime, 1, _VelocityR);
+    
+    float3 posFaceZ = cellCenter + float3(0, 0, -0.5f * _CellSize);
+    float3 traceDirZ = BackwardTrace(posFaceZ, _VelocityR);
+    float vz = ReadGridFaceBilinear(posFaceZ - traceDirZ * _DeltaTime, 2, _VelocityR);
+                
+    uint grid_types = _GridTypesR[id];
+    _VelocityOldW[id] = float4(EnforceBoundaryCondition(float3(vx, vy, vz), grid_types), 0);
 }

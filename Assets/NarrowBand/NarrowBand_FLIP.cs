@@ -30,7 +30,7 @@ namespace NarrowBand
         private float _rs;
         
 
-        public const int NumParticles = 256 * 256 * 2;
+        public const int NumParticles = 256 * 256;
         public const int GridRes = 256;
         public const int NumGrid = GridRes * GridRes;
         private const int Band1 = 2;

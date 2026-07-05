@@ -1,11 +1,9 @@
 #pragma use_dxc
 
-#include "FlipUtils.hlsl"
+#include "NBFlipUtils.hlsl"
 
 #pragma kernel P2G
-#pragma kernel SetGridType
 #pragma kernel AddForce
-#pragma kernel Normalize
 
 float4 _Gravity;
 
@@ -21,6 +19,8 @@ Texture3D<uint> _GridTypesR;
 RWTexture3D<uint> _GridTypesW;
 
 RWTexture3D<float4> _GridCoefficientW;
+
+Texture3D<float> _GridSDFR;
 
 static const float KernelPoly6 = 315.0f / (64.0f * 3.14159265);
 
@@ -38,8 +38,12 @@ static float SmoothingKernelPoly6(float r2)
 [numthreads(GROUP_THREADS_D3)]
 void P2G (uint3 id : SV_DispatchThreadID)
 {
+    float sdf = _GridSDFR[id];
+    if (sdf > Band1)
+        return;
+    
     float3 cellCenter = ((float3)id + 0.5f) * _CellSize;
-    uint3 coordMin = max((int3)id - 1, 0);
+    uint3 coordMin = max((int3)id - 2, 0);
     uint3 coordMax = min(id + 1, _GridSize - 1);
     float density = 0;
     float3 weightSum = 0;
@@ -77,29 +81,6 @@ void P2G (uint3 id : SV_DispatchThreadID)
 inline uint GetType(uint2 range)
 {
     return range.y > range.x ? FLUID : AIR;
-}
-
-[numthreads(GROUP_THREADS_D3)]
-void SetGridType (uint3 id : SV_DispatchThreadID)
-{
-    uint3 grid_max = _GridSize - 1;
-
-    const uint gridType = GetType(_ParticlesRange[Coord2Idx(id)]);
-    const uint xp_type = id.x == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(-1, 0, 0))]);
-    const uint xn_type = id.x == grid_max.x ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(1, 0, 0))]);
-    const uint yp_type = id.y == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(0, -1, 0))]);
-    const uint yn_type = id.y == grid_max.y ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(0, 1, 0))]);
-    const uint zp_type = id.z == 0 ? SOLID :            GetType(_ParticlesRange[Coord2Idx(id + int3(0, 0, -1))]);
-    const uint zn_type = id.z == grid_max.z ? SOLID :   GetType(_ParticlesRange[Coord2Idx(id + int3(0, 0, 1))]);
-
-    float center = 6 - (xp_type >> 1) - (xn_type >> 1) - (yp_type >> 1) - (yn_type >> 1) - (zp_type >> 1) -(zn_type >> 1);
-    _GridCoefficientW[id] = gridType == FLUID ? float4(-center, xp_type & 1, yp_type & 1, zp_type & 1) : 0;
-    _GridTypesW[id] = PackGridTyped(gridType, xp_type, xn_type, yp_type, yn_type, zp_type, zn_type);
-}
-
-[numthreads(GROUP_THREADS_D3)]
-void Normalize (uint3 id : SV_DispatchThreadID)
-{
 }
 
 float3 _RayOrigin;

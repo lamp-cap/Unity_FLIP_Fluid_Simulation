@@ -1,0 +1,112 @@
+
+#pragma use_dxc
+
+#include "NBFlipUtils.hlsl"
+
+#pragma kernel InitParticles
+#pragma kernel PrepareForRendering
+#pragma kernel Blur
+#pragma kernel InitLevel
+#pragma kernel ParticlesCounter
+
+RWStructuredBuffer<Particle> _ParticlesW;
+RWStructuredBuffer<int> _ParticlesIDW;
+
+float _Scale;
+float3 _InitMin0;
+float3 _InitMin1;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void InitParticles (uint3 id : SV_DispatchThreadID)
+{
+    Particle p;
+    uint localid = id.x % (_NumParticles / 2);
+    uint groupid = id.x / (_NumParticles / 2);
+    p.packedPosition = EncodePosition(MortonD3Decode(localid) * _CellSize * _Scale 
+        + (groupid > 0 ? _InitMin1 : _InitMin0));
+    p.packedVelocity = EncodeVelocity(0);
+    
+    _ParticlesW[id.x] = p;
+    _ParticlesIDW[id.x] = 0;
+}
+
+StructuredBuffer<Particle> _ParticlesR;
+RWStructuredBuffer<float4> _ParticlesRender;
+
+StructuredBuffer<uint> _CounterR;
+RWStructuredBuffer<uint> _Args;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void PrepareForRendering (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NumParticles) return;
+    if (all(id == 0)) _Args[0] = _CounterR[0];
+    Particle p = _ParticlesR[id.x];
+    _ParticlesRender[id.x] = float4(DecodePosition(p.packedPosition), asfloat(p.packedVelocity.x));
+}
+
+Texture3D<float4> _Src;
+RWTexture3D<float4> _Dst;
+float3 _Size;
+SamplerState _LinearClamp;
+
+[numthreads(GROUP_THREADS_D3)]
+void Blur (uint3 id : SV_DispatchThreadID)
+{
+    float3 uvw = (id + 0.5) / _Size;
+    float2 offset = float2(-0.5f, 0.5f) / _Size;
+    float4 c000 = _Src.SampleLevel(_LinearClamp, uvw + offset.xxx, 0);
+    float4 c001 = _Src.SampleLevel(_LinearClamp, uvw + offset.xxy, 0);
+    float4 c010 = _Src.SampleLevel(_LinearClamp, uvw + offset.xyx, 0);
+    float4 c011 = _Src.SampleLevel(_LinearClamp, uvw + offset.xyy, 0);
+    float4 c100 = _Src.SampleLevel(_LinearClamp, uvw + offset.yxx, 0);
+    float4 c101 = _Src.SampleLevel(_LinearClamp, uvw + offset.yxy, 0);
+    float4 c110 = _Src.SampleLevel(_LinearClamp, uvw + offset.yyx, 0);
+    float4 c111 = _Src.SampleLevel(_LinearClamp, uvw + offset.yyy, 0);
+    _Dst[id] = (c000 + c001 + c010 + c011 + c100 + c101 + c110 + c111) * 0.125;
+}
+
+RWTexture3D<float> _GridSDFW;
+Texture3D<float> _GridSDFR;
+
+StructuredBuffer<uint2> _ParticlesRangeR;
+RWStructuredBuffer<uint2> _ParticlesRangeW;
+
+RWStructuredBuffer<uint> _CounterW;
+
+int3 _Start;
+int3 _End;
+
+[numthreads(GROUP_THREADS_D3)]
+void InitLevel (uint3 id : SV_DispatchThreadID)
+{
+    int3 coord = id;
+    int level = -1;
+    if (all(coord >= 1) && all(coord <= 100))
+    {
+        level = 100;
+        if (any(coord == _Start) || any(coord == _End)) 
+            level = 0;
+    }
+    _GridSDFW[id] = level;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void ParticlesCounter (uint3 id : SV_DispatchThreadID)
+{
+    int level = _GridSDFR[id];
+    int i = Coord2Idx(id);
+    if (level < 0 || level >= Band2)
+    {
+        _ParticlesRangeW[i] = uint2(0, 0);
+        return;
+    }
+    int count = 8;
+    int ptr;
+    InterlockedAdd(_CounterW[0], count, ptr);
+    for (int j = 0; j < count; j++)
+    {
+        _ParticlesIDW[ptr + j] = -1; // if need add particle, set -1
+    }
+    _ParticlesRangeW[i] = uint2(ptr, ptr + count);
+}

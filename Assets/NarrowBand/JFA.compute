@@ -1,0 +1,112 @@
+
+#pragma use_dxc
+#include "NBFlipUtils.hlsl"
+
+#pragma target 6.0
+
+#pragma kernel InitSeeds
+#pragma kernel JFA6Pass
+#pragma kernel FinalDistance
+
+int _StepSize;     // 当前步长
+
+Texture3D<uint> _SeedBufferR;
+RWTexture3D<uint> _SeedBufferW;
+
+Texture3D<float> _GridSDFR;
+RWTexture3D<float> _GridSDFW;
+
+uint4 Unpack(uint data)
+{
+    return uint4(data & 1023u, data >> 10 & 1023u, data >> 20 & 1023u, data >> 30);
+}
+uint4 Pack(uint4 data)
+{
+    return data.x | data.y << 10 | data.z << 20 | data.w << 30;
+}
+
+int ManhattanDist(int3 a, int3 b)
+{
+    return dot(abs(a - b), 1);
+}
+
+[numthreads(8, 8, 8)]
+void InitSeeds(uint3 id : SV_DispatchThreadID)
+{
+    int label = _GridSDFR[id];
+
+    _SeedBufferW[id] = Pack(label == 0 ? uint4(id, 1) : uint4(0, 0, 0, label < 0 ? 2 : 0));
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void JFA6Pass(uint3 id : SV_DispatchThreadID)
+{
+    uint4 currentSeed = Unpack(_SeedBufferR[id]);
+    if (currentSeed.w == 2)
+    {
+        _SeedBufferW[id] = _SeedBufferR[id];
+        return;
+    }
+    uint3 bestSeed = currentSeed.xyz;
+    int bestDist = 0x7FFFFFFF; // 初始最大值
+    
+    int3 coord = int3(id);
+
+    if (currentSeed.w == 1)
+    {
+        bestDist = ManhattanDist(coord, currentSeed.xyz);
+    }
+    
+    const int3 offsets[6] = {
+        int3( _StepSize, 0, 0),
+        int3(-_StepSize, 0, 0),
+        int3(0,  _StepSize, 0),
+        int3(0, -_StepSize, 0),
+        int3(0, 0,  _StepSize),
+        int3(0, 0, -_StepSize)
+    };
+    
+    [unroll]
+    for (int i = 0; i < 6; i++)
+    {
+        int3 neighborCoord = coord + offsets[i];
+        if (any(neighborCoord < 0) || any(neighborCoord >= _GridSize))
+            continue;
+        
+        uint4 neighborSeed = Unpack(_SeedBufferR[neighborCoord]);
+        
+        if (neighborSeed.w != 1)
+            continue;
+        
+        int dist = ManhattanDist(coord, neighborSeed.xyz);
+        if (dist < bestDist || (dist == bestDist && any(neighborSeed <= bestSeed)))
+        {
+            bestDist = dist;
+            bestSeed = neighborSeed.xyz;
+        }
+    }
+    
+    _SeedBufferW[coord] = Pack(bestDist < 0x7FFFFFFF ? uint4(bestSeed, 1) : uint4(0, 0, 0, 0));
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void FinalDistance(uint3 id : SV_DispatchThreadID)
+{
+    uint4 seed = Unpack(_SeedBufferR[id]);
+    
+    int level;
+    if (seed.w == 2)
+    {
+        level = -1;
+    }
+    else if (seed.w != 1)
+    {
+        level = 8;
+    }
+    else
+    {
+        int3 coord = int3(id);
+        level = ManhattanDist(coord, seed.xyz);
+    }
+    _GridSDFW[id] = level;
+}
