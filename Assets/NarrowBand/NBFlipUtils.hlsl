@@ -213,14 +213,14 @@ inline float3 EnforceBoundaryCondition(float3 velocity, float4 coeff)
 {
     if (!IsActive(coeff.x))
         return 0;
-    return IsActive(coeff.yzw) ? velocity : max(0, velocity);
+    return IsActive(coeff.yzw) ? velocity : 0;
 }
 
 inline float3 EnforceBoundaryCondition(float3 velocity, uint gridTypes)
 {
     if (IsSolidCell(GetMyType(gridTypes)))
         return 0;
-    return IsSolidCell(GetPrevTypes(gridTypes)) ? max(0, velocity) : velocity;
+    return IsSolidCell(GetPrevTypes(gridTypes)) ? 0 : velocity;
 }
 
 inline float3 SampleGrid(float3 pos, Texture3D<float4> gridData)

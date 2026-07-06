@@ -24,34 +24,36 @@ StructuredBuffer<uint2> _ParticlesRangeR;
 RWStructuredBuffer<uint2> _ParticlesRangeW;
 
 RWTexture3D<float> _PressureW;
+RWStructuredBuffer<uint2> _CellParticleCountW;
 
+StructuredBuffer<uint> _CounterR;
 RWStructuredBuffer<uint> _CounterW;
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void MakePair (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= _NumParticles) return;
+    uint numParticles = _CounterR[0];
     _ParticlesIDW[id.x] = id.x;
-    _ParticlesHashW[id.x] = Coord2Idx(PositionCoord(_ParticlesR[id.x].packedPosition));
+    _ParticlesHashW[id.x] = id.x >= numParticles ? 0xFFFFFFFFu : Coord2Idx(PositionCoord(_ParticlesR[id.x].packedPosition));
 }
 
 [numthreads(GROUP_THREADS_D3)]
 void ClearGrid (uint3 id : SV_DispatchThreadID)
 {
-    if (all(id == 0)) _CounterW[0] = 0;
-    
     _PressureW[id] = 0.f;
     uint idx = Coord2Idx(id);
-    _ParticlesRangeW[idx] = uint2(_NumParticles, 0);
+    _ParticlesRangeW[idx] = uint2(0, 0);
+    _CellParticleCountW[idx] = 0;
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void SetRange(uint3 thread_id : SV_DispatchThreadID)
 {
-    if (thread_id.x >= _NumParticles) return;
+    uint numParticles = _CounterR[0];
+    if (thread_id.x >= numParticles) return;
     const uint curr_o_id = thread_id.x;
 
-    uint max_id = _NumParticles - 1;
+    uint max_id = numParticles - 1;
     const uint prev_o_id = curr_o_id == 0 ? max_id : curr_o_id - 1;
     const uint next_o_id = curr_o_id == max_id ? 0 : curr_o_id + 1;
     const uint curr_c_id = _ParticlesHashR[curr_o_id];
@@ -65,6 +67,9 @@ void SetRange(uint3 thread_id : SV_DispatchThreadID)
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void Rearrange(uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= _NumParticles) return;
-    _ParticlesW[id.x] = _ParticlesR[_ParticlesIDR[id.x]];
+    uint numParticles = _CounterR[0];
+    if (id.x >= numParticles) return;
+    int pid = _ParticlesIDR[id.x];
+    if (pid >= numParticles) return;
+    _ParticlesW[id.x] = _ParticlesR[pid];
 }

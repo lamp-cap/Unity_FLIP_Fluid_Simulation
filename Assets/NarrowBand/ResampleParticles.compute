@@ -2,13 +2,15 @@
 #pragma use_dxc
 #include "NBFlipUtils.hlsl"
 
-// #pragma target 6.0
-#pragma enable_d3d11_debug_symbols
+#pragma target 6.0
+// #pragma enable_d3d12_debug_symbols
 
 #pragma kernel SetGridType
 #pragma kernel SetGridLevel
 #pragma kernel ParticlesCounter
 #pragma kernel ResampleParticles
+#pragma kernel ClearCounter
+#pragma kernel Scan
 
 StructuredBuffer<int> _ParticlesIDR;
 RWStructuredBuffer<int> _ParticlesIDW;
@@ -34,8 +36,10 @@ Texture3D<float4> _VelocityR;
 
 RWTexture3D<float4> _GridCoefficientW;
 
-inline uint GetType(uint3 coord)
+inline uint GetType(int3 coord)
 {
+    if (any(coord < 0) || any(coord >= _GridSize))
+        return SOLID;
     if (_GridSDFR[coord] >= Band1) return FLUID;
     int2 range = _ParticlesRangeR[Coord2Idx(coord)];
     return range.y > range.x ? FLUID : AIR;
@@ -44,15 +48,13 @@ inline uint GetType(uint3 coord)
 [numthreads(GROUP_THREADS_D3)]
 void SetGridType (uint3 id : SV_DispatchThreadID)
 {
-    uint3 grid_max = _GridSize - 1;
-
     const uint gridType = GetType(id);
-    const uint xp_type = id.x == 0 ? SOLID :            GetType(id + int3(-1, 0, 0));
-    const uint xn_type = id.x == grid_max.x ? SOLID :   GetType(id + int3(1, 0, 0));
-    const uint yp_type = id.y == 0 ? SOLID :            GetType(id + int3(0, -1, 0));
-    const uint yn_type = id.y == grid_max.y ? SOLID :   GetType(id + int3(0, 1, 0));
-    const uint zp_type = id.z == 0 ? SOLID :            GetType(id + int3(0, 0, -1));
-    const uint zn_type = id.z == grid_max.z ? SOLID :   GetType(id + int3(0, 0, 1));
+    const uint xp_type = GetType(id + int3(-1, 0, 0));
+    const uint xn_type = GetType(id + int3(1, 0, 0));
+    const uint yp_type = GetType(id + int3(0, -1, 0));
+    const uint yn_type = GetType(id + int3(0, 1, 0));
+    const uint zp_type = GetType(id + int3(0, 0, -1));
+    const uint zn_type = GetType(id + int3(0, 0, 1));
 
     float center = 6 - (xp_type >> 1) - (xn_type >> 1) - (yp_type >> 1) - (yn_type >> 1) - (zp_type >> 1) -(zn_type >> 1);
     _GridCoefficientW[id] = gridType == FLUID ? float4(-center, xp_type & 1, yp_type & 1, zp_type & 1) : 0;
@@ -74,26 +76,71 @@ void SetGridLevel (uint3 id : SV_DispatchThreadID)
     _GridSDFW[id] = fill;
 }
 
+StructuredBuffer<uint2> _CellParticleCountR;
+RWStructuredBuffer<uint2> _CellParticleCountW;
+
 [numthreads(GROUP_THREADS_D3)]
 void ParticlesCounter (uint3 id : SV_DispatchThreadID)
 {
     int level = _GridSDFR[id];
     int i = Coord2Idx(id);
+
+    uint2 range = _ParticlesRangeR[Coord2Idx(id)];
     if (level < 0 || level >= Band2)
     {
-        _ParticlesRangeW[i] = uint2(0, 0);
+        _CellParticleCountW[i] = uint2(0, range.x);
         return;
     }
-    uint2 range = _ParticlesRangeW[i];
-    int count = range.y - range.x;
-    int expect = level < 1 ? count : max(8, count);
-    int ptr = 0;
-    InterlockedAdd(_CounterW[0], expect, ptr);
-    for (int j = 0; j < expect; j++)
+    uint count = clamp(range.y - range.x, 0, 32);
+    uint expect = level < 1 ? count : max(8, count);
+    _CellParticleCountW[i] = uint2(expect << 16 | count, range.x);
+}
+
+groupshared int g_d[32];
+
+[numthreads(1024, 1, 1)]
+void Scan (uint id : SV_GroupIndex)
+{
+    const uint laneID = WaveGetLaneIndex();
+    const uint laneCount = WaveGetLaneCount();
+    const uint waveIdx = id / laneCount;
+    const uint waveCount = 1024 / laneCount;
+    int groupCount = (_NumCells + 1023) / 1024;
+    int scan = 0;;
+    for (int i = 0; i < groupCount; ++i)
     {
-        _ParticlesIDW[ptr + j] = j < count ? range.x + j : -1; // if need add particle, set -1
+        int p = id + i * 1024;
+        uint2 data = p < _NumCells ? _CellParticleCountR[p] : 0;
+        uint expect = data.x >> 16;
+        int prefix = WavePrefixSum(expect);
+        if (laneID == laneCount - 1)
+        {
+            g_d[waveIdx] = prefix + expect;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (id < groupCount)
+        {
+            g_d[id] += WavePrefixSum(g_d[id]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        
+        if (p < _NumCells)
+        {
+            int offset = scan + prefix + (waveIdx > 0 ? g_d[waveIdx - 1] : 0);
+            // uint count = data.x & 65535u;
+            // uint oldPtr = data.y;
+            // for (int j = 0; j < expect; j++)
+            // {
+            //     _ParticlesIDW[offset + j] = j < count ? oldPtr + j : -1; // if need add particle, set -1
+            // }
+            _ParticlesRangeW[p] = uint2(offset, offset + expect);
+        }
+        
+        scan += g_d[waveCount - 1];
     }
-    _ParticlesRangeW[i] = uint2(ptr, ptr + expect);
+    
+    if (id == 0) _CounterW[0] = scan;
 }
 
 [numthreads(GROUP_THREADS_D3)]
@@ -101,7 +148,6 @@ void ResampleParticles (uint3 id : SV_DispatchThreadID)
 {
     uint2 range = _ParticlesRangeR[Coord2Idx(id)];
     if (range.x >= range.y) return;
-    
     int toAdd = 0;
     for (uint i = range.x; i < range.y; i++)
     {
@@ -118,6 +164,7 @@ void ResampleParticles (uint3 id : SV_DispatchThreadID)
     
     int existCount = range.y - range.x - toAdd;
     Particle posArr[8];
+    [unroll]
     for (int i = 0; i < 8; i++)
     {
         if (i < existCount)
@@ -164,4 +211,10 @@ void ResampleParticles (uint3 id : SV_DispatchThreadID)
         posArr[existCount] = pa;
         existCount++;
     }
+}
+
+[numthreads(64, 1, 1)]
+void ClearCounter (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 2) _CounterW[id.x] = 0;
 }

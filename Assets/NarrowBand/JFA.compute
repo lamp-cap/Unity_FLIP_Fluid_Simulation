@@ -42,40 +42,39 @@ void InitSeeds(uint3 id : SV_DispatchThreadID)
 void JFA6Pass(uint3 id : SV_DispatchThreadID)
 {
     uint4 currentSeed = Unpack(_SeedBufferR[id]);
-    if (currentSeed.w == 2)
-    {
-        _SeedBufferW[id] = _SeedBufferR[id];
-        return;
-    }
     uint3 bestSeed = currentSeed.xyz;
     int bestDist = 0x7FFFFFFF; // 初始最大值
     
     int3 coord = int3(id);
 
-    if (currentSeed.w == 1)
+    if (currentSeed.w & 1)
     {
         bestDist = ManhattanDist(coord, currentSeed.xyz);
     }
     
-    const int3 offsets[6] = {
-        int3( _StepSize, 0, 0),
-        int3(-_StepSize, 0, 0),
-        int3(0,  _StepSize, 0),
-        int3(0, -_StepSize, 0),
-        int3(0, 0,  _StepSize),
-        int3(0, 0, -_StepSize)
-    };
+    // const int3 offsets[6] = {
+    //     int3( _StepSize, 0, 0),
+    //     int3(-_StepSize, 0, 0),
+    //     int3(0,  _StepSize, 0),
+    //     int3(0, -_StepSize, 0),
+    //     int3(0, 0,  _StepSize),
+    //     int3(0, 0, -_StepSize)
+    // };
     
-    [unroll]
-    for (int i = 0; i < 6; i++)
+    // [unroll]
+    // for (int i = 0; i < 6; i++)
+    for (int z = -1; z <= 1; ++z)
+    for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x)
     {
-        int3 neighborCoord = coord + offsets[i];
+        if (x==0 && y==0 && z==0) continue;
+        int3 neighborCoord = coord + int3(_StepSize * x, _StepSize * y, _StepSize * z);
         if (any(neighborCoord < 0) || any(neighborCoord >= _GridSize))
             continue;
         
         uint4 neighborSeed = Unpack(_SeedBufferR[neighborCoord]);
         
-        if (neighborSeed.w != 1)
+        if ((neighborSeed.w & 1) == 0)
             continue;
         
         int dist = ManhattanDist(coord, neighborSeed.xyz);
@@ -86,7 +85,7 @@ void JFA6Pass(uint3 id : SV_DispatchThreadID)
         }
     }
     
-    _SeedBufferW[coord] = Pack(bestDist < 0x7FFFFFFF ? uint4(bestSeed, 1) : uint4(0, 0, 0, 0));
+    _SeedBufferW[coord] = Pack(bestDist < 0x7FFFFFFF ? uint4(bestSeed, currentSeed.w | 1) : uint4(0, 0, 0, currentSeed.w));
 }
 
 [numthreads(GROUP_THREADS_D3)]
@@ -95,18 +94,14 @@ void FinalDistance(uint3 id : SV_DispatchThreadID)
     uint4 seed = Unpack(_SeedBufferR[id]);
     
     int level;
-    if (seed.w == 2)
-    {
-        level = -1;
-    }
-    else if (seed.w != 1)
-    {
-        level = 8;
-    }
-    else
+    if (seed.w & 1)
     {
         int3 coord = int3(id);
         level = ManhattanDist(coord, seed.xyz);
     }
-    _GridSDFW[id] = level;
+    else
+    {
+        level = 16;
+    }
+    _GridSDFW[id] = (seed.w >> 1) ? -level : level;
 }

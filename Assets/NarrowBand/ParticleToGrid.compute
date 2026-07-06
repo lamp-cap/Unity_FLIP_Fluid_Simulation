@@ -39,7 +39,7 @@ static float SmoothingKernelPoly6(float r2)
 void P2G (uint3 id : SV_DispatchThreadID)
 {
     float sdf = _GridSDFR[id];
-    if (sdf > Band1)
+    if (sdf > Band1 || sdf < -Band1)
         return;
     
     float3 cellCenter = ((float3)id + 0.5f) * _CellSize;

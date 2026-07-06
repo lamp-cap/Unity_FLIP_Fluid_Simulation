@@ -34,12 +34,14 @@ StructuredBuffer<Particle> _ParticlesR;
 RWStructuredBuffer<float4> _ParticlesRender;
 
 StructuredBuffer<uint> _CounterR;
+RWStructuredBuffer<uint> _CounterW;
 RWStructuredBuffer<uint> _Args;
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void PrepareForRendering (uint3 id : SV_DispatchThreadID)
 {
-    if (id.x >= _NumParticles) return;
+    uint numParticles = _CounterR[0];
+    if (id.x >= numParticles) return;
     if (all(id == 0)) _Args[0] = _CounterR[0];
     Particle p = _ParticlesR[id.x];
     _ParticlesRender[id.x] = float4(DecodePosition(p.packedPosition), asfloat(p.packedVelocity.x));
@@ -72,8 +74,6 @@ Texture3D<float> _GridSDFR;
 StructuredBuffer<uint2> _ParticlesRangeR;
 RWStructuredBuffer<uint2> _ParticlesRangeW;
 
-RWStructuredBuffer<uint> _CounterW;
-
 int3 _Start;
 int3 _End;
 
@@ -82,7 +82,7 @@ void InitLevel (uint3 id : SV_DispatchThreadID)
 {
     int3 coord = id;
     int level = -1;
-    if (all(coord >= 1) && all(coord <= 100))
+    if (all(coord >= _Start) && all(coord <= _End))
     {
         level = 100;
         if (any(coord == _Start) || any(coord == _End)) 
@@ -91,22 +91,24 @@ void InitLevel (uint3 id : SV_DispatchThreadID)
     _GridSDFW[id] = level;
 }
 
+StructuredBuffer<uint2> _CellParticleCountR;
+RWStructuredBuffer<uint2> _CellParticleCountW;
+
 [numthreads(GROUP_THREADS_D3)]
 void ParticlesCounter (uint3 id : SV_DispatchThreadID)
 {
     int level = _GridSDFR[id];
     int i = Coord2Idx(id);
+
+    uint2 range = _ParticlesRangeR[Coord2Idx(id)];
+    
     if (level < 0 || level >= Band2)
     {
-        _ParticlesRangeW[i] = uint2(0, 0);
+        _CellParticleCountW[i] = uint2(0, range.x);
         return;
     }
-    int count = 8;
-    int ptr;
-    InterlockedAdd(_CounterW[0], count, ptr);
-    for (int j = 0; j < count; j++)
-    {
-        _ParticlesIDW[ptr + j] = -1; // if need add particle, set -1
-    }
-    _ParticlesRangeW[i] = uint2(ptr, ptr + count);
+    
+    uint count = 0;
+    uint expect = 8;
+    _CellParticleCountW[i] = uint2(expect << 16 | count, range.x);
 }

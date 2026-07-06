@@ -14,6 +14,7 @@ Texture3D<float4> _VelocityOldR;
 RWTexture3D<float4> _VelocityOldW;
 
 Texture3D<float4> _VelocityR;
+StructuredBuffer<uint> _CounterR;
 
 float _Flipness;
 
@@ -25,7 +26,9 @@ inline float3 WorldPosToGrid(const float3 pos)
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void G2P (uint3 id : SV_DispatchThreadID)
 {
+    uint numParticles = _CounterR[0];
     const uint p_id = id.x;
+    if (p_id >= numParticles) return;
 
     Particle p = _Particles[p_id];
 
@@ -51,7 +54,9 @@ inline void ClampPosition(inout float3 position, float3 grid_min, float3 grid_ma
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void Advection (uint3 id : SV_DispatchThreadID)
 {
+    uint numParticles = _CounterR[0];
     const uint p_id = id.x;
+    if (p_id >= numParticles) return;
 
     Particle p = _Particles[p_id];
 
@@ -77,9 +82,12 @@ void Advection (uint3 id : SV_DispatchThreadID)
     #endif
 
     pos += velocity * _DeltaTime;
+    
+    vel = pos <= 0.1f * _CellSize ? 0 : vel; 
+    vel = pos >= (_GridSize - 0.1f) * _CellSize ? 0 : vel;
 
-    p.packedVelocity = EncodeVelocity(pos < 0 ? max(0, vel) : vel);
-    ClampPosition(pos, _GridMin, _GridMin + _GridSize);
+    p.packedVelocity = EncodeVelocity(vel);
+    ClampPosition(pos, 0, _GridSize);
 
     p.packedPosition = EncodePosition(pos);
     _Particles[p_id] = p;
@@ -119,5 +127,5 @@ void GridAdvection (uint3 id : SV_DispatchThreadID)
     float vz = ReadGridFaceBilinear(posFaceZ - traceDirZ * _DeltaTime, 2, _VelocityR);
                 
     uint grid_types = _GridTypesR[id];
-    _VelocityOldW[id] = float4(EnforceBoundaryCondition(float3(vx, vy, vz), grid_types), 0);
+    _VelocityOldW[id] = float4(EnforceBoundaryCondition(float3(vx, vy, vz), grid_types), 15);
 }
