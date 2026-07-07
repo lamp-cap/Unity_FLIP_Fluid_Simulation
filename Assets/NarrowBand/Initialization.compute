@@ -1,5 +1,6 @@
 
 #pragma use_dxc
+#pragma target 6.0
 
 #include "NBFlipUtils.hlsl"
 
@@ -71,7 +72,6 @@ void Blur (uint3 id : SV_DispatchThreadID)
 RWTexture3D<float> _GridSDFW;
 Texture3D<float> _GridSDFR;
 
-StructuredBuffer<uint2> _ParticlesRangeR;
 RWStructuredBuffer<uint2> _ParticlesRangeW;
 
 int3 _Start;
@@ -91,24 +91,112 @@ void InitLevel (uint3 id : SV_DispatchThreadID)
     _GridSDFW[id] = level;
 }
 
-StructuredBuffer<uint2> _CellParticleCountR;
-RWStructuredBuffer<uint2> _CellParticleCountW;
+globallycoherent RWStructuredBuffer<uint> _PartitionScanDescriptors; // init with 0
 
-[numthreads(GROUP_THREADS_D3)]
-void ParticlesCounter (uint3 id : SV_DispatchThreadID)
+#define PARTITION_SIZE      512
+#define FLAG_INVALID        0u
+#define FLAG_AGGREGATE      1u
+#define FLAG_PREFIX         2u
+
+groupshared uint sharedData[16];
+groupshared uint partitionIndex;
+groupshared uint sharedPrefix;
+
+// Slot layout (SweepCommon.hlsl style — each partition publishes to pid+1,
+// look-back reads from pid; this offset prevents races between publish and
+// predecessor's prefix update, because slot[pid+1]'s first writer is always partition pid):
+//   slot[0]                  = seed  FLAG_PREFIX | 0 (set by ClearScanFlags)
+//   slot[1 .. _NumPartitions] = per-partition data
+//   slot[_NumPartitions + 1]  = partition-index counter (InterlockedAdd)
+[numthreads(PARTITION_SIZE, 1, 1)]
+void ParticlesCounter (uint id : SV_GroupIndex)
 {
-    int level = _GridSDFR[id];
-    int i = Coord2Idx(id);
-
-    uint2 range = _ParticlesRangeR[Coord2Idx(id)];
-    
-    if (level < 0 || level >= Band2)
+    // Assign Partition by atomic add on dedicated counter slot
+    if (id == 0)
     {
-        _CellParticleCountW[i] = uint2(0, range.x);
-        return;
+        InterlockedAdd(_PartitionScanDescriptors[_NumPartitions + 1], 1u, partitionIndex);
+        sharedPrefix = 0;
+    }
+    int wid = id / 32;
+    GroupMemoryBarrierWithGroupSync();
+    uint pid = partitionIndex;
+    uint globalIdx = pid * PARTITION_SIZE + id;
+
+    int level = _GridSDFR[MortonD3Decode(globalIdx)];
+
+    uint expect = 0;
+    if (level >= 0 && level < Band2)
+    {
+        expect = 8;
+    }
+
+    uint val = expect;
+    uint localInclusive = WavePrefixSum(val) + val;
+
+    if (WaveGetLaneIndex() == 31) sharedData[wid] = localInclusive;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (id < 16)
+    {
+        sharedData[id] += WavePrefixSum(sharedData[id]);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint aggregate = sharedData[15];
+
+    // Publish aggregate to slot[pid+1]
+    // (no special case for pid==0 — slot[0] is the seed, never written here)
+    if (id == 0)
+    {
+        InterlockedAdd(_PartitionScanDescriptors[pid + 1], (FLAG_AGGREGATE | (aggregate << 2)));
+    }
+
+    // === Look-back: start from slot[pid] (holds partition pid-1's data) ===
+    if (id == 0)
+    {
+        int lookback = pid;
+        uint lookbackReduction = 0;
+        while (lookback >= 0)
+        {
+            const uint desc = _PartitionScanDescriptors[lookback];
+            if ((desc & 3) == FLAG_PREFIX) {
+                // found inclusive prefix for partitions 0..lookback
+                lookbackReduction += (desc >> 2);
+                // forward the prefix to the next partition's slot
+                if (pid < _NumPartitions - 1)
+                    InterlockedAdd(_PartitionScanDescriptors[pid + 1], FLAG_AGGREGATE | (lookbackReduction << 2));
+
+                sharedPrefix = lookbackReduction - aggregate;
+                break;
+            }
+
+            if ((desc & 3) == FLAG_AGGREGATE)
+            {
+                lookbackReduction += (desc >> 2);
+                lookback--;
+                continue;
+            }
+            // FLAG_INVALID (0): partition hasn't published yet — spin.
+        }
     }
     
-    uint count = 0;
-    uint expect = 8;
-    _CellParticleCountW[i] = uint2(expect << 16 | count, range.x);
+    GroupMemoryBarrierWithGroupSync();
+    
+    // === global scan result ===
+    int offset = sharedPrefix + localInclusive - val + (wid > 0 ? sharedData[wid - 1] : 0);
+    
+    // total count
+    if (pid == _NumPartitions - 1 && id == 0) {
+        _CounterW[0] = sharedPrefix + aggregate;
+    }
+    
+    if (globalIdx < _NumCells)
+    {
+        for (int j = 0; j < expect; j++)
+        {
+            _ParticlesIDW[offset + j] = -1; // if need add particle, set -1
+        }
+        _ParticlesRangeW[globalIdx] = uint2(offset, offset + expect);
+    }
 }

@@ -164,7 +164,7 @@ MonoBehaviour:
   mouseForce: 1
   mouseForceRange: 3
   threshold: 0.5
-  drawType: 1
+  drawType: 0
   meshMat: {fileID: 2100000, guid: b10ed8ca361f71d4db26639892ce1e22, type: 2}
 --- !u!4 &911704354
 Transform:

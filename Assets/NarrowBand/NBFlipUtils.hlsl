@@ -26,6 +26,7 @@ int _NumCells;
 float _CellSize;
 float _InvCellSize;
 float _DeltaTime;
+int _NumPartitions;
 
 float2 OctWrap( float2 v )
 {

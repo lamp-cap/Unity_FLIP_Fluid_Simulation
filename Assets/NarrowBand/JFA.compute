@@ -52,23 +52,24 @@ void JFA6Pass(uint3 id : SV_DispatchThreadID)
         bestDist = ManhattanDist(coord, currentSeed.xyz);
     }
     
-    // const int3 offsets[6] = {
-    //     int3( _StepSize, 0, 0),
-    //     int3(-_StepSize, 0, 0),
-    //     int3(0,  _StepSize, 0),
-    //     int3(0, -_StepSize, 0),
-    //     int3(0, 0,  _StepSize),
-    //     int3(0, 0, -_StepSize)
-    // };
+    const int3 offsets[6] = {
+        int3( _StepSize, 0, 0),
+        int3(-_StepSize, 0, 0),
+        int3(0,  _StepSize, 0),
+        int3(0, -_StepSize, 0),
+        int3(0, 0,  _StepSize),
+        int3(0, 0, -_StepSize)
+    };
     
-    // [unroll]
-    // for (int i = 0; i < 6; i++)
-    for (int z = -1; z <= 1; ++z)
-    for (int y = -1; y <= 1; ++y)
-    for (int x = -1; x <= 1; ++x)
+    // for (int z = -1; z <= 1; ++z)
+    // for (int y = -1; y <= 1; ++y)
+    // for (int x = -1; x <= 1; ++x)
+    [unroll]
+    for (int i = 0; i < 6; i++)
     {
-        if (x==0 && y==0 && z==0) continue;
-        int3 neighborCoord = coord + int3(_StepSize * x, _StepSize * y, _StepSize * z);
+        // if (x==0 && y==0 && z==0) continue;
+        // int3 neighborCoord = coord + int3(_StepSize * x, _StepSize * y, _StepSize * z);
+        int3 neighborCoord = coord + offsets[i];
         if (any(neighborCoord < 0) || any(neighborCoord >= _GridSize))
             continue;
         
