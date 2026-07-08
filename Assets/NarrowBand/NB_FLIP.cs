@@ -1,7 +1,5 @@
-using System;
 using Abecombe.GPUUtil;
 using Unity.Mathematics;
-using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -21,7 +19,7 @@ public class NB_FLIP : MonoBehaviour
 
     public ComputeShader initCs;
     public ComputeShader buildLutCs;
-    public ComputeShader P2GCs;
+    public ComputeShader splatP2GCs;
     public ComputeShader NBCs;
     public ComputeShader JFACs;
     public ComputeShader projectionCs;
@@ -55,6 +53,7 @@ public class NB_FLIP : MonoBehaviour
     private readonly GPUDoubleBuffer<uint> _particleID = new();
     private readonly GPUDoubleBuffer<uint> _particleHash = new();
     private readonly GPUDoubleBuffer<uint2> _gridParticleRange = new();
+    private readonly GPUBuffer<uint2> _blockParticleRange = new();
     
     private readonly GPUBuffer<uint> _scanFlags = new();
     private readonly GPUBuffer<int> _gridWeightsTemp = new();
@@ -99,7 +98,6 @@ public class NB_FLIP : MonoBehaviour
     
     private int _kernelSetGridType;
     private int _kernelSetGridLevel;
-    private int _kernelClearCounter;
     private int _kernelClearScanFlags;
     private int _kernelParticlesCounter;
     private int _kernelResampleParticles;
@@ -108,8 +106,12 @@ public class NB_FLIP : MonoBehaviour
     private int _kernelJFA6Pass;
     private int _kernelFinalDistance;
     
-    private int _kernelP2G;
-    private int _kernelExternalForce;
+    private int _kernelBlockRange;
+    private int _kernelClearGridWeight;
+    private int _kernelSplatP2G;
+    private int _kernelNormalize;
+    private int _kernelSplatForce;
+
     private int _kernelDivergence;
     private int _kernelProject;
     private int _kernelUpdateVelocity;
@@ -154,6 +156,7 @@ public class NB_FLIP : MonoBehaviour
         _particleHash.Init(ParticlesBufferSize);
         
         _gridParticleRange.Init(NumGrids);
+        _blockParticleRange.Init(NumGrids / 512);
         _scanFlags.Init(DivRoundUp(NumGrids, 512) + 2);
         _gridVelocity.Init(GridSize, RenderTextureFormat.ARGBHalf);
         _gridOldVelocity.Init(GridSize, RenderTextureFormat.ARGBHalf);
@@ -173,7 +176,7 @@ public class NB_FLIP : MonoBehaviour
             _gridCoefficientPymaid[i].Init(GridSize >> i, RenderTextureFormat.ARGBHalf);
         }
         
-        _gridWeightsTemp.Init(NumGrids * 7);
+        _gridWeightsTemp.Init(NumGrids * 6);
         _dotBuffer = new ComputeBuffer(2, sizeof(uint));
         _counterBuffer = new ComputeBuffer(1, sizeof(uint));
         _counterBuffer.SetData(new uint[] { 0 });
@@ -195,13 +198,15 @@ public class NB_FLIP : MonoBehaviour
         _kernelSetRange = buildLutCs.FindKernel("SetRange");
         _kernelRearrange = buildLutCs.FindKernel("Rearrange");
         
-        _kernelP2G = P2GCs.FindKernel("P2G");
-        _kernelExternalForce = P2GCs.FindKernel("AddForce");
-        
+        _kernelBlockRange = splatP2GCs.FindKernel("BlockRange");
+        _kernelClearGridWeight = splatP2GCs.FindKernel("ClearGridWeight");
+        _kernelSplatP2G = splatP2GCs.FindKernel("P2G");
+        _kernelNormalize = splatP2GCs.FindKernel("Normalize");
+        _kernelSplatForce = splatP2GCs.FindKernel("AddForce");
+
         _kernelSetGridType = NBCs.FindKernel("SetGridType");
         _kernelSetGridLevel = NBCs.FindKernel("SetGridLevel");
         _kernelParticlesCounter = NBCs.FindKernel("ParticlesCounter");
-        _kernelClearCounter = NBCs.FindKernel("ClearCounter");
         _kernelClearScanFlags = NBCs.FindKernel("ClearScanFlags");
         _kernelResampleParticles = NBCs.FindKernel("ResampleParticles");
         
@@ -315,47 +320,35 @@ public class NB_FLIP : MonoBehaviour
         var cmd = CommandBufferPool.Get("FLIP");
         cmd.Clear();
         
+        if (!_pause)
+        {
+            cmd.BeginSample("BuildLUT");
+            BuildLut(cmd);
+            cmd.EndSample("BuildLUT");
+            
+            cmd.BeginSample("Resample");
+            ResampleParticles(cmd);
+            cmd.EndSample("Resample");
+            
+            cmd.BeginSample("P2G");
+            ParticleToGrid(cmd);
+            cmd.EndSample("P2G");
+            
+            cmd.BeginSample("Projection");
+            Projection(cmd);
+            cmd.EndSample("Projection");
+            
+            cmd.BeginSample("G2P");
+            GridToParticle(cmd);
+            cmd.EndSample("G2P");
+        }
+        
         cmd.BeginSample("Rendering");
         if (drawType == DrawType.Mesh)
             PrepareForRenderingMesh(cmd);
         else
             PrepareForRenderParticles(cmd);
         cmd.EndSample("Rendering");
-        Graphics.ExecuteCommandBuffer(cmd);
-        cmd.Clear();
-        
-        if (!_pause)
-        {
-            cmd.BeginSample("BuildLUT");
-            BuildLut(cmd);
-            cmd.EndSample("BuildLUT");
-            Graphics.ExecuteCommandBuffer(cmd);
-            cmd.Clear();
-            
-            cmd.BeginSample("Resample");
-            ResampleParticles(cmd);
-            cmd.EndSample("Resample");
-            Graphics.ExecuteCommandBuffer(cmd);
-            cmd.Clear();
-            
-            cmd.BeginSample("P2G");
-            ParticleToGrid(cmd);
-            cmd.EndSample("P2G");
-            Graphics.ExecuteCommandBuffer(cmd);
-            cmd.Clear();
-            
-            cmd.BeginSample("Projection");
-            Projection(cmd);
-            cmd.EndSample("Projection");
-            Graphics.ExecuteCommandBuffer(cmd);
-            cmd.Clear();
-            
-            cmd.BeginSample("G2P");
-            GridToParticle(cmd);
-            cmd.EndSample("G2P");
-            Graphics.ExecuteCommandBuffer(cmd);
-            cmd.Clear();
-        }
         
         Graphics.ExecuteCommandBuffer(cmd);
         cmd.Clear();
@@ -387,17 +380,9 @@ public class NB_FLIP : MonoBehaviour
         cmd.SetComputeTextureParam(initCs, _kernelInitSDF, "_GridSDFW", _gridSDF);
         cmd.DispatchCompute(initCs, _kernelInitSDF, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
         
-        var cs = buildLutCs;
+        var cs = JFACs;
         SetParams(cmd, cs);
-        int kernel = _kernelClearGrid;
-        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeW", _gridParticleRange.Read);
-        cmd.SetComputeBufferParam(cs, kernel, "_PartitionScanDescriptors", _scanFlags);
-        cmd.SetComputeTextureParam(cs, kernel, "_PressureW", _gridPressurePymaid[0]);
-        cmd.DispatchCompute(cs, kernel, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
-        
-        cs = JFACs;
-        SetParams(cmd, cs);
-        kernel = _kernelInitSeeds;
+        int kernel = _kernelInitSeeds;
         cmd.SetComputeTextureParam(cs, kernel, "_GridSDFR", _gridSDF);
         cmd.SetComputeTextureParam(cs, kernel, "_SeedBufferW", _gridSeed.Read);
         cmd.DispatchCompute(cs, kernel, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
@@ -422,11 +407,8 @@ public class NB_FLIP : MonoBehaviour
         cs = NBCs;
         SetParams(cmd, cs);
         
-        kernel = _kernelClearCounter;
-        cmd.SetComputeBufferParam(cs, kernel, "_CounterW", _counterBuffer);
-        cmd.DispatchCompute(cs, kernel, 1, 1, 1);
-
         kernel = _kernelClearScanFlags;
+        cmd.SetComputeBufferParam(cs, kernel, "_CounterW", _counterBuffer);
         cmd.SetComputeBufferParam(cs, kernel, "_PartitionScanDescriptors", _scanFlags);
         cmd.DispatchCompute(cs, kernel, DivRoundUp(NumGrids / 512 + 2, 128), 1, 1);
 
@@ -473,7 +455,6 @@ public class NB_FLIP : MonoBehaviour
         // clear grid data
         int kernel = _kernelClearGrid;
         cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeW", _gridParticleRange.Read);
-        cmd.SetComputeBufferParam(cs, kernel, "_PartitionScanDescriptors", _scanFlags);
         cmd.SetComputeTextureParam(cs, kernel, "_PressureW", _gridPressurePymaid[0]);
         cmd.DispatchCompute(cs, kernel, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
         
@@ -549,11 +530,8 @@ public class NB_FLIP : MonoBehaviour
         cs = NBCs;
         SetParams(cmd, cs);
         
-        kernel = _kernelClearCounter;
-        cmd.SetComputeBufferParam(cs, kernel, "_CounterW", _counterBuffer);
-        cmd.DispatchCompute(cs, kernel, 1, 1, 1);
-
         kernel = _kernelClearScanFlags;
+        cmd.SetComputeBufferParam(cs, kernel, "_CounterW", _counterBuffer);
         cmd.SetComputeBufferParam(cs, kernel, "_PartitionScanDescriptors", _scanFlags);
         cmd.DispatchCompute(cs, kernel, DivRoundUp(NumGrids / 512 + 2, 128), 1, 1);
 
@@ -581,17 +559,35 @@ public class NB_FLIP : MonoBehaviour
 
     private void ParticleToGrid(CommandBuffer cmd)
     {
-        var cs = P2GCs;
+        var cs = splatP2GCs;
         SetParams(cmd, cs);
-        
-        int kernel = _kernelP2G;
-        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRange", _gridParticleRange.Read);
+
+        // build per-block particle ranges from the Morton per-cell ranges
+        int kernel = _kernelBlockRange;
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeR", _gridParticleRange.Read);
+        cmd.SetComputeBufferParam(cs, kernel, "_BlockParticleRangeW", _blockParticleRange);
+        cmd.DispatchCompute(cs, kernel, _blockParticleRange.Size, 1, 1);
+
+        // clear the fixed-point accumulator (NumCells * 7 ints)
+        kernel = _kernelClearGridWeight;
+        cmd.SetComputeBufferParam(cs, kernel, "_WeightsSumW", _gridWeightsTemp);
+        cmd.DispatchCompute(cs, kernel, NumGrids / 256, 1, 1);
+
+        // scatter particles into the grid, one group per 8x8x8 block
+        kernel = _kernelSplatP2G;
+        cmd.SetComputeBufferParam(cs, kernel, "_BlockParticleRangeR", _blockParticleRange);
         cmd.SetComputeBufferParam(cs, kernel, "_Particles", _particles.Read);
+        cmd.SetComputeBufferParam(cs, kernel, "_WeightsSumW", _gridWeightsTemp);
+        cmd.SetComputeTextureParam(cs, kernel, "_GridSDFR", _gridSDF);
+        cmd.DispatchCompute(cs, kernel, GridSize.x / 8, GridSize.y / 8, GridSize.z / 8);
+
+        // normalize velocity by accumulated weight, write density
+        kernel = _kernelNormalize;
+        cmd.SetComputeBufferParam(cs, kernel, "_WeightsSumR", _gridWeightsTemp);
         cmd.SetComputeTextureParam(cs, kernel, "_VelocityOldW", _gridOldVelocity);
         cmd.SetComputeTextureParam(cs, kernel, "_GridSDFR", _gridSDF);
-        
         cmd.DispatchCompute(cs, kernel, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
-        
+
         var mouseRay = _cam.ScreenPointToRay(Input.mousePosition);
         cmd.SetComputeVectorParam(cs,"_RayOrigin", mouseRay.origin);
         cmd.SetComputeVectorParam(cs,"_RayDirection", mouseRay.direction);
@@ -612,7 +608,7 @@ public class NB_FLIP : MonoBehaviour
         cmd.SetComputeVectorParam(cs, "_MouseForceParameter", new float4(mouseAxisVelocity * mouseForce, mouseForceRange));
         
         cmd.SetComputeVectorParam(cs, "_Gravity", new Vector4(0f, -9f, 0f, 0f));
-        kernel = _kernelExternalForce;
+        kernel = _kernelSplatForce;
         cmd.SetComputeTextureParam(cs, kernel, "_GridTypesR", _gridTypes);
         cmd.SetComputeTextureParam(cs, kernel, "_VelocityOldR", _gridOldVelocity);
         cmd.SetComputeTextureParam(cs, kernel, "_VelocityW", _gridVelocity);
@@ -663,6 +659,7 @@ public class NB_FLIP : MonoBehaviour
         cmd.SetComputeTextureParam(cs, kernel, "_VelocityR", _gridVelocity);
         cmd.SetComputeTextureParam(cs, kernel, "_VelocityOldW", _gridOldVelocity);
         cmd.SetComputeTextureParam(cs, kernel, "_GridTypesR", _gridTypes);
+        cmd.SetComputeTextureParam(cs, kernel, "_GridSDFR", _gridSDF);
         cmd.DispatchCompute(cs, kernel, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
     }
 
@@ -890,6 +887,7 @@ public class NB_FLIP : MonoBehaviour
         _particleHash.Dispose();
         
         _gridParticleRange.Dispose();
+        _blockParticleRange.Dispose();
         _gridVelocity.Dispose();
         _gridOldVelocity.Dispose();
         _gridTypes.Dispose();

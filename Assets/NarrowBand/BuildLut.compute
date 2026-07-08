@@ -24,7 +24,6 @@ StructuredBuffer<uint2> _ParticlesRangeR;
 RWStructuredBuffer<uint2> _ParticlesRangeW;
 
 RWTexture3D<float> _PressureW;
-RWStructuredBuffer<uint> _PartitionScanDescriptors; // init with 0
 
 StructuredBuffer<uint> _CounterR;
 RWStructuredBuffer<uint> _CounterW;
@@ -43,8 +42,6 @@ void ClearGrid (uint3 id : SV_DispatchThreadID)
     _PressureW[id] = 0.f;
     uint idx = Coord2Idx(id);
     _ParticlesRangeW[idx] = uint2(0, 0);
-    if (idx <= _NumPartitions + 1)
-        _PartitionScanDescriptors[idx] = 0;
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]

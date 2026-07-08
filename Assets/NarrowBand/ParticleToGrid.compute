@@ -43,7 +43,7 @@ void P2G (uint3 id : SV_DispatchThreadID)
         return;
     
     float3 cellCenter = ((float3)id + 0.5f) * _CellSize;
-    uint3 coordMin = max((int3)id - 2, 0);
+    uint3 coordMin = max((int3)id - 1, 0);
     uint3 coordMax = min(id + 1, _GridSize - 1);
     float density = 0;
     float3 weightSum = 0;

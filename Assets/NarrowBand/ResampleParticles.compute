@@ -9,7 +9,6 @@
 #pragma kernel SetGridLevel
 #pragma kernel ParticlesCounter
 #pragma kernel ResampleParticles
-#pragma kernel ClearCounter
 #pragma kernel ClearScanFlags
 
 StructuredBuffer<int> _ParticlesIDR;
@@ -264,15 +263,10 @@ void ResampleParticles (uint3 id : SV_DispatchThreadID)
     }
 }
 
-[numthreads(64, 1, 1)]
-void ClearCounter (uint3 id : SV_DispatchThreadID)
-{
-    if (id.x < 2) _CounterW[id.x] = 0;
-}
-
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void ClearScanFlags (uint3 id : SV_DispatchThreadID)
 {
+    if (id.x < 2) _CounterW[id.x] = 0;
     // Clear all slots (0 .. _NumPartitions + 1), then set slot[0] as seed
     if (id.x <= _NumPartitions + 1)
         _PartitionScanDescriptors[id.x] = 0;

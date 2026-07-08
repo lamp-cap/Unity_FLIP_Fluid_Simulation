@@ -16,6 +16,8 @@ RWTexture3D<float4> _VelocityOldW;
 Texture3D<float4> _VelocityR;
 StructuredBuffer<uint> _CounterR;
 
+Texture3D<float> _GridSDFR;
+
 float _Flipness;
 
 inline float3 WorldPosToGrid(const float3 pos)
@@ -111,6 +113,10 @@ float3 BackwardTrace(float3 pos, Texture3D<float4> block)
 [numthreads(GROUP_THREADS_D3)]
 void GridAdvection (uint3 id : SV_DispatchThreadID)
 {
+    float sdf = _GridSDFR[id];
+    if (sdf < -Band1)
+        return;
+    
     int3 coord = id;
     float3 cellCenter = ((float3)coord + 0.5f) * _CellSize;
     // using RK3

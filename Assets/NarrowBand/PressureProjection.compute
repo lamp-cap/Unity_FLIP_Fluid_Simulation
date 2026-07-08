@@ -29,9 +29,9 @@ void CalcDivergence (uint3 id : SV_DispatchThreadID)
     {
         float4 gridData = _VelocityR[id];
         float3 vel = gridData.xyz;
-        float v_xn = id.x + 1 < _GridSize.x ? _VelocityR[id + int3(1, 0, 0)].x : 0;
-        float v_yn = id.y + 1 < _GridSize.y ? _VelocityR[id + int3(0, 1, 0)].y : 0;
-        float v_zn = id.z + 1 < _GridSize.z ? _VelocityR[id + int3(0, 0, 1)].z : 0;
+        float v_xn = IsSolidCell(GetXNextType(grid_types)) ? 0 : _VelocityR[id + int3(1, 0, 0)].x;
+        float v_yn = IsSolidCell(GetYNextType(grid_types)) ? 0 : _VelocityR[id + int3(0, 1, 0)].y;
+        float v_zn = IsSolidCell(GetZNextType(grid_types)) ? 0 : _VelocityR[id + int3(0, 0, 1)].z;
 
         // float densityErr = gridData.w / 4 - 1;
         // densityErr *= densityErr > 0 ? 1 : 0.2f;
