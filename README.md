@@ -5,7 +5,7 @@ FLIP fluid simulation with MGPCG solver in unity
 
 ## Assets/GPU_FLIP
 
-![FLIP](./images/mgpcg_flip.png)
+![FLIP](./Images/mgpcg_flip.png)
 
 A Incompressible inviscid Flow using FLIP written in HLSL
 
@@ -15,18 +15,18 @@ The grid is solved with a UAAMGPCG solver, but only one iteration
 
 Implemented the algorithm from the paper **A Fast Unsmoothed Aggregation Algebraic Multigrid Framework for the Large-Scale Simulation of Incompressible Flow** <https://computationalsciences.org/publications/shao-2022-multigrid/shao-2022-multigrid.pdf> as a preconditioner for the conjugate gradient method
 
-![Rendering](./images/fast_rendering.png)
+![Rendering](./Images/fast_rendering.png)
 fast rendering with fake reflection using mesh from marching cubes
 
 ## Assets/NarrowBand
 
-![NB_FLIP](./images/nb_flip.png)
+![NB_FLIP](./Images/nb_flip.png)
 
 Implemented the algorithm from the paper **Narrow Band FLIP for Liquid Simulations** <https://www.cs.cit.tum.de/fileadmin/w00cfj/cg/Research/Publications/2016/NBFlip/nbflip.pdf>
 
 ## Assets/PF_FLIP
 
-![NB_FLIP](./images/flip_2d.png)
+![NB_FLIP](./Images/flip_2d.png)
 
 2D FLIP using Unity Jobs system.
 and some legacy test code
