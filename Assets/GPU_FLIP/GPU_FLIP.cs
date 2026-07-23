@@ -15,6 +15,7 @@ public class GPU_FLIP : MonoBehaviour
     {
         Particles,
         Mesh,
+        Volume,
     }
 
     public ComputeShader initCs;
@@ -42,7 +43,8 @@ public class GPU_FLIP : MonoBehaviour
     public DrawType drawType;
 
     public Material meshMat;
-    
+    public Material volumeMat;
+
     private Material _material;
     
     private readonly GPUDoubleBuffer<Particle> _particles = new();
@@ -213,6 +215,12 @@ public class GPU_FLIP : MonoBehaviour
         meshMat.SetVector("_Size", new Vector4(size.x, size.y, size.z));
         meshMat.SetTexture("_Density", _gridVelocity);
 
+        if (volumeMat != null)
+        {
+            volumeMat.SetVector("_Size", new Vector4(size.x, size.y, size.z));
+            volumeMat.SetTexture("_Density", _gridVelocity);
+        }
+
         _argsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
         _argsBuffer.SetData(new[] {0, 1, 0, 0, 0});
 
@@ -234,6 +242,9 @@ public class GPU_FLIP : MonoBehaviour
         
         if (drawType == DrawType.Mesh)
             Graphics.DrawProceduralIndirect(meshMat, _bounds, MeshTopology.Triangles, _argsBuffer);
+        else if (drawType == DrawType.Volume)
+            Graphics.DrawProcedural(volumeMat, _bounds, MeshTopology.Triangles, 36, 1,
+                null, null, ShadowCastingMode.Off, false);
         else
             Graphics.DrawProceduralIndirect(_material,
                 _bounds,
@@ -280,6 +291,8 @@ public class GPU_FLIP : MonoBehaviour
         cmd.BeginSample("Rendering");
         if (drawType == DrawType.Mesh)
             PrepareForRenderingMesh(cmd);
+        else if (drawType == DrawType.Volume)
+            PrepareDensityTexture(cmd);
         else
             PrepareForRenderParticles(cmd);
         cmd.EndSample("Rendering");
@@ -472,15 +485,22 @@ public class GPU_FLIP : MonoBehaviour
         cmd.DispatchCompute(cs, kernel, PGroupThreadsX, 1, 1);
     }
 
-    private void PrepareForRenderingMesh(CommandBuffer cmd)
+    // Copies/prepares the density field into _gridVelocity for the raymarched
+    // renderers. Shared by Mesh (before marching cubes) and Volume draw types.
+    private void PrepareDensityTexture(CommandBuffer cmd)
     {
         var cs = initCs;
         cmd.SetComputeVectorParam(cs, "_Size", new Vector4(GridSize.x, GridSize.y, GridSize.z, 0));
         cmd.SetComputeTextureParam(cs, 2, "_Src", _gridOldVelocity);
         cmd.SetComputeTextureParam(cs, 2, "_Dst", _gridVelocity);
         cmd.DispatchCompute(cs, 2, GridSize.x / 8, GridSize.y / 8, GridSize.z / 8);
-        
-        cs = mcCs;
+    }
+
+    private void PrepareForRenderingMesh(CommandBuffer cmd)
+    {
+        PrepareDensityTexture(cmd);
+
+        var cs = mcCs;
         
         cmd.SetComputeVectorParam(cs, "_Size", new Vector4(GridSize.x, GridSize.y, GridSize.z, 0));
         cmd.SetComputeIntParam(cs, "_BufferSize", _vertBufferSize);
