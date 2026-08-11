@@ -22,7 +22,9 @@ uint numPartitions;
 void Init(uint3 id : SV_DispatchThreadID)
 {
     if (id.x == 0) partitionCounter[0] = 0;
-    if (id.x < numPartitions) partitionDescriptors[id.x] = 0;
+    // slot 0 is the prefix base: no partition broadcasts into it, so seed it as a
+    // finished PREFIX with reduction 0 (== exclusive prefix before partition 0).
+    if (id.x < numPartitions) partitionDescriptors[id.x] = (id.x == 0) ? FLAG_PREFIX : 0;
 }
 
 // 用于分配 partition ID 的原子计数器
@@ -59,39 +61,41 @@ void DecoupledLookbackScan(uint id : SV_GroupIndex)
     GroupMemoryBarrierWithGroupSync();
     
     uint aggregate = sharedData[15];
-    
-    // publish the aggregate
-    if (id == 0) 
+
+    // Broadcast our aggregate into the SUCCESSOR's slot (pid+1), never our own.
+    // This keeps a single writer per slot: slot pid+1 is written only by tile pid
+    // (this broadcast, then the promote below). Because both writes come from the
+    // same thread to the same address, program order guarantees the AGGREGATE state
+    // always carries R_pid — never a predecessor's prefix — so look-back can't double count.
+    if (id == 0 && pid < numPartitions - 1)
     {
-        if (pid == 0) 
-            partitionDescriptors[pid] = FLAG_PREFIX | (aggregate << 2);
-        else
-            // if the last group has finished，there will be exclusive << 2 | FLAG_AGGREGATE,
-            // it will be finished after add current group's value
-            InterlockedAdd(partitionDescriptors[pid], (FLAG_AGGREGATE | (aggregate << 2)));
+        InterlockedAdd(partitionDescriptors[pid + 1], (FLAG_AGGREGATE | (aggregate << 2)));
     }
     
     // === Look-back   only id==0 ===
     // look at current at first, if not finished, look back
-    if (id == 0) 
+    if (id == 0)
     {
+        // slot pid holds the predecessor's broadcast (R_{pid-1}); walking down and
+        // summing aggregates until a PREFIX slot yields exactly P_pid (exclusive prefix),
+        // so there is no aggregate to subtract off. slot 0 is pre-seeded to PREFIX|0.
         int lookback = pid;
         uint lookbackReduction = 0;
-        for (int spinCount = 0; spinCount < 10000 && lookback >= 0; ++spinCount) 
+        for (int spinCount = 0; spinCount < 10000 && lookback >= 0; ++spinCount)
         {
             const uint desc = partitionDescriptors[lookback];
             if ((desc & 3) == FLAG_PREFIX) {
                 // 找到了已确定的 prefix，结束
                 lookbackReduction += desc >> 2;
-                // 更新后一个的状态
+                // promote 后继：广播值 R_pid + 本次 P_pid = P_{pid+1}，flag 1+1=PREFIX
                 if (pid < numPartitions - 1)
                     InterlockedAdd(partitionDescriptors[pid + 1], 1 | lookbackReduction << 2);
-        
-                sharedPrefix = lookbackReduction - aggregate;
+
+                sharedPrefix = lookbackReduction;
                 break;
             }
-            
-            if ((desc & 3) == FLAG_AGGREGATE) 
+
+            if ((desc & 3) == FLAG_AGGREGATE)
             {
                 // FLAG_AGGREGATE: 继续往前看
                 lookbackReduction += desc >> 2;

@@ -1,11 +1,35 @@
-using System;
 using Unity.Collections;
 using Unity.Mathematics;
+using UnityEditor;
 using UnityEngine;
 using Random = Unity.Mathematics.Random;
 
+[CustomEditor(typeof(SmallTest))]
+public class SmallTestEditor : Editor
+{
+    public override void OnInspectorGUI()
+    {
+        DrawDefaultInspector();
+        if (GUILayout.Button("Solve CG"))
+        {
+            var smallTest = target as SmallTest;
+            smallTest.SolveCG();
+        }
+        if (GUILayout.Button("Test"))
+        {
+            var smallTest = target as SmallTest;
+            smallTest.Test();
+        }
+    }
+}
+
 public class SmallTest : MonoBehaviour
 {
+    private void OnEnable()
+    {
+        
+    }
+
     // Start is called before the first frame update
     void Start()
     {
@@ -20,7 +44,7 @@ public class SmallTest : MonoBehaviour
 
     public uint seed;
 
-    public void SoveCG()
+    public void SolveCG()
     {
         // left as coarse (1x2), middle as fine (2x4), right as coarse (1x2)
         //      |  8  9  |  
@@ -83,39 +107,44 @@ public class SmallTest : MonoBehaviour
             var Ap = new float[12];
             float pAp, rsNew, rsOld = 0;
             // 2f/3f between fine-coarse(h0/d01), 1f between same levels
-            var matrix = new float[12, 12];
+            var matrix = new float[12][];
+            for (int index = 0; index < 12; index++)
+            {
+                matrix[index] = new float[12];
+            }
+
             float l = 1f, m = 2f/3f;
-            matrix[0, 1] = l;  matrix[0, 2] = m;  matrix[0, 4] = m;
-            matrix[1, 0] = l;  matrix[1, 6] = m;  matrix[1, 8] = m;
-            matrix[2, 0] = m;  matrix[2, 3] = l;  matrix[2, 4] = l;
-            matrix[3, 2] = l;  matrix[3, 5] = l;  matrix[3, 10] = m;
-            matrix[4, 0] = m;  matrix[4, 2] = l;  matrix[4, 5] = l; matrix[4, 6] = l;
-            matrix[5, 3] = l;  matrix[5, 4] = l;  matrix[5, 7] = l; matrix[5, 10] = m;
-            matrix[6, 1] = m;  matrix[6, 4] = l;  matrix[6, 7] = l; matrix[6, 8] = l;
-            matrix[7, 5] = l;  matrix[7, 6] = l;  matrix[7, 9] = l; matrix[7, 11] = m;
-            matrix[8, 1] = m;  matrix[8, 6] = l;  matrix[8, 9] = l;
-            matrix[9, 7] = l;  matrix[9, 8] = l;  matrix[9, 11] = m;
-            matrix[10, 3] = m; matrix[10, 5] = m; matrix[10, 11] = l;
-            matrix[11, 7] = m; matrix[11, 9] = m; matrix[11, 10] = l;
+            matrix[0][1] = l;  matrix[0][2] = m;  matrix[0][4] = m;
+            matrix[1][0] = l;  matrix[1][6] = m;  matrix[1][8] = m;
+            matrix[2][0] = m;  matrix[2][3] = l;  matrix[2][4] = l;
+            matrix[3][2] = l;  matrix[3][5] = l;  matrix[3][10] = m;
+            matrix[4][0] = m;  matrix[4][2] = l;  matrix[4][5] = l; matrix[4][6] = l;
+            matrix[5][3] = l;  matrix[5][4] = l;  matrix[5][7] = l; matrix[5][10] = m;
+            matrix[6][1] = m;  matrix[6][4] = l;  matrix[6][7] = l; matrix[6][8] = l;
+            matrix[7][5] = l;  matrix[7][6] = l;  matrix[7][9] = l; matrix[7][11] = m;
+            matrix[8][1] = m;  matrix[8][6] = l;  matrix[8][9] = l;
+            matrix[9][7] = l;  matrix[9][8] = l;  matrix[9][11] = m;
+            matrix[10][3] = m; matrix[10][5] = m; matrix[10][11] = l;
+            matrix[11][7] = m; matrix[11][9] = m; matrix[11][10] = l;
             for (int y = 0; y < 12; y++)
             {
                 float sum = 0;
                 for (int x = 0; x < 12; x++)
                 {
-                    sum += matrix[x, y];
-                    Debug.Assert(Mathf.Abs(matrix[x, y] - matrix[y, x]) < 1e-5f, $"param[{x},{y}]!=param[{y}, {x}]]");
+                    sum += matrix[x][y];
+                    Debug.Assert(Mathf.Abs(matrix[x][y] - matrix[y][x]) < 1e-5f, $"param[{x},{y}]!=param[{y}, {x}]]");
                 }
 
-                matrix[y, y] = -sum;
+                matrix[y][y] = -sum;
             }
-            matrix[0, 0] = -3;
+            matrix[0][0] = -3;
 
             var msg = "";
 
             for (int y = 0; y < 12; y++)
             {
                 for (int x = 0; x < 12; x++)
-                    msg += $"{matrix[x, y]:F2},\t";
+                    msg += $"{matrix[x][y]:F2},\t";
                 msg += "\n";
             }
 
@@ -132,7 +161,7 @@ public class SmallTest : MonoBehaviour
                 {
                     var dot = 0f;
                     for (var j = 0; j < 12; j++)
-                        dot += matrix[i, j] * p[j];
+                        dot += matrix[i][j] * p[j];
                     Ap[i] = dot;
                 }
 
@@ -371,7 +400,12 @@ public class SmallTest : MonoBehaviour
         {
             const float l = 1f, m = 2f / 3f; // 1f for same level, h0 / (0.5f * (h0 + h1)) between fine coarse
             // fill matrix
-            var matrix = new float[ptr, ptr];
+            var matrix = new float[ptr][];
+            for (int index = 0; index < ptr; index++)
+            {
+                matrix[index] = new float[ptr];
+            }
+
             for (int y = 0; y < gridWidth; y++)
             for (int x = 0; x < gridWidth; x++)
             {
@@ -384,68 +418,68 @@ public class SmallTest : MonoBehaviour
                 {
                     int ii = offset + yy * width + xx;
                     // left
-                    if (xx > 0) matrix[ii, offset + yy * width + (xx - 1)] = l;
+                    if (xx > 0) matrix[ii][offset + yy * width + (xx - 1)] = l;
                     else if (x > 0)
                     {
                         int ni = y * gridWidth + x - 1;
                         int nLevel = levels[ni], nOffset = ptrs[ni], nWidth = GetWidth(nLevel);
-                        if (nLevel == level) matrix[ii, nOffset + yy * width + width - 1] = l;
+                        if (nLevel == level) matrix[ii][nOffset + yy * width + width - 1] = l;
                         else if (nLevel > level)
                         {
-                            matrix[ii, nOffset + (yy * 2) * nWidth + nWidth - 1] = m;
-                            matrix[ii, nOffset + (yy * 2 + 1) * nWidth + nWidth - 1] = m;
+                            matrix[ii][nOffset + (yy * 2) * nWidth + nWidth - 1] = m;
+                            matrix[ii][nOffset + (yy * 2 + 1) * nWidth + nWidth - 1] = m;
                         }
-                        else matrix[ii, nOffset + (yy / 2) * nWidth + nWidth - 1] = m;
+                        else matrix[ii][nOffset + (yy / 2) * nWidth + nWidth - 1] = m;
 
                     }
 
                     // right
                     if (xx < width - 1)
-                        matrix[ii, offset + yy * width + (xx + 1)] = l;
+                        matrix[ii][offset + yy * width + (xx + 1)] = l;
                     else if (x < gridWidth - 1)
                     {
                         int ni = y * gridWidth + x + 1;
                         int nLevel = levels[ni], nOffset = ptrs[ni], nWidth = GetWidth(nLevel);
-                        if (nLevel == level) matrix[ii, nOffset + yy * width] = l;
+                        if (nLevel == level) matrix[ii][nOffset + yy * width] = l;
                         else if (nLevel > level)
                         {
-                            matrix[ii, nOffset + (yy * 2) * nWidth] = m;
-                            matrix[ii, nOffset + (yy * 2 + 1) * nWidth] = m;
+                            matrix[ii][nOffset + (yy * 2) * nWidth] = m;
+                            matrix[ii][nOffset + (yy * 2 + 1) * nWidth] = m;
                         }
-                        else matrix[ii, nOffset + (yy / 2) * nWidth] = m;
+                        else matrix[ii][nOffset + (yy / 2) * nWidth] = m;
 
                     }
 
                     // bottom
                     if (yy > 0)
-                        matrix[ii, offset + (yy - 1) * width + xx] = l;
+                        matrix[ii][offset + (yy - 1) * width + xx] = l;
                     else if (y > 0)
                     {
                         int ni = (y - 1) * gridWidth + x;
                         int nLevel = levels[ni], nOffset = ptrs[ni], nWidth = GetWidth(nLevel);
-                        if (nLevel == level) matrix[ii, nOffset + (width - 1) * width + xx] = l;
+                        if (nLevel == level) matrix[ii][nOffset + (width - 1) * width + xx] = l;
                         else if (nLevel > level)
                         {
-                            matrix[ii, nOffset + (nWidth - 1) * nWidth + xx * 2] = m;
-                            matrix[ii, nOffset + (nWidth - 1) * nWidth + xx * 2 + 1] = m;
+                            matrix[ii][nOffset + (nWidth - 1) * nWidth + xx * 2] = m;
+                            matrix[ii][nOffset + (nWidth - 1) * nWidth + xx * 2 + 1] = m;
                         }
-                        else matrix[ii, nOffset + (nWidth - 1) * nWidth + xx / 2] = m;
+                        else matrix[ii][nOffset + (nWidth - 1) * nWidth + xx / 2] = m;
 
                     }
 
                     // top
-                    if (yy < width - 1) matrix[ii, offset + (yy + 1) * width + xx] = l;
+                    if (yy < width - 1) matrix[ii][offset + (yy + 1) * width + xx] = l;
                     else if (y < gridWidth - 1)
                     {
                         int ni = (y + 1) * gridWidth + x;
                         int nLevel = levels[ni], nOffset = ptrs[ni], nWidth = GetWidth(nLevel);
-                        if (nLevel == level) matrix[ii, nOffset + xx] = l;
+                        if (nLevel == level) matrix[ii][nOffset + xx] = l;
                         else if (nLevel > level)
                         {
-                            matrix[ii, nOffset + xx * 2] = m;
-                            matrix[ii, nOffset + xx * 2 + 1] = m;
+                            matrix[ii][nOffset + xx * 2] = m;
+                            matrix[ii][nOffset + xx * 2 + 1] = m;
                         }
-                        else matrix[ii, nOffset + xx / 2] = m;
+                        else matrix[ii][nOffset + xx / 2] = m;
                     }
                 }
             }
@@ -455,11 +489,11 @@ public class SmallTest : MonoBehaviour
                 float colSum = 0;
                 for (int x = 0; x < ptr; x++)
                 {
-                    colSum += matrix[x, y];
-                    Debug.Assert(Mathf.Abs(matrix[x, y] - matrix[y, x]) < 1e-5f, $"param[{x},{y}]!=param[{y}, {x}]]");
+                    colSum += matrix[x][y];
+                    Debug.Assert(Mathf.Abs(matrix[x][y] - matrix[y][x]) < 1e-5f, $"param[{x},{y}]!=param[{y}, {x}]]");
                 }
 
-                matrix[y, y] = -colSum;
+                matrix[y][y] = -colSum;
             }
 
             // var mt = ptr + "x" + ptr + " matrix:\n";
@@ -470,7 +504,7 @@ public class SmallTest : MonoBehaviour
             //     mt += "\n";
             // }
             // Debug.Log(mt);
-            matrix[0, 0] -= 0.5f;
+            matrix[0][0] -= 0.5f;
 
             var r = new float[ptr];
             var p = new float[ptr];

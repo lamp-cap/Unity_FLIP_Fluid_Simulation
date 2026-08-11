@@ -361,6 +361,7 @@ namespace PF_FLIP.Solver
             v.Dispose();
         }
 
+        [Button]
         public void UAAMG2D_BenchMark()
         {
             int runs = 100;

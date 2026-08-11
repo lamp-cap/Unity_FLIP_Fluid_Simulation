@@ -110,9 +110,20 @@ void ParticlesCounter (uint id : SV_GroupIndex)
     uint pid = partitionIndex;
     uint globalIdx = pid * PARTITION_SIZE + id;
 
-    int level = _GridSDFR[MortonD3Decode(globalIdx)];
+    // Threads past the last cell (partial final partition when _NumCells is not
+    // a multiple of PARTITION_SIZE, or a group whose pid landed beyond the grid)
+    // must NOT touch the buffers, but they still have to reach every group-wide
+    // barrier / wave op below, so keep them live and let them contribute 0.
+    bool inCell = globalIdx < (uint)_NumCells;
 
-    uint2 range = _ParticlesRangeR[globalIdx];
+    uint2 range = uint2(0, 0);
+    int level = -1;
+    if (inCell)
+    {
+        level = _GridSDFR[MortonD3Decode(globalIdx)];
+        range = _ParticlesRangeR[globalIdx];
+    }
+
     uint count = 0;
     uint expect = 0;
     if (level >= 0 && level < Band2)
@@ -136,15 +147,20 @@ void ParticlesCounter (uint id : SV_GroupIndex)
 
     uint aggregate = sharedData[15];
 
+    // A group whose atomically-assigned pid landed outside [0, _NumPartitions)
+    // owns no descriptor slot. It must not publish (would clobber the counter
+    // slot at [_NumPartitions+1] or write past the buffer) nor look back.
+    bool ownsSlot = pid < (uint)_NumPartitions;
+
     // Publish aggregate to slot[pid+1]
     // (no special case for pid==0 — slot[0] is the seed, never written here)
-    if (id == 0)
+    if (id == 0 && ownsSlot)
     {
         InterlockedAdd(_PartitionScanDescriptors[pid + 1], (FLAG_AGGREGATE | (aggregate << 2)));
     }
 
     // === Look-back: start from slot[pid] (holds partition pid-1's data) ===
-    if (id == 0)
+    if (id == 0 && ownsSlot)
     {
         int lookback = pid;
         uint lookbackReduction = 0;
@@ -185,7 +201,11 @@ void ParticlesCounter (uint id : SV_GroupIndex)
     if (globalIdx < _NumCells)
     {
         uint oldPtr = range.x;
-        for (int j = 0; j < expect; j++)
+        // The scanned total is clamped to _NumParticles (counter + range below),
+        // so a cell whose offset runs past the buffer must not write its IDs
+        // either — clamp the loop to the same bound to avoid an OOB store.
+        int writeEnd = (int)min((uint)(offset + expect), (uint)_NumParticles) - offset;
+        for (int j = 0; j < writeEnd; j++)
         {
             _ParticlesIDW[offset + j] = j < count ? oldPtr + j : -1; // if need add particle, set -1
         }

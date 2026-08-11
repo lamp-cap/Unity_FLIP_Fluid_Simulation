@@ -57,7 +57,7 @@
             {
                 v2f o;
                 float4 particle = _ParticleBuffer[instanceID];
-                float4 data = float4(particle.xy * 0.1, 0, 1.0);
+                float4 data = float4(particle.xy, 0, 1.0);
 
                 o.pos = TransformWorldToHClip(data.xyz + v.positionOS.xyz * _Size);
                 o.uv = float2(particle.z, particle.w * _VelScale);
