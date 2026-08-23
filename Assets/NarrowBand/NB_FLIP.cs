@@ -129,7 +129,7 @@ public class NB_FLIP : MonoBehaviour
     private const int k_partitionSize = 3840;
     
     private MaterialPropertyBlock _mpb;
-    private float ParticleRadius => GridSpacing * 0.25f;
+    private float ParticleRadius => GridSpacing * 0.5f;
     
     private ComputeBuffer _particleRenderingBufferWithArgs;
     private Camera _cam;

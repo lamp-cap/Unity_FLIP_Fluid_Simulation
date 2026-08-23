@@ -42,6 +42,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     }
     public SolverType solverType;
 
+    [Range(0, 64)] public int iterations = 8;
     [Range(-10, 10)] public float gravity = -9;
     [Range(0, 1)] public float flipness = 0.95f;
     public Mesh mesh;
@@ -82,7 +83,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     void OnEnable()
     {
         _posBuffer = new ComputeBuffer(16384, sizeof(float) * 4);
-        _bounds = new Bounds(Vector3.zero, Vector3.one * 10f);
+        _bounds = new Bounds(Vector3.one * 64f, Vector3.one * 128f);
         _particleCount = new NativeReference<int>(Allocator.Persistent);
         const int poolSize = 16384;
         _start = new NativeArray<int>(poolSize, Allocator.Persistent);
@@ -179,8 +180,6 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         }
 
         _particleCount.Value = pCounter;
-        
-        _posBuffer.SetData(_particlePos);
 
         var rnd = new Random(123456);
         for (int i = 0; i < count; i++)
@@ -198,6 +197,8 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         Debug.Log($"MGPCG_FLIP initialized, particle num: {pCounter}, allocate cells: {count}.");
 
         TestStep();
+        
+        _posBuffer.SetData(_particlePos);
     }
 
     // Update is called once per frame
@@ -245,7 +246,8 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         {
             Hashes = _hashes,
             StartIndices = _start,
-            EndIndices = _end
+            EndIndices = _end,
+            ParticleCount = _particleCount
         }.Schedule(_particleCount.Value, batchCount).Complete();
     
         new CombineLutJob
@@ -332,24 +334,39 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             ParticleVel = _particleVelocity,
             ParticlePos = _particlePos,
             Flipness = flipness,
+            GridLut = _mbg.GridInfos,
         }.Schedule(_particleCount.Value, batchCount).Complete();
         
-        // new ParticlesAdvectionJob
-        // {
-        //     GridLut =  _mbg.GridInfos,
-        //     GridVelocity = _mbg.GridVelocity,
-        //     ParticlePos = _particlePos,
-        // }.Schedule(_particleCount.Value, batchCount).Complete();
-        //
-        // new GridsAdvectionJob()
-        // {
-        //     GridVelocity = _mbg.GridVelocity,
-        //     GridVelocityAlt = _mbg.GridVelocityAlt,
-        //     GridTypes = _mbg.GridTypes,
-        // }.Schedule(cellCount, batchCount).Complete();
+        new ParticlesAdvectionJob
+        {
+            GridLut =  _mbg.GridInfos,
+            GridVelocity = _mbg.GridVelocity,
+            ParticlePos = _particlePos,
+        }.Schedule(_particleCount.Value, batchCount).Complete();
+        
+        new DownSampleJob
+        {
+            GridLut = _mbg.GridInfos,
+            GridVelocity = _mbg.GridVelocity,
+            GridVelocityDS = _mbg.GridVelocityDS,
+        }.Schedule(bCount, 1).Complete();
+
+        new GridsAdvectionJob()
+        {
+            GridLut = _mbg.GridInfos,
+            GridVelocity = _mbg.GridVelocity,
+            GridVelocityDS = _mbg.GridVelocityDS,
+            GridVelocityAlt = _mbg.GridVelocityAlt,
+            GridTypes = _mbg.GridTypes,
+        }.Schedule(bCount, batchCount).Complete();
+
+        for (int i = 0; i < iterations; i++)
+        {
+            Step(i);
+        }
     }
 
-    private void Step()
+    private void Step(int frame)
     {
         int batchCount = 32;
         int cellCount = _mbg.CellCount;
@@ -360,7 +377,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             Start = _start,
             End = _end,
             Range = _range,
-        }.Schedule(cellCount, batchCount).Complete();
+        }.Schedule(_range.Length, batchCount).Complete();
         Profiler.EndSample();
         
         Profiler.BeginSample("Build Lut");
@@ -373,20 +390,6 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         Profiler.BeginSample("Sort");
         _hashes.Slice(0, _particleCount.Value).SortJob(new Int2Comparer()).Schedule().Complete();
         Profiler.EndSample();
-    
-        new BuildLutJob
-        {
-            Hashes = _hashes,
-            StartIndices = _start,
-            EndIndices = _end
-        }.Schedule(_particleCount.Value, batchCount).Complete();
-    
-        new CombineLutJob
-        {
-            StartIndices = _start,
-            EndIndices = _end,
-            Range = _range,
-        }.Schedule(cellCount, batchCount).Complete();
         
         new ShuffleJob
         {
@@ -399,6 +402,21 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
 
         (_particlePos, _particlePosCopy) = (_particlePosCopy, _particlePos);
         (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
+    
+        new BuildLutJob
+        {
+            Hashes = _hashes,
+            StartIndices = _start,
+            EndIndices = _end,
+            ParticleCount = _particleCount
+        }.Schedule(_particleCount.Value, batchCount).Complete();
+    
+        new CombineLutJob
+        {
+            StartIndices = _start,
+            EndIndices = _end,
+            Range = _range,
+        }.Schedule(_range.Length, batchCount).Complete();
 
         Profiler.EndSample();
         
@@ -409,6 +427,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             Range = _range,
             BlockLevel = _mbg.BlockLevel
         }.Schedule(bCount, 1).Complete();
+        
         cellCount = _mbg.AllocateBaseCells();
         
         new SetCellTypesJob()
@@ -427,31 +446,37 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             GridSDF = _mbg.SDF
         }.Schedule(bCount, 1).Complete();
         
-        new ParticlesCounterJob(_mbg.GridInfos, _mbg.SDF, _range, _particleID, _particleCount).Run();
+        _mbg.IterateCellSDF();
         
-        new ResampleParticlesJob()
+        // if (frame < iterations - 1)
         {
-            GridLut = _mbg.GridInfos,
-            PosRaw = _particlePos,
-            VelRaw = _particleVelocity,
-            PosNew = _particlePosCopy,
-            VelNew = _particleVelocityCopy,
-            Ids = _particleID,
-            GridVelocity = _mbg.GridVelocity,
-            Ranges = _range,
-        }.Schedule(bCount, batchCount).Complete();
-
-        (_particlePos, _particlePosCopy) = (_particlePosCopy, _particlePos);
-        (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
+            new ParticlesCounterJob(_mbg.GridInfos, _mbg.SDF, _range, _particleID, _particleCount).Run();
+            Debug.Log("Resample particle count: " + _particleCount.Value);
+            new ResampleParticlesJob()
+            {
+                GridLut = _mbg.GridInfos,
+                PosRaw = _particlePos,
+                VelRaw = _particleVelocity,
+                PosNew = _particlePosCopy,
+                VelNew = _particleVelocityCopy,
+                Ids = _particleID,
+                GridVelocity = _mbg.GridVelocity,
+                Ranges = _range,
+            }.Schedule(bCount, batchCount).Complete();
+            
+            (_particlePos, _particlePosCopy) = (_particlePosCopy, _particlePos);
+            (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
+        }
         
         Profiler.EndSample();
-    
+        
         Profiler.BeginSample("P2G");
         
         new ParticleToGridJob
         {
             Ranges = _range,
             GridLut = _mbg.GridInfos,
+            GridSDF = _mbg.SDF,
             ParticlePos = _particlePos,
             ParticleVel = _particleVelocity,
             GridVelocity = _mbg.GridVelocityAlt,
@@ -466,12 +491,13 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             Gravity = new float2(0, gravity),
         }.Schedule(cellCount, batchCount).Complete();
         Profiler.EndSample();
-    
+        
         Profiler.BeginSample("Solve Pressure");
         _mbg.Solve();
         Profiler.EndSample();
-    
+        
         Profiler.BeginSample("G2P");
+        
         new GridToParticleJob
         {
             GridVelocityOld = _mbg.GridVelocityAlt,
@@ -479,10 +505,11 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             ParticleVel = _particleVelocity,
             ParticlePos = _particlePos,
             Flipness = flipness,
+            GridLut = _mbg.GridInfos,
         }.Schedule(_particleCount.Value, batchCount).Complete();
-    
+        
         Profiler.EndSample();
-    
+        
         Profiler.BeginSample("Advection");
         new ParticlesAdvectionJob
         {
@@ -491,12 +518,21 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             ParticlePos = _particlePos,
         }.Schedule(_particleCount.Value, batchCount).Complete();
         
+        new DownSampleJob
+        {
+            GridLut = _mbg.GridInfos,
+            GridVelocity = _mbg.GridVelocity,
+            GridVelocityDS = _mbg.GridVelocityDS,
+        }.Schedule(bCount, 1).Complete();
+        
         new GridsAdvectionJob()
         {
+            GridLut = _mbg.GridInfos,
             GridVelocity = _mbg.GridVelocity,
+            GridVelocityDS = _mbg.GridVelocityDS,
             GridVelocityAlt = _mbg.GridVelocityAlt,
             GridTypes = _mbg.GridTypes,
-        }.Schedule(cellCount, batchCount).Complete();
+        }.Schedule(bCount, batchCount).Complete();
         Profiler.EndSample();
     }
     
@@ -533,13 +569,14 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     private struct BuildLutJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<int2> Hashes;
+        [ReadOnly] public NativeReference<int> ParticleCount;
         [NativeDisableParallelForRestriction] public NativeArray<int> StartIndices;
         [NativeDisableParallelForRestriction] public NativeArray<int> EndIndices;
 
         public void Execute(int i)
         {
-            int prev = i == 0 ? NumParticles - 1 : i - 1;
-            int next = i == NumParticles - 1 ? 0 : i + 1;
+            int prev = i == 0 ? ParticleCount.Value - 1 : i - 1;
+            int next = i == ParticleCount.Value - 1 ? 0 : i + 1;
             int currID = Hashes[i].x;
             int prevID = Hashes[prev].x;
             int nextID = Hashes[next].x;
@@ -622,11 +659,12 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                 {
                     int2 range = Range[(coord.x * bWidth + x) + (coord.y * bWidth + y) * gWidth * bWidth];
                     if (range.y > range.x) type = FLUID;
-                    else if (oldLevel >= 0)
+                    else if (oldLevel == 0)
                     {
                         float oldSDF = SDF[oldPtr + localIdx];
                         if (oldSDF > Band1) type = FLUID; // always true when CFL < Band1
                     }
+                    else if (oldLevel > 0) type = FLUID;
                 }
                 else type = FLUID; // inside block
 
@@ -792,7 +830,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             {
                 var cCoord = new int2(coord.x * bWidth + x, coord.y * bWidth + y);
                 int2 range = Ranges[(cCoord.x) + (cCoord.y) * gWidth * bWidth];
-                if (range.x >= range.y) return;
+                if (range.x >= range.y) continue;
                 
                 int toAdd = 0;
                 for (int i = range.x; i < range.y; i++)
@@ -807,7 +845,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                     }
                 }
                 
-                if (toAdd == 0) return;
+                if (toAdd == 0) continue;
                 
                 int existCount = range.y - range.x - toAdd;
                 var posArr = new NativeArray<float2>(4, Allocator.Temp);
@@ -1122,8 +1160,6 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         [ReadOnly] public NativeArray<float4> ParticlePos;
         [ReadOnly] public NativeArray<float2> GridVelocityOld;
         [ReadOnly] public NativeArray<float2> GridVelocityNew;
-        [ReadOnly] public NativeArray<float2> GridVelocityOldDS;
-        [ReadOnly] public NativeArray<float2> GridVelocityNewDS;
         [ReadOnly] public NativeArray<int2> GridLut;
         public NativeArray<float2> ParticleVel;
         public float Flipness;
@@ -1133,9 +1169,9 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             float2 pos = ParticlePos[i].xy;
             float2 vel = ParticleVel[i];
 
-            SampleGridFaceBilinear(0, pos, GridVelocityOld, GridVelocityOldDS, GridVelocityNew, GridVelocityNewDS, GridLut, 
+            SampleGridFaceBilinear(0, pos, GridVelocityOld,  GridVelocityNew, GridLut, 
                 out var gOriginVelX, out var gVelX);
-            SampleGridFaceBilinear(1, pos, GridVelocityOld, GridVelocityOldDS, GridVelocityNew, GridVelocityNewDS, GridLut, 
+            SampleGridFaceBilinear(1, pos, GridVelocityOld,  GridVelocityNew, GridLut, 
                 out var gOriginVelY, out var gVelY);
             
             float2 gOriginVel = new float2(gOriginVelX, gOriginVelY);
@@ -1144,26 +1180,25 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             ParticleVel[i] = math.lerp(gVel, vel + (gVel - gOriginVel), Flipness);
         }
         
-        private void SampleGridFaceBilinear(int axis, float2 pos, NativeArray<float2> vf1, NativeArray<float2> vc1, 
-            NativeArray<float2> vf2, NativeArray<float2> vc2, NativeArray<int2> lut, out float u1, out float u2)
+        private void SampleGridFaceBilinear(int axis, float2 pos, NativeArray<float2> vf1, 
+            NativeArray<float2> vf2, NativeArray<int2> lut, out float u1, out float u2)
         {
             u1 = 0;
             u2 = 0;
-            const int baseBlockWidth = bWidth;
             const int gridSize = gWidth * bWidth;
             float2 basePos = pos / cWidth;
             int2 baseCoord = (int2)math.floor(basePos);
             if (math.any(baseCoord < 0) || math.any(baseCoord >= gridSize))
                 return;
             
-            int2 blockCoord = baseCoord / baseBlockWidth;
+            int2 blockCoord = baseCoord / bWidth;
             int2 info = lut[Coord2Idx(blockCoord)];
             int blockLevel = info.x;
             if (blockLevel != 0)
                 return;
 
-            float2 localPos = (basePos - blockCoord * baseBlockWidth) / (1 << blockLevel);
-            int blockWidth = baseBlockWidth >> blockLevel;
+            float2 localPos = (basePos - blockCoord * bWidth) / (1 << blockLevel);
+            int blockWidth = bWidth >> blockLevel;
             float2 offset = new float2(0.5f, 0.5f);
             offset[axis] = 0;
             float2 localUV = localPos - offset;
@@ -1219,8 +1254,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             int x, int y, out float2 r1, out float2 r2)
         {
             var baseCoord = math.clamp(new int2(x, y), 0, gWidth * bWidth - 1);
-            const int baseBlockWidth = bWidth;
-            int2 blockCoord = baseCoord / baseBlockWidth;
+            int2 blockCoord = baseCoord / bWidth;
             int blockIdx = Coord2Idx(blockCoord);
             int2 info = lut[blockIdx];
             int level = info.x;
@@ -1228,8 +1262,8 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             r2 = float2.zero;
             if (level < 0)
                 return;
-            int blockWidth = baseBlockWidth >> level;
-            int2 localCoord = (baseCoord - blockCoord * baseBlockWidth) >> level;
+            int blockWidth = bWidth >> level;
+            int2 localCoord = (baseCoord - blockCoord * bWidth) >> level;
             r1 = v1[info.y + BlockCoord2Idx(localCoord, blockWidth)];
             r2 = v2[info.y + BlockCoord2Idx(localCoord, blockWidth)];
         }
@@ -1240,7 +1274,6 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     {
         [ReadOnly] public NativeArray<int2> GridLut;
         [ReadOnly] public NativeArray<float2> GridVelocity;
-        [ReadOnly] public NativeArray<float2> GridVelocityDS;
         public NativeArray<float4> ParticlePos;
     
         public void Execute(int i)
@@ -1250,14 +1283,14 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             // advect using RK2 (Explicit midpoint method)
             // float2 k1 = SampleGridBilinear(GridVelocity, GridVelocityDS, GridLut, pos);
 
-            SampleGridFaceBilinear(0, pos, GridVelocity, GridVelocityDS, GridLut, out var gOriginVelX);
-            SampleGridFaceBilinear(1, pos, GridVelocity, GridVelocityDS, GridLut, out var gOriginVelY);
+            SampleGridFaceBilinear(0, pos, GridVelocity,  GridLut, out var gOriginVelX);
+            SampleGridFaceBilinear(1, pos, GridVelocity,  GridLut, out var gOriginVelY);
             
             float2 k1 = new float2(gOriginVelX, gOriginVelY);
             var newPos = pos + 0.5f * DeltaTime * k1;
             
-            SampleGridFaceBilinear(0, newPos, GridVelocity, GridVelocityDS, GridLut, out gOriginVelX);
-            SampleGridFaceBilinear(1, newPos, GridVelocity, GridVelocityDS, GridLut, out gOriginVelY);
+            SampleGridFaceBilinear(0, newPos, GridVelocity,  GridLut, out gOriginVelX);
+            SampleGridFaceBilinear(1, newPos, GridVelocity,  GridLut, out gOriginVelY);
             // float2 k2 = ReadGridBilinear(pos + 0.5f * DeltaTime * k1, GridLut, GridVelocity);
             var vel = new float2(gOriginVelX, gOriginVelY);
 
@@ -1266,25 +1299,24 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             ParticlePos[i] = particle;
         }
         
-        private void SampleGridFaceBilinear(int axis, float2 pos, NativeArray<float2> vf1, NativeArray<float2> vc1, 
+        private void SampleGridFaceBilinear(int axis, float2 pos, NativeArray<float2> vf1,
             NativeArray<int2> lut, out float u1)
         {
             u1 = 0;
-            const int baseBlockWidth = bWidth;
             const int gridSize = gWidth * bWidth;
             float2 basePos = pos / cWidth;
             int2 baseCoord = (int2)math.floor(basePos);
             if (math.any(baseCoord < 0) || math.any(baseCoord >= gridSize))
                 return;
             
-            int2 blockCoord = baseCoord / baseBlockWidth;
+            int2 blockCoord = baseCoord / bWidth;
             int2 info = lut[Coord2Idx(blockCoord)];
             int blockLevel = info.x;
-            if (blockLevel < 0)
+            if (blockLevel != 0)
                 return;
             
-            float2 localPos = (basePos - blockCoord * baseBlockWidth) / (1 << blockLevel);
-            int blockWidth = baseBlockWidth >> blockLevel;
+            float2 localPos = (basePos - blockCoord * bWidth) / (1 << blockLevel);
+            int blockWidth = bWidth;
             float2 offset = new float2(0.5f, 0.5f);
             offset[axis] = 0;
             float2 localUV = localPos - offset; 
@@ -1321,221 +1353,285 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             int fineLevel, coarseLevel;
             // edge between same level blocks
             {
-                int2 lbBlockCoord = blockCoord - math.select(int2.zero, 1, localUV < 0 & blockCoord > 0);
-                int2 infoLB = lut[Coord2Idx(lbBlockCoord)];
-                int4 neighborLevel = blockLevel;
-                blockLevel = neighborLevel.x;
-                bool isRight = localUV.x < 0 || localUV.x > blockWidth - 1, isTop = localUV.y < 0 || localUV.y > blockWidth - 1;
-                int levelR = math.select(blockLevel, neighborLevel.y, isRight);
-                int levelT = math.select(blockLevel, neighborLevel.z, isTop);
-                int levelRT = math.select(math.select(neighborLevel.y, neighborLevel.z, isTop), neighborLevel.w,
-                    isRight && isTop);
-                fineLevel = math.min(math.min(blockLevel, levelR), math.min(levelT, levelRT));
-                coarseLevel = math.max(math.max(blockLevel, levelR), math.max(levelT, levelRT));
-                if (coarseLevel == fineLevel)
-                {
-                    bool2 selector = weight > 0.5f;
-                    selector[axis] = false;
-                    int2 c0 = baseCoord - math.select(int2.zero, 1 << blockLevel, selector);
-                    int2 c1 = c0 + (1 << blockLevel);
-                    SamplePointFine(vf1,  lut, c0.x, c0.y, out float2 lb1);
-                    SamplePointFine(vf1,  lut, c1.x, c0.y, out float2 rb1);
-                    SamplePointFine(vf1,  lut, c0.x, c1.y, out float2 lt1);
-                    SamplePointFine(vf1,  lut, c1.x, c1.y, out float2 rt1);
-                    u1 = LerpBilinear(weight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
-                    return;
-                }
-            }
-            
-            int2 faceBlockCoord = blockCoord + math.select(int2.zero, new int2(1,0), localUV.x > blockWidth - 0.5f & blockCoord > 0);
-            int2 infoFace = lut[Coord2Idx(faceBlockCoord)];
-        
-            blockLevel = infoFace.x;
-            blockCoord = faceBlockCoord;
-            
-            if (blockLevel == coarseLevel)
-            {
-                float2 coarsePos = (basePos - blockCoord * baseBlockWidth) / (1 << coarseLevel);
-                float2 coarseUV = coarsePos - offset;
-                float2 coarseWeight = coarseUV - math.floor(coarseUV);
-                bool2 selector = coarseWeight > 0.5f;
+                bool2 selector = weight > 0.5f;
                 selector[axis] = false;
-                int2 c0 = baseCoord - math.select(int2.zero, 1 << blockLevel, selector);
-                int2 c1 = c0 + (1 << blockLevel);
-                SamplePointLevel(vf1, vc1, lut, c0.x, c0.y, coarseLevel, out float2 lb1);
-                SamplePointLevel(vf1, vc1, lut, c1.x, c0.y, coarseLevel, out float2 rb1);
-                SamplePointLevel(vf1, vc1, lut, c0.x, c1.y, coarseLevel, out float2 lt1);
-                SamplePointLevel(vf1, vc1, lut, c1.x, c1.y, coarseLevel, out float2 rt1);
+                int2 c0 = baseCoord - math.select(int2.zero, 1, selector);
+                int2 c1 = c0 + 1;
+                SamplePointFine(vf1,  lut, c0.x, c0.y, out float2 lb1);
+                SamplePointFine(vf1,  lut, c1.x, c0.y, out float2 rb1);
+                SamplePointFine(vf1,  lut, c0.x, c1.y, out float2 lt1);
+                SamplePointFine(vf1,  lut, c1.x, c1.y, out float2 rt1);
                 u1 = LerpBilinear(weight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
             }
-            else
-            {
-                float2 coarsePos = (basePos - blockCoord * baseBlockWidth) / (1 << coarseLevel);
-                float2 coarseUV = coarsePos - offset;
-                float2 coarseWeight = coarseUV - math.floor(coarseUV);
-                
-                float2 finePos = (basePos - blockCoord * baseBlockWidth) / (1 << fineLevel);
-                float2 fineUV = finePos - offset;
-                float2 fineWeight = fineUV - math.floor(fineUV);
-                
-                
-                bool2 selector = coarseWeight > 0.5f;
-                selector[axis] = false;
-                int2 c0 = baseCoord - math.select(int2.zero, 1 << blockLevel, selector);
-                int2 c1 = c0 + (1 << coarseLevel);
-                SamplePointLevel(vf1, vc1, lut, c0.x, c0.y, coarseLevel, out float2 lb1);
-                SamplePointLevel(vf1, vc1, lut, c1.x, c0.y, coarseLevel, out float2 rb1);
-                SamplePointLevel(vf1, vc1, lut, c0.x, c1.y, coarseLevel, out float2 lt1);
-                SamplePointLevel(vf1, vc1, lut, c1.x, c1.y, coarseLevel, out float2 rt1);
-                
-                int4 neighborLevelCur = blockLevel;
-                int4 neighborLevelLB = blockLevel;
-                int levelR = neighborLevelCur.y;
-                int levelT = neighborLevelCur.z;
-                int levelRT = neighborLevelCur.w;
-                int levelL = neighborLevelLB.z;
-                int levelB = neighborLevelLB.y;
-                int levelLB = neighborLevelLB.x;
-                int levelLT = lut[Coord2Idx(math.clamp(faceBlockCoord + new int2(-1, 1), 0, gWidth - 1))].x;
-                int levelRB = lut[Coord2Idx(math.clamp(faceBlockCoord + new int2(1, -1), 0, gWidth - 1))].x;
-                float dstToCoarse = 1;
-                localPos = fineUV + new float2(1, 0.5f);
-                float2 subPos = BlockWidth(fineLevel) - fineUV - new float2(0.5f, 0.5f);
-                // return math.cmin(localPos);
-                int levelC = infoFace.x;
-                if (levelC < levelL) dstToCoarse = math.min(dstToCoarse, localPos.x);
-                if (levelC < levelR) dstToCoarse = math.min(dstToCoarse, subPos.x);
-                if (levelC < levelT) dstToCoarse = math.min(dstToCoarse, subPos.y);
-                if (levelC < levelB) dstToCoarse = math.min(dstToCoarse, localPos.y);
-                if (levelC < levelLB) dstToCoarse = math.min(dstToCoarse, math.max(localPos.x, localPos.y));
-                if (levelC < levelRT) dstToCoarse = math.min(dstToCoarse, math.max(subPos.x, subPos.y));
-                if (levelC < levelLT) dstToCoarse = math.min(dstToCoarse, math.max(localPos.x, subPos.y));
-                if (levelC < levelRB) dstToCoarse = math.min(dstToCoarse, math.max(subPos.x, localPos.y));
-                dstToCoarse = math.min(1, dstToCoarse * 2);
-
-                var valueCoarse1 = LerpBilinear(coarseWeight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
-                
-                
-                selector = fineWeight > 0.5f;
-                selector[axis] = false;
-                c0 = baseCoord - math.select(int2.zero, 1 << fineLevel, selector);
-                c1 = c0 + (1 << fineLevel);
-
-                SamplePointFine(vf1, lut, c0.x, c0.y, out lb1);
-                SamplePointFine(vf1, lut, c1.x, c0.y, out rb1);
-                SamplePointFine(vf1, lut, c0.x, c1.y, out lt1);
-                SamplePointFine(vf1, lut, c1.x, c1.y, out rt1);
-                
-                var valueFine1 = LerpBilinear(fineWeight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
-                
-                u1 = math.lerp(valueCoarse1, valueFine1, dstToCoarse);
-            }
+            // should not happen
+            // int2 faceBlockCoord = blockCoord + math.select(int2.zero, new int2(1,0), localUV.x > blockWidth - 0.5f & blockCoord > 0);
+            // int2 infoFace = lut[Coord2Idx(faceBlockCoord)];
+            //
+            // blockLevel = infoFace.x;
+            // blockCoord = faceBlockCoord;
+            //
+            // if (blockLevel == coarseLevel)
+            // {
+            //     float2 coarsePos = (basePos - blockCoord * baseBlockWidth) / (1 << coarseLevel);
+            //     float2 coarseUV = coarsePos - offset;
+            //     float2 coarseWeight = coarseUV - math.floor(coarseUV);
+            //     bool2 selector = coarseWeight > 0.5f;
+            //     selector[axis] = false;
+            //     int2 c0 = baseCoord - math.select(int2.zero, 1 << blockLevel, selector);
+            //     int2 c1 = c0 + (1 << blockLevel);
+            //     SamplePointLevel(vf1, vc1, lut, c0.x, c0.y, coarseLevel, out float2 lb1);
+            //     SamplePointLevel(vf1, vc1, lut, c1.x, c0.y, coarseLevel, out float2 rb1);
+            //     SamplePointLevel(vf1, vc1, lut, c0.x, c1.y, coarseLevel, out float2 lt1);
+            //     SamplePointLevel(vf1, vc1, lut, c1.x, c1.y, coarseLevel, out float2 rt1);
+            //     u1 = LerpBilinear(weight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
+            // }
+            // else
+            // {
+            //     float2 coarsePos = (basePos - blockCoord * baseBlockWidth) / (1 << coarseLevel);
+            //     float2 coarseUV = coarsePos - offset;
+            //     float2 coarseWeight = coarseUV - math.floor(coarseUV);
+            //     
+            //     float2 finePos = (basePos - blockCoord * baseBlockWidth) / (1 << fineLevel);
+            //     float2 fineUV = finePos - offset;
+            //     float2 fineWeight = fineUV - math.floor(fineUV);
+            //     
+            //     
+            //     bool2 selector = coarseWeight > 0.5f;
+            //     selector[axis] = false;
+            //     int2 c0 = baseCoord - math.select(int2.zero, 1 << blockLevel, selector);
+            //     int2 c1 = c0 + (1 << coarseLevel);
+            //     SamplePointLevel(vf1, vc1, lut, c0.x, c0.y, coarseLevel, out float2 lb1);
+            //     SamplePointLevel(vf1, vc1, lut, c1.x, c0.y, coarseLevel, out float2 rb1);
+            //     SamplePointLevel(vf1, vc1, lut, c0.x, c1.y, coarseLevel, out float2 lt1);
+            //     SamplePointLevel(vf1, vc1, lut, c1.x, c1.y, coarseLevel, out float2 rt1);
+            //     
+            //     int4 neighborLevelCur = blockLevel;
+            //     int4 neighborLevelLB = blockLevel;
+            //     int levelR = neighborLevelCur.y;
+            //     int levelT = neighborLevelCur.z;
+            //     int levelRT = neighborLevelCur.w;
+            //     int levelL = neighborLevelLB.z;
+            //     int levelB = neighborLevelLB.y;
+            //     int levelLB = neighborLevelLB.x;
+            //     int levelLT = lut[Coord2Idx(math.clamp(faceBlockCoord + new int2(-1, 1), 0, gWidth - 1))].x;
+            //     int levelRB = lut[Coord2Idx(math.clamp(faceBlockCoord + new int2(1, -1), 0, gWidth - 1))].x;
+            //     float dstToCoarse = 1;
+            //     localPos = fineUV + new float2(1, 0.5f);
+            //     float2 subPos = BlockWidth(fineLevel) - fineUV - new float2(0.5f, 0.5f);
+            //     // return math.cmin(localPos);
+            //     int levelC = infoFace.x;
+            //     if (levelC < levelL) dstToCoarse = math.min(dstToCoarse, localPos.x);
+            //     if (levelC < levelR) dstToCoarse = math.min(dstToCoarse, subPos.x);
+            //     if (levelC < levelT) dstToCoarse = math.min(dstToCoarse, subPos.y);
+            //     if (levelC < levelB) dstToCoarse = math.min(dstToCoarse, localPos.y);
+            //     if (levelC < levelLB) dstToCoarse = math.min(dstToCoarse, math.max(localPos.x, localPos.y));
+            //     if (levelC < levelRT) dstToCoarse = math.min(dstToCoarse, math.max(subPos.x, subPos.y));
+            //     if (levelC < levelLT) dstToCoarse = math.min(dstToCoarse, math.max(localPos.x, subPos.y));
+            //     if (levelC < levelRB) dstToCoarse = math.min(dstToCoarse, math.max(subPos.x, localPos.y));
+            //     dstToCoarse = math.min(1, dstToCoarse * 2);
+            //
+            //     var valueCoarse1 = LerpBilinear(coarseWeight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
+            //     
+            //     
+            //     selector = fineWeight > 0.5f;
+            //     selector[axis] = false;
+            //     c0 = baseCoord - math.select(int2.zero, 1 << fineLevel, selector);
+            //     c1 = c0 + (1 << fineLevel);
+            //
+            //     SamplePointFine(vf1, lut, c0.x, c0.y, out lb1);
+            //     SamplePointFine(vf1, lut, c1.x, c0.y, out rb1);
+            //     SamplePointFine(vf1, lut, c0.x, c1.y, out lt1);
+            //     SamplePointFine(vf1, lut, c1.x, c1.y, out rt1);
+            //     
+            //     var valueFine1 = LerpBilinear(fineWeight, lb1[axis], rb1[axis], lt1[axis], rt1[axis]);
+            //     
+            //     u1 = math.lerp(valueCoarse1, valueFine1, dstToCoarse);
+            // }
         }
         
         private static void SamplePointFine(NativeArray<float2> v1,  NativeArray<int2> lut,
             int x, int y, out float2 r1)
         {
             var baseCoord = math.clamp(new int2(x, y), 0, gWidth * bWidth - 1);
-            const int baseBlockWidth = bWidth;
-            int2 blockCoord = baseCoord / baseBlockWidth;
+            int2 blockCoord = baseCoord / bWidth;
             int blockIdx = Coord2Idx(blockCoord);
             int2 info = lut[blockIdx];
             int level = info.x;
             r1 = float2.zero;
             if (level < 0)
                 return;
-            int blockWidth = baseBlockWidth >> level;
-            int2 localCoord = (baseCoord - blockCoord * baseBlockWidth) >> level;
+            int blockWidth = bWidth >> level;
+            int2 localCoord = (baseCoord - blockCoord * bWidth) >> level;
             r1 = v1[info.y + BlockCoord2Idx(localCoord, blockWidth)];
         }
+    }
 
-        private static void SamplePointLevel(NativeArray<float2> vf1, NativeArray<float2> vc1, 
-            NativeArray<int2> lut, int x, int y, int targetLevel, out float2 r1)
+    [BurstCompile]
+    private struct DownSampleJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<int2> GridLut;
+        [ReadOnly] public NativeArray<float2> GridVelocity;
+        [NativeDisableParallelForRestriction, WriteOnly] public NativeArray<float2> GridVelocityDS;
+
+        public void Execute(int i)
         {
-            var baseCoord = math.clamp(new int2(x, y), 0, gWidth * bWidth - 1);
-            const int baseBlockWidth = bWidth;
-            int2 blockCoord = baseCoord / baseBlockWidth;
-            int blockIdx = Coord2Idx(blockCoord);
-            int2 info = lut[blockIdx];
+            int2 info = GridLut[i];
             int level = info.x;
-            
-            r1 = float2.zero;
-            if (level < 0) return;
-            
-            if (level == targetLevel)
+            // Only levels 0 and 1 have a coarser level inside the simulation.
+            if (level < 0 || level > 1) return;
+            int ptr = info.y;
+            int fineWidth = BlockWidth(level);
+            int coarseWidth = BlockWidth(level + 1);
+            for (int cy = 0; cy < coarseWidth; cy++)
+            for (int cx = 0; cx < coarseWidth; cx++)
             {
-                int blockWidth = baseBlockWidth >> level;
-                int2 localCoord = (baseCoord - blockCoord * baseBlockWidth) >> level;
-                r1 = vf1[info.y + BlockCoord2Idx(localCoord, blockWidth)];
-            }
-            else
-            {
-                // UnityEngine.Debug.Assert(level < targetLevel);
-                int blockWidth = baseBlockWidth >> targetLevel;
-                int2 localCoord = (baseCoord - blockCoord * baseBlockWidth) >> targetLevel;
-                r1 = vc1[info.y + BlockCoord2Idx(localCoord, blockWidth)];
+                int fx = cx * 2, fy = cy * 2;
+                float2 v00 = GridVelocity[ptr + BlockCoord2Idx(fx,     fy,     fineWidth)];
+                float2 v10 = GridVelocity[ptr + BlockCoord2Idx(fx + 1, fy,     fineWidth)];
+                float2 v01 = GridVelocity[ptr + BlockCoord2Idx(fx,     fy + 1, fineWidth)];
+                // MAC face coarsening: average the two fine faces each coarse face spans.
+                GridVelocityDS[ptr + BlockCoord2Idx(cx, cy, coarseWidth)] =
+                    new float2((v00.x + v01.x) * 0.5f, (v00.y + v10.y) * 0.5f);
             }
         }
-
     }
 
     [BurstCompile]
     private struct GridsAdvectionJob : IJobParallelFor
     {
+        [ReadOnly] public NativeArray<int2> GridLut;
         [ReadOnly] public NativeArray<float2> GridVelocity;
+        [ReadOnly] public NativeArray<float2> GridVelocityDS;
         [ReadOnly] public NativeArray<uint> GridTypes;
-        [WriteOnly] public NativeArray<float2> GridVelocityAlt;
-    
+        [NativeDisableParallelForRestriction, WriteOnly] public NativeArray<float2> GridVelocityAlt;
+
         public void Execute(int i)
         {
-            int2 coord = Idx2Coord(i);
-            float2 cellCenter = ((float2)coord + 0.5f) * CellSize;
-            // using RK4
-            float2 posFaceX = cellCenter + new float2(-0.5f * CellSize, 0);
-            float2 traceDirX = BackwardTrace(posFaceX, GridVelocity);
-            float vx = ReadGridFaceBilinear(posFaceX - traceDirX * DeltaTime, 0, GridVelocity);
+            int2 blockCoord = Idx2Coord(i);
+            int2 info = GridLut[i];
+            int level = info.x;
+            if (level < 0) return;
+            int ptr = info.y;
+            int width = BlockWidth(level);
+            float h = GetH(level);
+            float2 blockOrigin = (float2)(blockCoord * bWidth);
 
-            float2 posFaceY = cellCenter + new float2(0, -0.5f * CellSize);
-            float2 traceDirY = BackwardTrace(posFaceY, GridVelocity);
-            float vy = ReadGridFaceBilinear(posFaceY - traceDirY * DeltaTime, 1, GridVelocity);
-            
-            uint grid_types = GridTypes[i];
-            GridVelocityAlt[i] = EnforceBoundaryCondition(new float2(vx, vy), grid_types);
+            for (int y = 0; y < width; y++)
+            for (int x = 0; x < width; x++)
+            {
+                int idx = ptr + BlockCoord2Idx(x, y, width);
+                float2 cellCenter = blockOrigin + (new float2(x, y) + 0.5f) * h;
+
+                float2 posFaceX = cellCenter + new float2(-0.5f * h, 0);
+                float2 posFaceY = cellCenter + new float2(0, -0.5f * h);
+
+                // Semi-Lagrangian advection with RK4 backward tracing.
+                float2 traceDirX = BackwardTrace(posFaceX);
+                float2 traceDirY = BackwardTrace(posFaceY);
+
+                float vx = SampleFaceBilinear(0, posFaceX - traceDirX * DeltaTime);
+                float vy = SampleFaceBilinear(1, posFaceY - traceDirY * DeltaTime);
+
+                GridVelocityAlt[idx] = EnforceBoundaryCondition(new float2(vx, vy), GridTypes[idx]);
+            }
         }
 
-        private float2 BackwardTrace(float2 pos, NativeArray<float2> block)
+        private float2 BackwardTrace(float2 pos)
         {
-            float2 k1 = ReadGridFacesBilinear(pos,  block);
-            float2 k2 = ReadGridFacesBilinear(pos - 0.5f * DeltaTime * k1, block);
-            float2 k3 = ReadGridFacesBilinear(pos - 0.5f * DeltaTime * k2, block);
-            float2 k4 = ReadGridFacesBilinear(pos - DeltaTime * k3, block);
+            float2 k1 = SampleVelocity(pos);
+            float2 k2 = SampleVelocity(pos - 0.5f * DeltaTime * k1);
+            float2 k3 = SampleVelocity(pos - 0.5f * DeltaTime * k2);
+            float2 k4 = SampleVelocity(pos - DeltaTime * k3);
             return (k1 + 2 * k2 + 2 * k3 + k4) / 6.0f;
         }
 
-        private float2 ReadGridFacesBilinear(float2 pos, NativeArray<float2> block)
+        private float2 SampleVelocity(float2 pos)
         {
-            return new float2(ReadGridFaceBilinear(pos, 0, block),
-                              ReadGridFaceBilinear(pos, 1, block));
+            return new float2(SampleFaceBilinear(0, pos), SampleFaceBilinear(1, pos));
         }
-        
-        private float ReadGridFaceBilinear(float2 pos, int axis, NativeArray<float2> block)
+
+        private float SampleFaceBilinear(int axis, float2 pos)
         {
-            float2 uv = pos * InvCellSize + new float2(axis == 0 ? 0 : -0.5f, axis == 1 ? 0 : -0.5f);
-            uv = math.clamp(uv, 1e-3f, gWidth - 1e-3f);
-            int2 p00 = (int2)math.floor(uv);
-            int2 p11 = p00 + 1;
-            float2 f = uv - p00;
-            float c00 = ReadGrid(p00, block)[axis];
-            float c10 = ReadGrid(new int2(p11.x, p00.y), block)[axis];
-            float c01 = ReadGrid(new int2(p00.x, p11.y), block)[axis];
-            float c11 = ReadGrid(p11, block)[axis];
-            float c0 = math.lerp(c00, c10, f.x);
-            float c1 = math.lerp(c01, c11, f.x);
-            return math.lerp(c0, c1, f.y);
+            int gridSize = gWidth * bWidth;
+            float2 basePos = pos * InvCellSize;
+            int2 baseCoord = (int2)math.floor(basePos);
+            if (math.any(baseCoord < 0) || math.any(baseCoord >= gridSize))
+                return 0f;
+
+            int2 blockCoord = baseCoord / bWidth;
+            int2 info = GridLut[Coord2Idx(blockCoord)];
+            int level = info.x;
+            if (level < 0) return 0f;
+            int ptr = info.y;
+            int blockWidth = BlockWidth(level);
+
+            float2 localPos = (basePos - (float2)(blockCoord * bWidth)) / (1 << level);
+            float2 offset = new float2(0.5f, 0.5f);
+            offset[axis] = 0f;
+            float2 localUV = localPos - offset;
+            float2 f = localUV - math.floor(localUV);
+
+            // Strictly interior: bilinear over this block's native cells.
+            if (math.all(localUV > 0f & localUV < blockWidth - 1f))
+            {
+                int2 p00 = (int2)math.floor(localUV);
+                float v00 = GridVelocity[ptr + BlockCoord2Idx(p00.x,     p00.y,     blockWidth)][axis];
+                float v10 = GridVelocity[ptr + BlockCoord2Idx(p00.x + 1, p00.y,     blockWidth)][axis];
+                float v01 = GridVelocity[ptr + BlockCoord2Idx(p00.x,     p00.y + 1, blockWidth)][axis];
+                float v11 = GridVelocity[ptr + BlockCoord2Idx(p00.x + 1, p00.y + 1, blockWidth)][axis];
+                return LerpBilinear(f, v00, v10, v01, v11);
+            }
+
+            // On a block boundary: resolve the stencil at the coarsest level among the
+            // blocks it touches, so coarse-fine edges uniformly use the coarse data.
+            bool2 selector = f > 0.5f;
+            selector[axis] = false;
+            int2 c0 = baseCoord - math.select(int2.zero, 1 << level, selector);
+            int2 c1 = c0 + (1 << level);
+
+            int coarseLevel = level;
+            coarseLevel = math.max(coarseLevel, BlockLevelAt(c0.x, c0.y));
+            coarseLevel = math.max(coarseLevel, BlockLevelAt(c1.x, c0.y));
+            coarseLevel = math.max(coarseLevel, BlockLevelAt(c0.x, c1.y));
+            coarseLevel = math.max(coarseLevel, BlockLevelAt(c1.x, c1.y));
+
+            float2 coarseLocal = (basePos - (float2)(blockCoord * bWidth)) / (1 << coarseLevel);
+            float2 coarseUV = coarseLocal - offset;
+            float2 cf = coarseUV - math.floor(coarseUV);
+            bool2 csel = cf > 0.5f;
+            csel[axis] = false;
+            int2 cc0 = baseCoord - math.select(int2.zero, 1 << coarseLevel, csel);
+            int2 cc1 = cc0 + (1 << coarseLevel);
+
+            float lb = SamplePointLevel(cc0.x, cc0.y, coarseLevel, axis);
+            float rb = SamplePointLevel(cc1.x, cc0.y, coarseLevel, axis);
+            float lt = SamplePointLevel(cc0.x, cc1.y, coarseLevel, axis);
+            float rt = SamplePointLevel(cc1.x, cc1.y, coarseLevel, axis);
+            return LerpBilinear(cf, lb, rb, lt, rt);
         }
-        private static float2 ReadGrid(int2 coord, NativeArray<float2> block)
+
+        private int BlockLevelAt(int x, int y)
         {
-            return block[Coord2Idx(math.clamp(coord, 0, gWidth - 1))];
+            int gridSize = gWidth * bWidth;
+            int2 bc = math.clamp(new int2(x, y), 0, gridSize - 1) / bWidth;
+            return GridLut[Coord2Idx(bc)].x;
+        }
+
+        private float SamplePointLevel(int x, int y, int targetLevel, int axis)
+        {
+            int gridSize = gWidth * bWidth;
+            int2 baseCoord = math.clamp(new int2(x, y), 0, gridSize - 1);
+            int2 blockCoord = baseCoord / bWidth;
+            int2 info = GridLut[Coord2Idx(blockCoord)];
+            int level = info.x;
+            if (level < 0) return 0f;
+
+            int blockWidth = BlockWidth(targetLevel);
+            int2 localCoord = (baseCoord - blockCoord * bWidth) >> targetLevel;
+            int idx = info.y + BlockCoord2Idx(localCoord, blockWidth);
+            if (level < targetLevel)
+                return GridVelocityDS[idx][axis];
+            return GridVelocity[idx][axis];
         }
     }
 
@@ -1787,6 +1883,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             }
         }
         
+        
         Gizmos.color = Color.white;
         for (int y = 0; y < gWidth; y++)
         for (int x = 0; x < gWidth; x++)
@@ -1809,7 +1906,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                 float d = _mbg.SDF[idx];
                 Handles.Label(center, $"{d}");
                 float2 vel = _mbg.GridVelocity[idx];
-                Gizmos.DrawLine(center, center + new Vector3(vel.x, vel.y, 0));
+                Gizmos.DrawLine(center, center + 0.2f * new Vector3(vel.x, vel.y, 0));
                 // float3 ps = _mbg.GridLaplacian[idx];
                 // if ((_mbg.GridTypes[idx] & 3) != 0) continue;
                 // Handles.Label(center, $"{ps.x:F2}");

@@ -153,7 +153,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   initCs: {fileID: 7200000, guid: 422e398747efe8443ae25b822342d12b, type: 3}
   buildLutCs: {fileID: 7200000, guid: 33617cb477456e84abbd8fa816668ea1, type: 3}
-  P2GCs: {fileID: 7200000, guid: a5e95cccfb0ff2c41b39258178c1a686, type: 3}
   splatP2GCs: {fileID: 7200000, guid: 9a0fe422cfb0abf42ba174299b7387a3, type: 3}
   NBCs: {fileID: 7200000, guid: 2ddbcad5d4541254c9a007007bbf60af, type: 3}
   JFACs: {fileID: 7200000, guid: 924262f5600572c4b9bc84b5eedde2e3, type: 3}
@@ -163,7 +162,7 @@ MonoBehaviour:
   mcCs: {fileID: 7200000, guid: cbefffa4c1505b54689332f612d627e6, type: 3}
   solverCs: {fileID: 7200000, guid: 8fa57cc5d1843c941ac20f52df051f53, type: 3}
   damping: 0.6667
-  flipness: 0.95
+  flipness: 0.99
   mouseForce: 1
   mouseForceRange: 2
   threshold: 0.5

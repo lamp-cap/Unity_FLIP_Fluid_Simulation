@@ -11,6 +11,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     private const uint FLUID = 0;
     
     public NativeArray<float2> GridVelocityAlt;
+    public NativeArray<float2> GridVelocityAltDS;
     public NativeArray<float> _pressure;
 
     private NativeArray<int2>[] _infoPymaid;
@@ -34,6 +35,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     public NativeArray<int2> GridInfosOld;
     public NativeArray<float3> GridLaplacian;
     public NativeArray<float2> GridVelocity;
+    public NativeArray<float2> GridVelocityDS;
     public NativeArray<float> Flux;
     public NativeArray<float> SDF;
     public NativeArray<int> BlockLevel;
@@ -78,6 +80,8 @@ public class MultiresBlockGridSolver : System.IDisposable
         _Ap = new NativeArray<float>(numCells, Allocator.Persistent);
         GridVelocity = new NativeArray<float2>(numCells, Allocator.Persistent);
         GridVelocityAlt = new NativeArray<float2>(numCells, Allocator.Persistent);
+        GridVelocityDS = new NativeArray<float2>(numCells, Allocator.Persistent);
+        GridVelocityAltDS = new NativeArray<float2>(numCells, Allocator.Persistent);
         _pressure = new NativeArray<float>(numCells, Allocator.Persistent);
         Flux = new NativeArray<float>(numCells, Allocator.Persistent);
         SDF = new NativeArray<float>(numCells, Allocator.Persistent);
@@ -104,6 +108,8 @@ public class MultiresBlockGridSolver : System.IDisposable
         _Ap.Dispose();
         GridVelocityAlt.Dispose();
         GridVelocity.Dispose();
+        GridVelocityDS.Dispose();
+        GridVelocityAltDS.Dispose();
         _pressure.Dispose();
         Flux.Dispose();
         SDF.Dispose();
@@ -122,7 +128,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     {
         CalcFlux();
         
-        SolveMGPCG(32, GridInfos, GridLaplacian, _pressure, Flux);
+        SolveMGPCG(4, GridInfos, GridLaplacian, _pressure, Flux);
 
         ApplyPressure(GridInfos, _pressure, GridVelocity);
     }
@@ -527,6 +533,11 @@ public class MultiresBlockGridSolver : System.IDisposable
         GridInfos.CopyTo(GridInfosOld);
         new InitGridTypesJob(GridInfos, GridTypes, bounds).Schedule(BlockCount, 1).Complete();
 
+        new ClearCellsJob()
+        {
+            f = _r,
+            p = Flux,
+        }.Schedule(_cellCount.Value, 64).Complete();
         return _cellCount.Value;
     }
 
@@ -548,9 +559,8 @@ public class MultiresBlockGridSolver : System.IDisposable
     public int AllocateBaseCells()
     {
         new ComputeBlockSDFJob(BlockLevel).Run();
-        new AllocateCellsJob(BlockLevel, GridInfos, _cellCount).Run();
-        
         GridInfos.CopyTo(GridInfosOld);
+        new AllocateCellsJob(BlockLevel, GridInfos, _cellCount).Run();
 
         return _cellCount.Value;
     }
@@ -565,6 +575,60 @@ public class MultiresBlockGridSolver : System.IDisposable
         }.Schedule(BlockCount, 1).Complete();
     }
     
+    [BurstCompile]
+    private struct ClearCellsJob : IJobParallelFor
+    {
+        [WriteOnly] public NativeArray<float> f;
+        [WriteOnly] public NativeArray<float> p;
+        
+        public void Execute(int i)
+        {
+            f[i] = 0;
+            p[i] = 0;
+        }
+        
+        private static void FillHaloBlock(NativeArray<float> v, NativeArray<int2> infos, NativeArray<float> block, int2 coord)
+        {
+            int2 info = infos[Coord2Idx(coord)];
+            int level = info.x; // must be 0
+            int ptr = info.y;
+            int blockWidth = BlockWidth(level);
+            int haloBlockWidth = blockWidth + 2;
+            for (int by = 0; by < blockWidth; by++)
+            for (int bx = 0; bx < blockWidth; bx++)
+            {
+                int localIdx = BlockCoord2Idx(bx + 1, by + 1, haloBlockWidth);
+                int physicsIdx = ptr + BlockCoord2Idx(bx, by, blockWidth);
+                    
+                block[localIdx] = v[physicsIdx];
+            }
+            int4 ox = new int4(-1, 1, 0, 0);
+            int4 oy = new int4(0, 0, -1, 1);
+            
+            for (int n = 0; n < 4; n++)
+            {
+                int2 dir = new int2(ox[n], oy[n]);
+                int2 curr = coord + dir;
+                if (curr.x < 0 || curr.y < 0 || curr.x >= GridWidth || curr.y >= GridWidth)
+                    continue;
+                
+                int2 nInfo = infos[Coord2Idx(curr)];
+                int nLevel = nInfo.x;
+                if (nLevel != level)
+                    continue;
+                
+                int phn = nInfo.y;
+                for (int c = 0; c < blockWidth; c++)
+                {
+                    int2 nCoord = math.select(math.select(c, 0, dir > 0), blockWidth - 1, dir < 0);
+                    int nLocalIdx = BlockCoord2Idx(nCoord, blockWidth);
+                    int2 cCoord = math.select(math.select(c + 1, haloBlockWidth - 1, dir > 0), 0, dir < 0);
+                    int paddingIdx = BlockCoord2Idx(cCoord, haloBlockWidth);
+                    block[paddingIdx] = v[phn + nLocalIdx];
+                }
+            }
+        }
+    }
     
     [BurstCompile]
     private struct ComputeCellSDFJob : IJobParallelFor
