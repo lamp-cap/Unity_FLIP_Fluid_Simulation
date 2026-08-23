@@ -44,6 +44,7 @@ public class NB_FLIP : MonoBehaviour
     public DrawType drawType;
 
     public Material meshMat;
+    public Material digitMat;
     
     private Material _material;
     
@@ -78,7 +79,7 @@ public class NB_FLIP : MonoBehaviour
     private ComputeBuffer _dotBuffer;
     private ComputeBuffer _counterBuffer;
     
-    private const int ParticlesBufferSize = 256 * 128 * 128;
+    private const int ParticlesBufferSize = 256 * 128 * 100;
     private static readonly int3 GridSize = new int3(256, 128, 128);
     private const float GridSpacing = 0.2f;
     private int NumGrids => GridSize.x * GridSize.y * GridSize.z;
@@ -240,7 +241,7 @@ public class NB_FLIP : MonoBehaviour
         _mpb.SetFloat("_Radius", ParticleRadius);
         _mpb.SetFloat("_NearClipPlane", Camera.main.nearClipPlane);
         _mpb.SetFloat("_FarClipPlane", Camera.main.farClipPlane);
-        _mpb.SetVector("_SlowColor", new Color(0f, 0.3891521f, 0.7735849f, 1f));
+        _mpb.SetVector("_SlowColor", new Color(0f, 0.32f, 0.7735849f, 1f));
         _mpb.SetVector("_FastColor", new Color(0.5999911f, 0.7552593f, 0.9150943f, 1f));
         _mpb.SetVector("_VelocityRange", new Vector2(2f, 8f));
         _mpb.SetFloat("_FresnelPower", 0.3f);
@@ -265,6 +266,8 @@ public class NB_FLIP : MonoBehaviour
             fontSize = 32,
             normal = { textColor = Color.white }
         };
+        
+        digitMat.SetBuffer("_Counter", _counterBuffer);
         
         Debug.Log($"Initializing GPU flip with particles: {ParticlesBufferSize}, GridSize: {GridSize}, numCells: {NumGrids}, bufferSize: {_vertBufferSize}");
         Debug.Log($"Initializing GPU flip with particlesT: {_pGroupThreadsX}, GridSizeT: {_gGroupThreads}");
@@ -293,6 +296,13 @@ public class NB_FLIP : MonoBehaviour
                 ShadowCastingMode.Off,
                 false
             );
+        
+    }
+
+    private void LateUpdate()
+    {
+        digitMat.SetBuffer("_Counter", _counterBuffer);
+        Graphics.DrawProcedural(digitMat, new Bounds(Vector3.zero, Vector3.one), MeshTopology.Quads, 4);
     }
 
     private void OnDrawGizmos()

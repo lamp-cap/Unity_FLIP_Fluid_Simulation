@@ -155,6 +155,7 @@ MonoBehaviour:
   flipness: 0.95
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: 878651dacc481f54da85c4070620f1f6, type: 2}
+  drawBaseParticles: 0
   outerRadius: 0.5
   surfaceDensity: 30
   nbSurfaceMaintenanceIterations: 4
