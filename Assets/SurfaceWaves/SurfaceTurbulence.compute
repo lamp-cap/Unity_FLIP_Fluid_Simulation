@@ -1,0 +1,906 @@
+#pragma use_dxc
+// Required, not optional: SurfaceTurbulenceUtils.hlsl declares 36 UAVs and the
+// header is shared by every kernel, so each entry point inherits all of them. The
+// default compute profile caps UAVs at 8, which makes D3D12 reject the root
+// signature ("CreateRootSignature failed (887a0005) Reason: 887a0006") and every
+// pipeline state fails to create — the kernels then silently never run. SM 6.0
+// raises the limit to 64.
+#pragma target 6.0
+
+#include "SurfaceTurbulenceUtils.hlsl"
+
+#pragma kernel ClearSurfaceRange
+#pragma kernel MakeSurfacePair
+#pragma kernel SetSurfaceRange
+#pragma kernel InitSurfacePoints
+#pragma kernel AdvectSurfacePoints
+#pragma kernel ComputeSurfaceNormals
+#pragma kernel ComputeAveragedNormals
+#pragma kernel AssignNormals
+#pragma kernel ComputeSurfaceDensities
+#pragma kernel ComputeSurfaceDisplacements
+#pragma kernel ApplySurfaceDisplacements
+#pragma kernel ConstrainSurface
+#pragma kernel InterpolateNewWaveData
+#pragma kernel ComputeAdditions
+#pragma kernel MarkDeletions
+#pragma kernel MarkDeletionsDensity
+#pragma kernel ApplyDensityKills
+#pragma kernel SnapshotCoarse
+#pragma kernel StageAliveForScan
+#pragma kernel StageCandidatesForScan
+#pragma kernel GatherSurvivors
+#pragma kernel AppendCandidates
+#pragma kernel FinalizeSurfaceCount
+#pragma kernel ResetAliveAfterCompaction
+#pragma kernel ClearSurfaceStatus
+#pragma kernel WriteSurfaceDispatchArgs
+#pragma kernel AddSeed
+#pragma kernel ComputeSurfaceWaveNormal
+#pragma kernel ComputeSurfaceWaveLaplacians
+#pragma kernel EvolveWave
+#pragma kernel ComputeSurfaceCurvature
+#pragma kernel SmoothCurvature
+#pragma kernel SeedWaves
+#pragma kernel DisplaceForRender
+
+// =============================================================================
+// Surface turbulence — 3D compute port of surfaceturbulence.cpp
+// (Mercier et al., SIGGRAPH Asia 2015).
+//
+// All per-surface-point kernels use [numthreads(GROUP_THREADS_X,1,1)] and are
+// independent per point (no cross-thread write).
+//
+// The over-density thinning of addDeleteSurfacePoints IS implemented, as
+// MarkDeletionsDensity + ApplyDensityKills: the C++ version's index-ordered
+// cascade turns out to be exactly equivalent to a single stateless pass (see the
+// derivation above those kernels).
+//
+// Still deferred: the doCompress / insertBuffered compaction, which is what
+// would consume _CandidatePos/_HasCandidate and repack survivors. Left for a
+// later stream-compaction pass.
+//
+// Alive-flag lifecycle (documented, driven by C# later):
+//   - _SurfaceAlive is initialized to 1 for [0, _SurfaceCount) at seeding time.
+//   - MarkDeletions clears it for killed points.
+//   - every other per-point kernel skips points with _SurfaceAlive == 0.
+//   - compaction (deferred) re-packs survivors and resets alive to 1.
+// =============================================================================
+
+// ===== surface bucket build (sorted LUT, runs around DeviceRadixSort) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ClearSurfaceRange(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _NumCells) return;
+    _SurfaceRange[id.x] = uint2(0, 0);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void MakeSurfacePair(uint3 id : SV_DispatchThreadID)
+{
+    // hash = Morton cell of the surface point; unused slots hash to the sentinel
+    // so the radix sort pushes them to the end (SetRange then ignores them).
+    if (id.x >= (uint)_MaxSurfacePoints) return;
+    _SurfaceID[id.x] = id.x;
+    if (id.x >= _SurfaceCount)
+    {
+        _SurfaceHash[id.x] = SURFACE_HASH_INVALID;
+    }
+    else
+    {
+        int3 cell = (int3)floor(_SurfacePos[id.x] * _InvCellSize);
+        cell = clamp(cell, int3(0, 0, 0), _GridSize - int3(1, 1, 1));
+        _SurfaceHash[id.x] = Coord2Idx((uint3)cell);
+    }
+}
+
+// Dispatched over the FULL capacity, not the live count: the sort runs at fixed
+// size so its CPU-side parameters stay independent of the GPU-resident count.
+// Unused slots hash to SURFACE_HASH_INVALID and sort to the tail, so the sentinel
+// is what delimits the valid prefix here.
+//
+// Boundary cases fall out of the wrap: slot 0's predecessor is the last capacity
+// slot, which is a sentinel, so its hash differs and the range start is written.
+// Likewise the final valid slot's successor is a sentinel, closing the range.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void SetSurfaceRange(uint3 thread_id : SV_DispatchThreadID)
+{
+    const uint cap = (uint)_MaxSurfacePoints;
+    if (thread_id.x >= cap) return;
+
+    const uint curr_o_id = thread_id.x;
+    const uint curr_c_id = _SurfaceHash[curr_o_id];
+    if (curr_c_id == SURFACE_HASH_INVALID) return;
+
+    const uint max_id = cap - 1;
+    const uint prev_o_id = curr_o_id == 0 ? max_id : curr_o_id - 1;
+    const uint next_o_id = curr_o_id == max_id ? 0 : curr_o_id + 1;
+    const uint prev_c_id = _SurfaceHash[prev_o_id];
+    const uint next_c_id = _SurfaceHash[next_o_id];
+
+    if (curr_c_id != prev_c_id) _SurfaceRange[curr_c_id].x = curr_o_id;
+    if (curr_c_id != next_c_id) _SurfaceRange[curr_c_id].y = curr_o_id + 1;
+}
+
+// ===== initialization (C++ initFines) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void InitSurfacePoints(uint3 id : SV_DispatchThreadID)
+{
+    // One thread per coarse particle; appends sphere-sampled surface points via
+    // an atomic counter. Near-surface check uses "a 3x3x3 neighbor cell is
+    // empty" as a proxy for the C++ fluid-flags check (see header note).
+    const uint ncoarse = (uint)_NumParticles;
+    if (id.x >= ncoarse) return;
+
+    const float3 coarsePos = DecodePosition(_CoarseParticles[id.x].packedPosition);
+
+    // near surface: any empty neighbor cell in 3x3x3
+    int3 c = (int3)floor(coarsePos * _InvCellSize);
+    bool nearSurface = false;
+    for (int dz = -1; dz <= 1 && !nearSurface; ++dz)
+    for (int dy = -1; dy <= 1 && !nearSurface; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+        int3 nc = c + int3(dx, dy, dz);
+        if (any(nc < int3(0,0,0)) || any(nc >= _GridSize)) continue;
+        uint2 r = _CoarseRange[Coord2Idx((uint3)nc)];
+        if (r.x >= r.y) { nearSurface = true; break; }
+    }
+    if (!nearSurface)
+    {
+        InterlockedAdd(_SeedReject[0], 1);
+        return;
+    }
+
+    const uint discretization = (uint)(PI * (_OuterRadius + _InnerRadius) / _MeanFineDistance);
+    const float dtheta = 2.0 * _MeanFineDistance / (_OuterRadius + _InnerRadius);
+    const float outerRadius2 = _OuterRadius * _OuterRadius;
+
+    // conservative per-particle sample budget (sphere rings)
+    const uint maxRingSamples = (uint)(2.0 * PI / dtheta) + 1;
+    const uint halfH = discretization / 2;
+
+    for (uint i = 0; i <= halfH; ++i)
+    {
+        const float theta = i * dtheta;
+        const uint discretization2 = (uint)(floor(2.0 * PI * sin(theta) / dtheta)) + 1;
+        const uint nphi = min(discretization2, maxRingSamples);
+        for (uint p = 0; p < nphi; ++p)
+        {
+            const float phi = 2.0 * PI * (float)p / (float)nphi;
+            const float3 normal = float3(sin(theta) * cos(phi), cos(theta), sin(theta) * sin(phi));
+            const float3 position = coarsePos + _OuterRadius * normal;
+
+            // Skip candidates outside the constraint domain. The nearSurface test
+            // above cannot tell "empty because air" from "empty because wall", so a
+            // block resting flush against the container still reports its
+            // wall-facing sides as surface. Those points would all be retired by
+            // MarkDeletions on the first maintenance pass anyway; rejecting them
+            // here keeps them from inflating the seeded count, which is what used
+            // to make the point total peak at startup.
+            if (!IsInDomain(position))
+            {
+                InterlockedAdd(_SeedReject[1], 1);
+                continue;
+            }
+
+            // Inside the narrow band: the coarse set ends at Band1, so the
+            // nearSurface proxy also fires on the band's inner edge and would
+            // seed a spurious second surface inside the liquid.
+            if (IsDeepInterior(position))
+            {
+                InterlockedAdd(_SeedReject[4], 1);
+                continue;
+            }
+
+            // valid: no OTHER coarse particle within outerRadius of the candidate
+            bool valid = true;
+            LOOP_COARSE_NEIGHBORS_BEGIN(position, 2.0 * _OuterRadius)
+                if ((uint)idn != id.x && dot(npos - position, npos - position) < outerRadius2)
+                {
+                    valid = false;
+                    break;
+                }
+            LOOP_COARSE_NEIGHBORS_END
+            if (!valid)
+            {
+                InterlockedAdd(_SeedReject[2], 1);
+                continue;
+            }
+            InterlockedAdd(_SeedReject[3], 1);
+
+            uint slot;
+            InterlockedAdd(_SurfaceCounter[0], 1, slot);
+            if (slot >= (uint)_MaxSurfacePoints) break;
+            _SurfacePos[slot] = position;
+            _SurfaceNormal[slot] = float3(0, 0, 0);
+            _SurfaceWaveH[slot] = 0.0;
+            _SurfaceWaveDtH[slot] = 0.0;
+            _SurfaceWaveSeed[slot] = 0.0;
+            _SurfaceWaveSeedAmp[slot] = 0.0;
+            _SurfaceWaveSource[slot] = 0.0;
+            _SurfaceAlive[slot] = 1;
+            _SurfaceStatus[slot] = 1; // PNEW
+        }
+    }
+}
+
+// ===== advection (C++ advectSurfacePoints) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void AdvectSurfacePoints(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float3 avgDisplacement = float3(0, 0, 0);
+    float totalWeight = 0.0;
+    float3 p = _SurfacePos[idx];
+
+    LOOP_COARSE_PREV_NEIGHBORS_BEGIN(p, 2.0 * _OuterRadius)
+        float3 disp = curPos - prevPos;
+        float distance = length(prevPos - p);
+        float w = WeightAdvection(distance);
+        avgDisplacement += w * disp;
+        totalWeight += w;
+    LOOP_COARSE_PREV_NEIGHBORS_END
+
+    if (totalWeight != 0.0) avgDisplacement /= totalWeight;
+    _SurfacePos[idx] = p + avgDisplacement;
+}
+
+// ===== normals (C++ computeSurfaceNormals / smoothSurfaceNormals) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeSurfaceNormals(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float3 pos = _SurfacePos[idx];
+    float3 gradient = ConstraintGradient(pos);
+    float3 n = SafeNormalize(gradient);
+
+    float3 t1, t2;
+    GetTangentFrame(n, t1, t2);
+
+    float sw = 0, swx = 0, swy = 0, swxy = 0, swx2 = 0, swy2 = 0, swxz = 0, swyz = 0, swz = 0;
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
+        LOOP_GHOSTS_POS_BEGIN(npos, _NormalRadius)
+            float x = dot(gPos - pos, t1);
+            float y = dot(gPos - pos, t2);
+            float z = dot(gPos - pos, n);
+            float w = WeightSurfaceNormal(length(pos - gPos));
+            swx2 += w * x * x;
+            swy2 += w * y * y;
+            swxy += w * x * y;
+            swxz += w * x * z;
+            swyz += w * y * z;
+            swx  += w * x;
+            swy  += w * y;
+            swz  += w * z;
+            sw   += w;
+        LOOP_GHOSTS_END
+    LOOP_SURFACE_NEIGHBORS_END
+
+    float det = -sw * swxy * swxy + 2.0 * swx * swxy * swy - swx2 * swy * swy
+              - swx * swx * swy2 + sw * swx2 * swy2;
+    if (det == 0.0)
+    {
+        _SurfaceNormal[idx] = float3(0, 0, 0);
+        return;
+    }
+
+    float3 abc = (1.0 / det) * float3(
+        swxz * (-swy * swy + sw * swy2) + swyz * (-sw * swxy + swx * swy) + swz * (swxy * swy - swx * swy2),
+        swxz * (-sw * swxy + swx * swy) + swyz * (-swx * swx + sw * swx2) + swz * (swx * swxy - swx2 * swy),
+        swxz * (swxy * swy - swx * swy2) + swyz * (swx * swxy - swx2 * swy) + swz * (-swxy * swxy + swx2 * swy2));
+
+    float3 normal = -SafeNormalize(t1 * abc.x + t2 * abc.y - n);
+    if (dot(gradient, normal) < 0.0) normal = -normal;
+    _SurfaceNormal[idx] = normal;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeAveragedNormals(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    float3 pos = _SurfacePos[idx];
+    float3 newNormal = float3(0, 0, 0);
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
+        float w = WeightSurfaceNormal(length(pos - npos));
+        newNormal += w * _SurfaceNormal[idn];
+    LOOP_SURFACE_NEIGHBORS_END
+    _TempVec3[idx] = SafeNormalize(newNormal);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void AssignNormals(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    _SurfaceNormal[idx] = _TempVec3[idx];
+}
+
+// ===== regularization (C++ regularizeSurfacePoints) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeSurfaceDensities(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    float3 pos = _SurfacePos[idx];
+    float density = 0.0;
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
+        LOOP_GHOSTS_POS_BEGIN(npos, _NormalRadius)
+            density += WeightSurfaceNormal(length(pos - gPos));
+        LOOP_GHOSTS_END
+    LOOP_SURFACE_NEIGHBORS_END
+    _TempFloat[idx] = density;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeSurfaceDisplacements(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float3 pos = _SurfacePos[idx];
+    float3 normal = _SurfaceNormal[idx];
+
+    float3 displacementNormal = float3(0, 0, 0);
+    float3 displacementTangent = float3(0, 0, 0);
+    float wTotal = 0.0;
+
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
+        LOOP_GHOSTS_POS_NORMAL_BEGIN(npos, _SurfaceNormal[idn], _NormalRadius)
+            float3 dir = pos - gPos;
+            float lengthDir = length(dir);
+            float3 dn = dot(dir, normal) * normal;
+            float3 dt = dir - dn;
+            if (_TempFloat[idn] == 0.0) continue;
+            float w = WeightSurfaceNormal(lengthDir) / _TempFloat[idn];
+
+            float3 crossVec = SafeNormalize(cross(normal, -dir));
+            float3 projectedNormal = SafeNormalize(gNormal - dot(crossVec, gNormal) * crossVec);
+            if (dot(projectedNormal, normal) < 0.0 || abs(dot(normal, normal + projectedNormal)) < 1e-6) continue;
+            dn = -dot(normal + projectedNormal, dir) / dot(normal, normal + projectedNormal) * normal;
+
+            displacementNormal += w * dn;
+            displacementTangent += w * SafeNormalize(dt);
+            wTotal += w;
+        LOOP_GHOSTS_END
+    LOOP_SURFACE_NEIGHBORS_END
+
+    if (wTotal != 0.0)
+    {
+        displacementNormal /= wTotal;
+        displacementTangent /= wTotal;
+    }
+    displacementNormal *= 0.75;
+    displacementTangent *= 0.25 * _MeanFineDistance;
+    _TempVec3[idx] = displacementNormal + displacementTangent;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ApplySurfaceDisplacements(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    _SurfacePos[idx] += _TempVec3[idx];
+}
+
+// ===== constraint (C++ constrainSurface) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ConstrainSurface(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    float3 pos = _SurfacePos[idx];
+    // One Gaussian-sum sweep yields both the branch test and the projection
+    // direction; this used to sweep the coarse neighborhood twice (level,
+    // then gradient).
+    float level;
+    float3 gradient;
+    ConstraintLevelGradient(pos, level, gradient);
+    if (level > 1.0)
+        _SurfacePos[idx] = pos - (_OuterRadius - _InnerRadius) * (level - 1.0) * gradient;
+    else if (level < 0.0)
+        _SurfacePos[idx] = pos - (_OuterRadius - _InnerRadius) * level * gradient;
+}
+
+// ===== new-point wave data (C++ interpolateNewWaveData) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void InterpolateNewWaveData(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    if ((_SurfaceStatus[idx] & 1u) == 0) return; // not PNEW
+
+    float3 pos = _SurfacePos[idx];
+    _SurfaceWaveH[idx] = 0.0;
+    _SurfaceWaveDtH[idx] = 0.0;
+    _SurfaceWaveSeed[idx] = 0.0;
+    _SurfaceWaveSeedAmp[idx] = 0.0;
+    float wTotal = 0.0;
+
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius)
+        if ((_SurfaceStatus[idn] & 1u) == 0)
+        {
+            float w = WeightSurfaceTangent(length(pos - npos));
+            _SurfaceWaveH[idx] += w * _SurfaceWaveH[idn];
+            _SurfaceWaveDtH[idx] += w * _SurfaceWaveDtH[idn];
+            _SurfaceWaveSeed[idx] += w * _SurfaceWaveSeed[idn];
+            _SurfaceWaveSeedAmp[idx] += w * _SurfaceWaveSeedAmp[idn];
+            wTotal += w;
+        }
+    LOOP_SURFACE_NEIGHBORS_END
+
+    if (wTotal != 0.0)
+    {
+        _SurfaceWaveH[idx] /= wTotal;
+        _SurfaceWaveDtH[idx] /= wTotal;
+        _SurfaceWaveSeed[idx] /= wTotal;
+        _SurfaceWaveSeedAmp[idx] /= wTotal;
+    }
+}
+
+// ===== addition / deletion (C++ addDeleteSurfacePoints, parallel subset) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeAdditions(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    _HasCandidate[idx] = 0;
+
+    float3 pos = _SurfacePos[idx];
+    float3 gradient = ConstraintGradient(pos);
+
+    float3 tangentDisplacement = float3(0, 0, 0);
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius)
+        if (idn != idx)
+        {
+            float3 dir = pos - npos;
+            float lengthDir = length(dir);
+            if (lengthDir > 1e-8)
+            {
+                dir /= lengthDir;
+                float3 dn = dot(dir, gradient) * gradient;
+                float3 dt = dir - dn;
+                float w = WeightSurfaceTangent(lengthDir);
+                tangentDisplacement += w * dt;
+            }
+        }
+    LOOP_SURFACE_NEIGHBORS_END
+
+    if (length(tangentDisplacement) != 0.0) tangentDisplacement = SafeNormalize(tangentDisplacement);
+    float3 creationPos = pos + _MeanFineDistance * tangentDisplacement;
+
+    // candidate if in-domain, outside the band interior, and no existing surface
+    // point within meanFineDistance
+    if (IsInDomain(creationPos) && !IsDeepInterior(creationPos))
+    {
+        bool has = false;
+        LOOP_SURFACE_NEIGHBORS_BEGIN(creationPos, _MeanFineDistance - 1e-6)
+            if (length(npos - creationPos) <= _MeanFineDistance - 1e-6) { has = true; break; }
+        LOOP_SURFACE_NEIGHBORS_END
+        if (!has)
+        {
+            _CandidatePos[idx] = creationPos;
+            _HasCandidate[idx] = 1;
+        }
+    }
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void MarkDeletions(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    float3 pos = _SurfacePos[idx];
+
+    // out of domain (C++ density-delete clause) or no coarse neighbors in
+    // advection radius or too far from the constraint level-set.
+    bool kill = !IsInDomain(pos);
+    // Retire points that drifted into the grid-only interior. Not in the C++
+    // reference, which has no narrow band: there the coarse particles fill the
+    // whole volume, so an interior surface can never form.
+    if (!kill) kill = IsDeepInterior(pos);
+    // The C++ hasNeighbor(2*outerRadius) clause is dropped: it swept 729 cells
+    // to conclude what the level test below already does. No neighbor inside
+    // the query radius -> lvl == 0 -> level == +inf -> killed either way; and
+    // a point whose only neighbors sit just past the truncated query radius
+    // contributes < ~1.5% each to lvl, which still lands level > 1.2.
+    if (!kill)
+    {
+        float level = ConstraintLevel(pos);
+        // NOTE: the 2D port dropped `level < -0.2` due to lvl>1 saturation in 2D;
+        // this 3D port follows the C++ reference verbatim.
+        kill = (level < -0.2 || level > 1.2);
+    }
+    if (kill) _SurfaceAlive[idx] = 0;
+}
+
+// Over-density thinning (C++ addDeleteSurfacePoints, the
+// hasNeighborOtherThanItself clause at surfaceturbulence.cpp:614).
+//
+// The C++ evaluates this in index order and kill() is visible to later
+// iterations, so a chain of close points cascades down to just its highest-index
+// member. That is exactly equivalent to the stateless test below:
+//
+//     kill i  <=>  some neighbor j > i within r is alive on entry
+//
+// A lower-index neighbor can never survive to kill i: if j < i survived then j
+// saw no higher-index live neighbor at its turn, yet i > j was alive and in
+// range. Contradiction. So only the j > i clause can ever fire.
+//
+// Runs BEFORE MarkDeletions on purpose: the C++ ORs the density and domain
+// criteria inside one loop, so a point that is itself doomed by the domain test
+// is still alive when it kills its lower-index neighbor. Applying domain kills
+// first would let those neighbors survive.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void MarkDeletionsDensity(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount) return;
+    _SurfaceKill[idx] = 0;
+    if (_SurfaceAlive[idx] == 0) return;
+
+    const float r = 0.67 * _MeanFineDistance;
+    float3 pos = _SurfacePos[idx];
+
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, r)
+        if ((uint)idn > idx && length(npos - pos) <= r)
+        {
+            _SurfaceKill[idx] = 1;
+            break;
+        }
+    LOOP_SURFACE_NEIGHBORS_END
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ApplyDensityKills(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount) return;
+    if (_SurfaceKill[idx] != 0) _SurfaceAlive[idx] = 0;
+}
+
+// Snapshot of the coarse particles taken between the solver's G2P and Advection
+// dispatches, giving AdvectSurfacePoints its (curPos - prevPos) per neighbor.
+//
+// A compute copy rather than CommandBuffer.CopyBuffer: GPUUtil allocates with
+// GraphicsBuffer.Target.Structured only, and CopyBuffer requires the source to
+// carry Target.CopySource, so that path throws.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void SnapshotCoarse(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_NumParticles) return;
+    _CoarsePrevOut[id.x] = _CoarseParticles[id.x];
+}
+
+// ===== compaction (C++ doCompress + insertBufferedParticles) =====
+//
+// Replaces the deferred repack. Five steps, all count-independent so the whole
+// thing stays on the GPU:
+//
+//   1. StageAliveForScan / StageCandidatesForScan  - copy the flag arrays into
+//      _ScanBuf, zeroing past the live count so the scan total is exact.
+//   2. (external) PrefixScan.compute DecoupledLookbackScan over _ScanBuf, which
+//      turns it into exclusive destination slots and writes the total.
+//   3. GatherSurvivors  - permute the 8 persistent fields by that map into the
+//      ping-pong set. Gather (read src[map]) rather than scatter, because the
+//      append step writes past the survivors and would race an in-place scatter.
+//   4. AppendCandidates - write new points at survivors + candDst[i], flagged
+//      PNEW so InterpolateNewWaveData picks them up.
+//   5. WriteSurfaceDispatchArgs - derive the indirect args from the new count.
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void StageAliveForScan(uint3 id : SV_DispatchThreadID)
+{
+    const uint cap = (uint)_MaxSurfacePoints;
+    if (id.x >= cap) return;
+    // Rewrites the whole padded range every frame: the previous scan left prefix
+    // sums here, and a nonzero tail would corrupt the new total.
+    _ScanBuf[id.x] = (id.x < (uint)_SurfaceCount && _SurfaceAlive[id.x] != 0) ? 1u : 0u;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void StageCandidatesForScan(uint3 id : SV_DispatchThreadID)
+{
+    const uint cap = (uint)_MaxSurfacePoints;
+    if (id.x >= cap) return;
+    _ScanBuf[id.x] = (id.x < (uint)_SurfaceCount && _HasCandidate[id.x] != 0) ? 1u : 0u;
+}
+
+// _ScanBuf holds exclusive destinations, _ScanTotal[0] the survivor count.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void GatherSurvivors(uint3 id : SV_DispatchThreadID)
+{
+    const uint idx = id.x;
+    if (idx >= (uint)_SurfaceCount) return;
+    if (_SurfaceAlive[idx] == 0) return;
+
+    const uint dst = _ScanBuf[idx];
+    if (dst >= (uint)_MaxSurfacePoints) return;
+
+    _SurfacePosOut[dst]          = _SurfacePos[idx];
+    _SurfaceNormalOut[dst]       = _SurfaceNormal[idx];
+    _SurfaceWaveHOut[dst]        = _SurfaceWaveH[idx];
+    _SurfaceWaveDtHOut[dst]      = _SurfaceWaveDtH[idx];
+    _SurfaceWaveSeedOut[dst]     = _SurfaceWaveSeed[idx];
+    _SurfaceWaveSeedAmpOut[dst]  = _SurfaceWaveSeedAmp[idx];
+    _SurfaceWaveSourceOut[dst]   = _SurfaceWaveSource[idx];
+    _SurfaceStatusOut[dst]       = _SurfaceStatus[idx];
+}
+
+// Runs after the survivor gather has been swapped in, so the *Out buffers here
+// are the live set and _SurvivorCount[0] is where the appends start.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void AppendCandidates(uint3 id : SV_DispatchThreadID)
+{
+    const uint idx = id.x;
+    if (idx >= (uint)_SurfaceCount) return;
+    if (_HasCandidate[idx] == 0) return;
+
+    const uint dst = _SurvivorCount[0] + _ScanBuf[idx];
+    if (dst >= (uint)_MaxSurfacePoints)
+    {
+        // Capacity reached: the point is dropped. Counted so the host can report
+        // sustained saturation, which is otherwise invisible — compaction frees
+        // slots each frame, so the buffer can sit full without any single frame
+        // looking wrong.
+        InterlockedAdd(_SurfaceOverflow[0], 1);
+        return;
+    }
+
+    _SurfacePosOut[dst]         = _CandidatePos[idx];
+    _SurfaceNormalOut[dst]      = float3(0, 0, 0);
+    _SurfaceWaveHOut[dst]       = 0.0;
+    _SurfaceWaveDtHOut[dst]     = 0.0;
+    _SurfaceWaveSeedOut[dst]    = 0.0;
+    _SurfaceWaveSeedAmpOut[dst] = 0.0;
+    _SurfaceWaveSourceOut[dst]  = 0.0;
+    _SurfaceStatusOut[dst]      = 1; // PNEW
+}
+
+// Final count = survivors + appended candidates, clamped to capacity. One thread.
+[numthreads(1, 1, 1)]
+void FinalizeSurfaceCount(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0) return;
+    uint total = _SurvivorCount[0] + _ScanTotal[0];
+    _SurfaceCountBuf[0] = min(total, (uint)_MaxSurfacePoints);
+}
+
+// All points are alive immediately after a repack.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ResetAliveAfterCompaction(uint3 id : SV_DispatchThreadID)
+{
+    const uint cap = (uint)_MaxSurfacePoints;
+    if (id.x >= cap) return;
+    _SurfaceAlive[id.x] = id.x < (uint)_SurfaceCount ? 1u : 0u;
+    _SurfaceKill[id.x] = 0;
+    _HasCandidate[id.x] = 0;
+}
+
+// PNEW must not persist: InterpolateNewWaveData would keep blanking the wave
+// fields of points that are no longer new. Cleared at the end of the frame.
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ClearSurfaceStatus(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_MaxSurfacePoints) return;
+    _SurfaceStatus[id.x] = 0;
+}
+
+// Indirect args for the per-point kernels: ceil(count / GROUP_THREADS_X) groups.
+// Also fills the DrawProceduralIndirect args (vertexCount, instanceCount, ...).
+[numthreads(1, 1, 1)]
+void WriteSurfaceDispatchArgs(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x != 0) return;
+    uint n = _SurfaceCountBuf[0];
+    _SurfaceDispatchArgs[0] = (n + GROUP_THREADS_X - 1) / GROUP_THREADS_X;
+    _SurfaceDispatchArgs[1] = 1;
+    _SurfaceDispatchArgs[2] = 1;
+
+    _SurfaceDrawArgs[0] = n; // vertexCount
+    _SurfaceDrawArgs[1] = 1; // instanceCount
+    _SurfaceDrawArgs[2] = 0;
+    _SurfaceDrawArgs[3] = 0;
+    _SurfaceDrawArgs[4] = 0;
+}
+
+// ===== wave seeding / evolution (C++ surfaceWaves) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void AddSeed(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+    _SurfaceWaveH[idx] += _SurfaceWaveSeed[idx];
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeSurfaceWaveNormal(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float3 pos = _SurfacePos[idx];
+    float3 n = SafeNormalize(_SurfaceNormal[idx]);
+    float3 t1, t2;
+    GetTangentFrame(n, t1, t2);
+
+    float sw = 0, swx = 0, swy = 0, swxy = 0, swx2 = 0, swy2 = 0, swxz = 0, swyz = 0, swz = 0;
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius)
+        LOOP_GHOSTS_POS_BEGIN(npos, _TangentRadius)
+            float x = dot(gPos - pos, t1);
+            float y = dot(gPos - pos, t2);
+            float z = _SurfaceWaveH[idn];
+            float w = WeightSurfaceTangent(length(pos - gPos));
+            swx2 += w * x * x;
+            swy2 += w * y * y;
+            swxy += w * x * y;
+            swxz += w * x * z;
+            swyz += w * y * z;
+            swx  += w * x;
+            swy  += w * y;
+            swz  += w * z;
+            sw   += w;
+        LOOP_GHOSTS_END
+    LOOP_SURFACE_NEIGHBORS_END
+
+    float det = -sw * swxy * swxy + 2.0 * swx * swxy * swy - swx2 * swy * swy
+              - swx * swx * swy2 + sw * swx2 * swy2;
+    if (det == 0.0)
+    {
+        _TempVec3[idx] = float3(0, 0, 0);
+        return;
+    }
+
+    float3 abc = (1.0 / det) * float3(
+        swxz * (-swy * swy + sw * swy2) + swyz * (-sw * swxy + swx * swy) + swz * (swxy * swy - swx * swy2),
+        swxz * (-sw * swxy + swx * swy) + swyz * (-swx * swx + sw * swx2) + swz * (swx * swxy - swx2 * swy),
+        swxz * (swxy * swy - swx * swy2) + swyz * (swx * swxy - swx2 * swy) + swz * (-swxy * swxy + swx2 * swy2));
+
+    // C++ reconstructs the wave normal in the world basis (vx, vy, z-up), not t1/t2.
+    float3 vx = float3(1, 0, 0);
+    float3 vy = float3(0, 1, 0);
+    _TempVec3[idx] = -SafeNormalize(vx * abc.x + vy * abc.y - float3(0, 0, 1));
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeSurfaceWaveLaplacians(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float laplacian = 0.0;
+    float wTotal = 0.0;
+    float3 pPos = _SurfacePos[idx];
+    float3 pNormal = _SurfaceNormal[idx];
+
+    float3 t1, t2;
+    GetTangentFrame(pNormal, t1, t2);
+
+    float3 pWaveNormal = _TempVec3[idx];
+    float ph = _SurfaceWaveH[idx];
+
+    if (pWaveNormal.z == 0.0)
+    {
+        _TempFloat[idx] = 0.0;
+        return;
+    }
+
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _TangentRadius)
+        float nh = _SurfaceWaveH[idn];
+        LOOP_GHOSTS_POS_BEGIN(npos, _TangentRadius)
+            float3 dir = gPos - pPos;
+            float lengthDir = length(dir);
+            if (lengthDir < 1e-5) continue;
+            float3 tangentDir = lengthDir * SafeNormalize(dir - dot(dir, pNormal) * pNormal);
+            float dirX = dot(tangentDir, t1);
+            float dirY = dot(tangentDir, t2);
+            float dz = nh - ph - (-pWaveNormal.x / pWaveNormal.z) * dirX - (-pWaveNormal.y / pWaveNormal.z) * dirY;
+            float w = WeightSurfaceTangent(length(pPos - gPos));
+            wTotal += w;
+            laplacian += clamp(w * 4.0 * dz / (lengthDir * lengthDir), -100.0, 100.0);
+        LOOP_GHOSTS_END
+    LOOP_SURFACE_NEIGHBORS_END
+
+    _TempFloat[idx] = wTotal != 0.0 ? laplacian / wTotal : 0.0;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void EvolveWave(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    _SurfaceWaveDtH[idx] += _WaveSpeed * _WaveSpeed * _DeltaTime * _TempFloat[idx];
+    _SurfaceWaveDtH[idx] /= (1.0 + _DeltaTime * _WaveDamping);
+    _SurfaceWaveH[idx] += _DeltaTime * _SurfaceWaveDtH[idx];
+    _SurfaceWaveH[idx] /= (1.0 + _DeltaTime * _WaveDamping);
+    _SurfaceWaveH[idx] -= _SurfaceWaveSeed[idx];
+
+    _SurfaceWaveDtH[idx] = clamp(_SurfaceWaveDtH[idx], -_WaveMaxFrequency * _WaveMaxAmplitude, _WaveMaxFrequency * _WaveMaxAmplitude);
+    _SurfaceWaveH[idx] = clamp(_SurfaceWaveH[idx], -_WaveMaxAmplitude, _WaveMaxAmplitude);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ComputeSurfaceCurvature(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float3 pPos = _SurfacePos[idx];
+    float wTotal = 0.0;
+    float curv = 0.0;
+    float3 pNormal = _SurfaceNormal[idx];
+
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _NormalRadius)
+        LOOP_GHOSTS_POS_NORMAL_BEGIN(npos, _SurfaceNormal[idn], _NormalRadius)
+            float3 dir = pPos - gPos;
+            if (dot(pNormal, gNormal) < 0.0) continue; // backfacing
+            float dist = length(dir);
+            if (dist < _NormalRadius / 100.0) continue;
+
+            float distn = dot(dir, pNormal);
+            float w = WeightSurfaceNormal(dist);
+            curv += w * distn;
+            wTotal += w;
+        LOOP_GHOSTS_END
+    LOOP_SURFACE_NEIGHBORS_END
+
+    if (wTotal != 0.0) curv /= wTotal;
+    _TempFloat[idx] = abs(curv);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void SmoothCurvature(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float3 pPos = _SurfacePos[idx];
+    float curv = 0.0;
+    float wTotal = 0.0;
+
+    LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _NormalRadius)
+        float w = WeightSurfaceNormal(length(pPos - npos));
+        curv += w * _TempFloat[idn];
+        wTotal += w;
+    LOOP_SURFACE_NEIGHBORS_END
+
+    _SurfaceWaveSource[idx] = wTotal != 0.0 ? curv / wTotal : 0.0;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void SeedWaves(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
+
+    float source = Smoothstep(_SeedThresholdCenter - _SeedThresholdRadius,
+                              _SeedThresholdCenter + _SeedThresholdRadius,
+                              _SurfaceWaveSource[idx]) * 2.0 - 1.0;
+    float theta = _DeltaTime * _FrameCount * _WaveSpeed * _WaveSeedFrequency;
+    float costheta = cos(theta);
+    float maxSeedAmplitude = _WaveMaxSeedingAmplitude * _WaveMaxAmplitude;
+
+    _SurfaceWaveSeedAmp[idx] = clamp(_SurfaceWaveSeedAmp[idx] + source * _SeedStepSizeRatio * maxSeedAmplitude, 0.0, maxSeedAmplitude);
+    _SurfaceWaveSeed[idx] = _SurfaceWaveSeedAmp[idx] * costheta;
+
+    // source values for display only
+    _SurfaceWaveSource[idx] = source >= 0.0 ? 1.0 : 0.0;
+}
+
+// ===== display (C++ surfacePointsDisplaced) =====
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void DisplaceForRender(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= _SurfaceCount) return;
+
+    // Retired points keep their slot until compaction lands, so park them at NaN
+    // to drop them from rasterization instead of freezing them at their last
+    // position. Once compaction repacks survivors this check becomes dead code
+    // (every slot below _SurfaceCount will be alive) and can go away.
+    if (_SurfaceAlive[idx] == 0)
+    {
+        _SurfaceRender[idx] = float4(0.0 / 0.0, 0.0 / 0.0, 0.0 / 0.0, 0.0);
+        return;
+    }
+
+    float3 pos = _SurfacePos[idx];
+    float3 normal = _SurfaceNormal[idx];
+    float h = _SurfaceWaveH[idx];
+    _SurfaceRender[idx] = float4(pos + normal * h, h);
+}

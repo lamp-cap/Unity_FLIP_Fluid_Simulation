@@ -168,87 +168,97 @@ void Prolongate (uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)
     }
 }
 
-groupshared float g_x[16][8][8];
-groupshared float g_b[16][8][8];
-groupshared float4 g_a[16][8][8];
+// Coarsest-level smoother. One group covers the ENTIRE coarsest grid, so the
+// LDS extents below must equal that grid exactly and there is no halo — a
+// missing neighbour is a domain boundary, not another block.
+//
+// This couples to the C# side: GridSize (256,128,128) >> (MGLevel-1 == 4)
+// gives (16,8,8), and MGPCG() dispatches this kernel with (1,1,1) groups.
+// Changing GridSize or MGLevel requires updating SS_DIM_* to match.
+#define SS_DIM_X 16
+#define SS_DIM_Y 8
+#define SS_DIM_Z 8
 
-[numthreads(16,8,8)]
+groupshared float  g_x[SS_DIM_X][SS_DIM_Y][SS_DIM_Z];
+groupshared float4 g_a[SS_DIM_X][SS_DIM_Y][SS_DIM_Z];
+
+// Clamped LDS read. A clamped index is only ever consumed when the matching
+// coefficient is zero (domain boundary), so clamping cannot change a result —
+// it just keeps the access in bounds. Note id is uint: id.x-1 at x==0 wraps to
+// 0xFFFFFFFF without this.
+inline float ReadSharedX(int3 c)
+{
+    c = clamp(c, int3(0, 0, 0), int3(SS_DIM_X - 1, SS_DIM_Y - 1, SS_DIM_Z - 1));
+    return g_x[c.x][c.y][c.z];
+}
+
+// Relax the cells of one colour. Threads of the other colour fall through; the
+// caller issues the barrier, so control flow stays group-uniform there.
+void SymmetricSmoothSweep(uint3 id, float4 a0, float4 a1, float b, uint colour)
+{
+    if (((id.x ^ id.y ^ id.z) & 1) != colour || !IsActive(a0.x))
+        return;
+
+    const int3 c = (int3)id;
+    float sum = 0;
+    sum += IsActive(a0.y) ? a0.y * ReadSharedX(c - int3(1, 0, 0)) : 0;
+    sum += IsActive(a0.z) ? a0.z * ReadSharedX(c - int3(0, 1, 0)) : 0;
+    sum += IsActive(a0.w) ? a0.w * ReadSharedX(c - int3(0, 0, 1)) : 0;
+    sum += IsActive(a1.y) ? a1.y * ReadSharedX(c + int3(1, 0, 0)) : 0;
+    sum += IsActive(a1.z) ? a1.z * ReadSharedX(c + int3(0, 1, 0)) : 0;
+    sum += IsActive(a1.w) ? a1.w * ReadSharedX(c + int3(0, 0, 1)) : 0;
+
+    g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
+}
+
+[numthreads(SS_DIM_X, SS_DIM_Y, SS_DIM_Z)]
 void SymmetricSmooth (uint3 id : SV_DispatchThreadID)
 {
-    // load Bock Data
+    // load block data
     g_x[id.x][id.y][id.z] = _x[id];
     g_a[id.x][id.y][id.z] = _coefficients[id];
     GroupMemoryBarrierWithGroupSync();
-    
-    float b = _b[id];
-    
-    float4 a0 = g_a[id.x][id.y][id.z];
-    float4 a1 = float4(0,   id.x < 16 ? g_a[id.x+1][id.y][id.z].y : 0,
-                            id.y < 16 ? g_a[id.x][id.y+1][id.z].z : 0,
-                            id.z < 16 ? g_a[id.x][id.y][id.z+1].w : 0);
 
+    float b = _b[id];
+
+    // a0.yzw = coefficients toward -x/-y/-z (stored on this cell).
+    // a1.yzw = coefficients toward +x/+y/+z, which the compact symmetric layout
+    // stores on the *neighbour*, hence the offset reads. Bounds are DIM-1: the
+    // previous `id.x < 16 / id.y < 16 / id.z < 16` tests were all trivially
+    // true (id.y and id.z only reach 7), so every +face read landed outside
+    // g_a and returned unrelated LDS data.
+    float4 a0 = g_a[id.x][id.y][id.z];
+    float4 a1 = float4(0,
+        id.x < SS_DIM_X - 1 ? g_a[id.x + 1][id.y][id.z].y : 0,
+        id.y < SS_DIM_Y - 1 ? g_a[id.x][id.y + 1][id.z].z : 0,
+        id.z < SS_DIM_Z - 1 ? g_a[id.x][id.y][id.z + 1].w : 0);
+
+    // Palindromic sweep order (R,B,B,R) keeps the smoother symmetric, which CG
+    // requires of its preconditioner.
     for (int i = 0; i < 4; ++i)
     {
-        if (((id.x ^ id.y ^ id.z) & 1) == 0 && IsActive(a0.x))
-        {
-            float sum = 0;
-            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
-            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
-            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
-            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
-            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
-            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
-            
-            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
-        }
-        
+        SymmetricSmoothSweep(id, a0, a1, b, 0);
         GroupMemoryBarrierWithGroupSync();
-        
-        if (((id.x ^ id.y ^ id.z) & 1) == 1 && IsActive(a0.x))
-        {
-            float sum = 0;
-            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
-            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
-            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
-            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
-            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
-            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
-            
-            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
-        }
+
+        SymmetricSmoothSweep(id, a0, a1, b, 1);
         GroupMemoryBarrierWithGroupSync();
-        if (((id.x ^ id.y ^ id.z) & 1) == 1 && IsActive(a0.x))
-        {
-            float sum = 0;
-            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
-            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
-            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
-            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
-            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
-            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
-            
-            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
-        }
-        
+
+        SymmetricSmoothSweep(id, a0, a1, b, 1);
         GroupMemoryBarrierWithGroupSync();
-        
-        if (((id.x ^ id.y ^ id.z) & 1) == 0 && IsActive(a0.x))
-        {
-            float sum = 0;
-            sum += IsActive(a0.y) ? a0.y * g_x[id.x-1][id.y][id.z]: 0;
-            sum += IsActive(a0.z) ? a0.z * g_x[id.x][id.y-1][id.z]: 0;
-            sum += IsActive(a0.w) ? a0.w * g_x[id.x][id.y][id.z-1]: 0;
-            sum += IsActive(a1.y) ? a1.y * g_x[id.x+1][id.y][id.z]: 0;
-            sum += IsActive(a1.z) ? a1.z * g_x[id.x][id.y+1][id.z]: 0;
-            sum += IsActive(a1.w) ? a1.w * g_x[id.x][id.y][id.z+1]: 0;
-            
-            g_x[id.x][id.y][id.z] = (_h2 * b - sum) / a0.x;
-        }
+
+        SymmetricSmoothSweep(id, a0, a1, b, 0);
         GroupMemoryBarrierWithGroupSync();
     }
     _x[id] = g_x[id.x][id.y][id.z];
-    
-    if (id.x < 2) _counterW[id.x] = 0;
+
+    // Reset the two dot-product accumulators for the CG steps that follow.
+    // Guarding on id.x alone let all 64 threads sharing an id.x write the same
+    // slot; scope it to one thread of the group.
+    if (all(id == uint3(0, 0, 0)))
+    {
+        _counterW[0] = 0;
+        _counterW[1] = 0;
+    }
 }
 
 Texture3D<float> _lhs;

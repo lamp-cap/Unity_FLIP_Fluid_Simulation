@@ -1,0 +1,305 @@
+#pragma use_dxc
+#pragma target 6.0
+
+// =============================================================================
+// Band waves — damped wave equation on the narrow band of the SDF.
+//
+// The cheap cousin of the surface-turbulence point cloud (Mercier et al. 2015):
+// same PDE (h_tt = c^2 * surfaceLaplacian(h) - damping + source), but the
+// carrier is the solver's own SDF band instead of ~1M surface points. Two
+// full-grid dispatches per frame, fixed-index texture reads only — the point
+// system pays billions of scattered neighbour visits for the same equation.
+//
+// Discretization: closest-point-method flavored (Ruuth & Merriman 2008).
+//   BandWaveStep    — staggered first-order wave step on a 6-neighbour stencil,
+//                     masked to SDF in [-_BandWaveAirBand, _BandWaveBandMax]:
+//                     the fluid side of the surface PLUS a slab of air, because
+//                     the MC density iso sits ~1 cell into the air (density
+//                     bleeds past the outer particles) — h must extend there
+//                     or the mesh never samples anything. (Air is negative,
+//                     16 = deep interior sentinel.)
+//   BandWaveProject — h := h(closest point on the surface) via one Newton step
+//                     on the distance field (p' = p - d * grad(d)). With h
+//                     constant along the normal, the Cartesian Laplacian equals
+//                     the SURFACE Laplacian, so waves propagate tangentially
+//                     instead of bouncing across the band tube.
+//
+// The SDF is an integer Manhattan-distance field, so grad(d) is axis-quantized
+// and the projection is crude — it collapses the tube's normal direction well
+// enough for ripples, it is not a smooth CPM extension.
+//
+// Source, v1: the moving surface itself forces the surface layer (d <= 1):
+// dtH += dt * gain * vy. A surface that moves radiates ripples; still water
+// stays still. The point system's curvature seeding does not translate: the
+// SDF is integer-valued, so a Laplacian-of-SDF curvature estimate is aliased
+// noise. Revisit with a density-field curvature if velocity forcing feels
+// wrong.
+// =============================================================================
+
+#include "../GPU_FLIP/FlipUtils.hlsl"
+
+#pragma kernel ResetBandWaves
+#pragma kernel BandWaveStep
+#pragma kernel BandWaveProject
+#pragma kernel BandWaveStats
+#pragma kernel BandWaveDisplaceMesh
+
+// ===== solver inputs =====
+// 0 = surface cell, >0 inward (fluid), <0 air side, 16 = no seed within JFA range
+Texture3D<float>  _GridSDFR;
+Texture3D<float4> _VelocityR; // xyz = velocity; .y drives the source
+
+// double-buffered wave state: C# binds Read as SRV, Write as UAV
+Texture3D<float>   _WaveHR;
+RWTexture3D<float> _WaveHW;
+Texture3D<float>   _WaveDtHR;
+RWTexture3D<float> _WaveDtHW;
+
+// ===== params =====
+// Prefactor of the Laplacian: speed^2 * dt / cellSize^2. C# clamps speed to
+// the CFL limit before passing, so the kernel never has to guard stability.
+float _BandWaveCoeff;
+float _BandWaveDamping;
+float _BandWaveMaxAmp;
+float _BandWaveBandMax;     // SDF level up to which cells simulate (cells)
+float _BandWaveAirBand;     // air-side slab of the band (cells, positive)
+float _BandWaveSourceGain;
+
+// ===== diagnostics (polled at ~1 Hz off the hot path, gated by pollDiagnostics) =====
+// [0] asuint(max|h|)  [1] sum|h| fixed-point x256  [2] band cell count  [3] active (|h|>1e-3) count
+RWStructuredBuffer<uint> _BandWaveStats;
+
+[numthreads(8, 8, 8)]
+void ResetBandWaves(uint3 id : SV_DispatchThreadID)
+{
+    _WaveHW[id] = 0;
+    _WaveDtHW[id] = 0;
+}
+
+[numthreads(8, 8, 8)]
+void BandWaveStep(uint3 id : SV_DispatchThreadID)
+{
+    float d = _GridSDFR[id];
+    if (d < -_BandWaveAirBand || d > _BandWaveBandMax)
+    {
+        // Keep both slots clean outside the (moving) band so stale values
+        // never leak back in when the surface migrates over a cell.
+        _WaveHW[id] = 0;
+        _WaveDtHW[id] = 0;
+        return;
+    }
+
+    float h = _WaveHR[id];
+
+    // 6-neighbour Laplacian in cell units. Neighbours outside the band hold 0
+    // (both branches of this kernel keep them zeroed), which is a reflective
+    // band edge; after the Project pass the normal-direction part of the
+    // stencil is ~zero, so what remains is tangential propagation.
+    float lap = -6.0 * h;
+    lap += _WaveHR[uint3(max(id.x, 1u) - 1u, id.y, id.z)];
+    lap += _WaveHR[uint3(min(id.x + 1u, _GridSize.x - 1u), id.y, id.z)];
+    lap += _WaveHR[uint3(id.x, max(id.y, 1u) - 1u, id.z)];
+    lap += _WaveHR[uint3(id.x, min(id.y + 1u, _GridSize.y - 1u), id.z)];
+    lap += _WaveHR[uint3(id.x, id.y, max(id.z, 1u) - 1u)];
+    lap += _WaveHR[uint3(id.x, id.y, min(id.z + 1u, _GridSize.z - 1u))];
+
+    float dtH = _WaveDtHR[id];
+
+    // moving surface radiates ripples; only the FLUID surface layer (SDF 0..1)
+    // forces — air-side carriers must not force too or the band forces twice
+    if (d >= 0.0 && d <= 1.0)
+        dtH += _DeltaTime * _BandWaveSourceGain * _VelocityR[id].y;
+
+    dtH = (dtH + _BandWaveCoeff * lap) / (1.0 + _DeltaTime * _BandWaveDamping);
+
+    float hNew = (h + _DeltaTime * dtH) / (1.0 + _DeltaTime * _BandWaveDamping);
+    hNew = clamp(hNew, -_BandWaveMaxAmp, _BandWaveMaxAmp);
+
+    _WaveHW[id] = hNew;
+    _WaveDtHW[id] = dtH;
+}
+
+[numthreads(8, 8, 8)]
+void BandWaveProject(uint3 id : SV_DispatchThreadID)
+{
+    float d = _GridSDFR[id];
+    if (d < -_BandWaveAirBand || d > _BandWaveBandMax)
+    {
+        _WaveHW[id] = 0;
+        return;
+    }
+    if (d >= 0.0 && d <= 1.0)
+    {
+        // fluid surface layer IS the base field, nothing to project
+        _WaveHW[id] = _WaveHR[id];
+        return;
+    }
+
+    // one Newton step on the distance field lands on the surface layer:
+    // p' = p - d * grad(d). grad from central differences on the (integer)
+    // SDF is axis-quantized; good enough to collapse the tube.
+    float dl = _GridSDFR[uint3(max(id.x, 1u) - 1u, id.y, id.z)];
+    float dr = _GridSDFR[uint3(min(id.x + 1u, _GridSize.x - 1u), id.y, id.z)];
+    float db = _GridSDFR[uint3(id.x, max(id.y, 1u) - 1u, id.z)];
+    float du = _GridSDFR[uint3(id.x, min(id.y + 1u, _GridSize.y - 1u), id.z)];
+    float df = _GridSDFR[uint3(id.x, id.y, max(id.z, 1u) - 1u)];
+    float dk = _GridSDFR[uint3(id.x, id.y, min(id.z + 1u, _GridSize.z - 1u))];
+    float3 grad = 0.5 * float3(dr - dl, du - db, dk - df);
+    float len = length(grad);
+    if (len < 1e-4)
+    {
+        _WaveHW[id] = _WaveHR[id];
+        return;
+    }
+
+    float3 pos = ((float3)id + 0.5) * _CellSize;         // cell-centre convention
+    float3 proj = pos - d * _CellSize * (grad / len);    // step back to the surface
+    // texel i sits at world (i + 0.5) * h, so world -> uv is just pos/h/N
+    float3 uv = proj * _InvCellSize / (float3)_GridSize;
+    _WaveHW[id] = _WaveHR.SampleLevel(my_linear_clamp_sampler, uv, 0);
+}
+
+groupshared float4 gStat[512]; // x=max|h|, y=sum|h|, z=band?, w=active?
+
+[numthreads(8, 8, 8)]
+void BandWaveStats(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    float d = _GridSDFR[id];
+    bool inBand = d >= -_BandWaveAirBand && d <= _BandWaveBandMax;
+    float h = inBand ? abs(_WaveHR[id]) : 0.0;
+    gStat[gi] = float4(h, h, inBand ? 1.0 : 0.0, h > 0.001 ? 1.0 : 0.0);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 256; s > 0; s >>= 1)
+    {
+        if (gi < s)
+            gStat[gi] = float4(max(gStat[gi].x, gStat[gi + s].x),
+                               gStat[gi].y + gStat[gi + s].y,
+                               gStat[gi].z + gStat[gi + s].z,
+                               gStat[gi].w + gStat[gi + s].w);
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0)
+    {
+        // |h| >= 0, so positive floats compare in uint bit order
+        InterlockedMax(_BandWaveStats[0], asuint(gStat[0].x));
+        // x256 fixed point: maxAmp * numCells * 256 stays well inside uint
+        InterlockedAdd(_BandWaveStats[1], (uint)(gStat[0].y * 256.0 + 0.5));
+        InterlockedAdd(_BandWaveStats[2], (uint)gStat[0].z);
+        InterlockedAdd(_BandWaveStats[3], (uint)gStat[0].w);
+    }
+}
+
+// ===== mesh displacement (phase 2) =====
+//
+// Rewrites the MC vertices in place, right after BuildMesh, displaced along
+// the SDF normal by h. The vertex format is PACKED, not float3 (see
+// MarchingCubes.compute CreateVertex):
+//   .xy = position: (worldPos + 10) * 10 as Morton cell + 1023-quantized frac
+//   .zw = normal:   octahedral coords as raw float bits
+// Decode mirrors MarchingCubesGPU/Shaders/DrawStructuredBuffer.shader;
+// re-encode mirrors MarchingCubes.compute. Declared RW (though read-only
+// here) because the buffer was created ComputeBufferType.IndirectArguments.
+
+RWStructuredBuffer<uint>    _MeshVertexCount; // _argsBuffer; [0] = vertex count
+RWStructuredBuffer<uint4>   _MeshVertices;
+float _BandWaveDisplaceScale;
+float _BandWaveDisplaceNormalGain;
+
+// Free surface only: wall-contact faces are not a water-air interface — and
+// the band tube hugging a wall resonates h to the clamp, which raw sampling
+// at the vertex turned into protruding rims.
+Texture3D<uint> _GridTypesR;
+// Density (in _gridOldVelocity.w, written by Normalize) gives a SMOOTH
+// surface normal; the integer-SDF gradient is axis-quantized and jitters
+// the displacement direction.
+Texture3D<float4> _DensityR;
+
+uint2 EncodeWavePosition(float3 worldPos)
+{
+    float3 cellPos = clamp((worldPos + 10.0) * 10.0, 0.0, 1023.99);
+    return uint2(Morton3DEncode((uint3)floor(cellPos)),
+                 PackUint3((uint3)round(frac(cellPos) * 1023.0)));
+}
+
+uint2 EncodeWaveNormal(float3 n)
+{
+    float2 oct = EncodeNormal(n); // FlipUtils octahedral, [0,1]
+    return uint2(asuint(oct.x), asuint(oct.y));
+}
+
+float SampleSDFAt(float3 p)
+{
+    return _GridSDFR.SampleLevel(my_linear_clamp_sampler, p * _InvCellSize / (float3)_GridSize, 0);
+}
+float SampleWaveAt(float3 p)
+{
+    return _WaveHR.SampleLevel(my_linear_clamp_sampler, p * _InvCellSize / (float3)_GridSize, 0);
+}
+float SampleDensityAt(float3 p)
+{
+    return _DensityR.SampleLevel(my_linear_clamp_sampler, p * _InvCellSize / (float3)_GridSize, 0).w;
+}
+
+[numthreads(128, 1, 1)]
+void BandWaveDisplaceMesh(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _MeshVertexCount[0]) return;
+
+    uint4 v = _MeshVertices[id.x];
+    float3 pos = ((float3)MortonD3Decode(v.x) + UnpackUint3(v.y) / 1023.0) * 0.1 - 10.0;
+    float3 nrm = DecodeNormal(float2(asfloat(v.z), asfloat(v.w)));
+
+    // free surface only: the iso vertex sits between a fluid cell and an air
+    // cell — if any of the 2x2x2 cells around it is SOLID this is wall
+    // contact, not water-air interface. Leave those vertices as MC built
+    // them (they used to pick up the resonating wall-band h and bulge).
+    int3 c0 = (int3)floor(pos * _InvCellSize);
+    [unroll]
+    for (int i = 0; i < 8; ++i)
+    {
+        int3 c = c0 + int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        if (all(c >= 0) && all(c < (int3)_GridSize) && IsSolidCell(GetMyType(_GridTypesR[c])))
+            return;
+    }
+
+    // smooth outward normal from the density gradient: density falls off
+    // outward across the iso, so nIn = +grad(density), nOut = -grad(density).
+    float3 g;
+    g.x = SampleDensityAt(pos + float3(_CellSize, 0, 0)) - SampleDensityAt(pos - float3(_CellSize, 0, 0));
+    g.y = SampleDensityAt(pos + float3(0, _CellSize, 0)) - SampleDensityAt(pos - float3(0, _CellSize, 0));
+    g.z = SampleDensityAt(pos + float3(0, 0, _CellSize)) - SampleDensityAt(pos - float3(0, 0, _CellSize));
+    float gl = length(g);
+    if (gl < 1e-5) return; // no density gradient here: leave as MC built it
+    float3 nIn = g / gl;
+    float3 nOut = -nIn;
+
+    // sample h at THIS vertex's own surface layer: one Newton step on the
+    // signed distance (p' = p - d * grad-direction) lands on d ~ 0. Top
+    // faces, side faces and rim vertices all read the surface value of
+    // their own location, instead of whatever band layer the iso happens to
+    // cross (the old raw sampling made side faces read deep-band h).
+    float d = SampleSDFAt(pos);
+    float3 pSurf = pos - d * _CellSize * nIn;
+    float hgt = SampleWaveAt(pSurf);
+
+    // shading normal follows the ripple slope: for a displacement field
+    // d = h along the normal, the tilted normal is n - tangentialGrad(h)
+    if (_BandWaveDisplaceNormalGain != 0.0)
+    {
+        float3 gh;
+        gh.x = SampleWaveAt(pSurf + float3(_CellSize, 0, 0)) - SampleWaveAt(pSurf - float3(_CellSize, 0, 0));
+        gh.y = SampleWaveAt(pSurf + float3(0, _CellSize, 0)) - SampleWaveAt(pSurf - float3(0, _CellSize, 0));
+        gh.z = SampleWaveAt(pSurf + float3(0, 0, _CellSize)) - SampleWaveAt(pSurf - float3(0, 0, _CellSize));
+        gh -= dot(gh, nOut) * nOut; // tangential part only
+
+        float3 tilted = nrm - _BandWaveDisplaceNormalGain * gh;
+        float tl = length(tilted);
+        if (tl > 1e-5) nrm = tilted / tl;
+    }
+
+    pos += nOut * hgt * _BandWaveDisplaceScale;
+
+    _MeshVertices[id.x] = uint4(EncodeWavePosition(pos), EncodeWaveNormal(nrm));
+}

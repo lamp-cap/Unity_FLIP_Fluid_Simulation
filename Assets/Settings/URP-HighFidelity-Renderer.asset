@@ -19,7 +19,7 @@ MonoBehaviour:
     AfterOpaque: 1
     Source: 0
     NormalSamples: 2
-    Intensity: 2.02
+    Intensity: 1.5
     DirectLightingStrength: 0.25
     Radius: 5
     Samples: 0

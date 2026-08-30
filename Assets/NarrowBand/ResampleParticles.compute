@@ -44,16 +44,48 @@ inline uint GetType(int3 coord)
     return range.y > range.x ? FLUID : AIR;
 }
 
-[numthreads(GROUP_THREADS_D3)]
-void SetGridType (uint3 id : SV_DispatchThreadID)
+// SetGridType reads a 1-cell halo around its 8x8x8 tile, so the naive version
+// evaluates GetType 7x per thread (3584 per group) over a footprint of only
+// 10^3 = 1000 distinct cells — every interior cell is fetched 7 times. Stage
+// the padded tile in LDS once, then read neighbours from there.
+#define SGT_TILE        8                                   // = GROUP_THREADS_D3
+#define SGT_PAD         (SGT_TILE + 2)                       // 10, one halo cell each side
+#define SGT_PAD_COUNT   (SGT_PAD * SGT_PAD * SGT_PAD)        // 1000
+#define SGT_GROUP_SIZE  (SGT_TILE * SGT_TILE * SGT_TILE)     // 512
+
+groupshared uint gs_types[SGT_PAD_COUNT];
+
+inline uint SgtPadIdx(uint3 p)
 {
-    const uint gridType = GetType(id);
-    const uint xp_type = GetType(id + int3(-1, 0, 0));
-    const uint xn_type = GetType(id + int3(1, 0, 0));
-    const uint yp_type = GetType(id + int3(0, -1, 0));
-    const uint yn_type = GetType(id + int3(0, 1, 0));
-    const uint zp_type = GetType(id + int3(0, 0, -1));
-    const uint zn_type = GetType(id + int3(0, 0, 1));
+    return (p.z * SGT_PAD + p.y) * SGT_PAD + p.x;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void SetGridType (uint3 id : SV_DispatchThreadID,
+                  uint3 gtid : SV_GroupThreadID,
+                  uint3 gid : SV_GroupID,
+                  uint gindex : SV_GroupIndex)
+{
+    // Origin of the padded tile in grid space (may be negative; GetType clamps
+    // out-of-bounds lookups to SOLID, matching the per-thread version).
+    const int3 padOrigin = (int3)(gid * SGT_TILE) - 1;
+
+    // 1000 cells / 512 threads => at most 2 cooperative load iterations.
+    for (uint i = gindex; i < SGT_PAD_COUNT; i += SGT_GROUP_SIZE)
+    {
+        uint3 p = uint3(i % SGT_PAD, (i / SGT_PAD) % SGT_PAD, i / (SGT_PAD * SGT_PAD));
+        gs_types[i] = GetType(padOrigin + (int3)p);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint3 c = gtid + 1;   // this thread's cell inside the padded tile
+    const uint gridType = gs_types[SgtPadIdx(c)];
+    const uint xp_type  = gs_types[SgtPadIdx(c - uint3(1, 0, 0))];
+    const uint xn_type  = gs_types[SgtPadIdx(c + uint3(1, 0, 0))];
+    const uint yp_type  = gs_types[SgtPadIdx(c - uint3(0, 1, 0))];
+    const uint yn_type  = gs_types[SgtPadIdx(c + uint3(0, 1, 0))];
+    const uint zp_type  = gs_types[SgtPadIdx(c - uint3(0, 0, 1))];
+    const uint zn_type  = gs_types[SgtPadIdx(c + uint3(0, 0, 1))];
 
     float center = 6 - (xp_type >> 1) - (xn_type >> 1) - (yp_type >> 1) - (yn_type >> 1) - (zp_type >> 1) -(zn_type >> 1);
     _GridCoefficientW[id] = gridType == FLUID ? float4(-center, xp_type & 1, yp_type & 1, zp_type & 1) : 0;

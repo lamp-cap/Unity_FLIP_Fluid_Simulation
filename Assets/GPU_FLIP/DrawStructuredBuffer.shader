@@ -1,4 +1,4 @@
-﻿Shader "Custom/DrawStructuredBuffer" 
+﻿Shader "Custom/DrawStructuredBuffer2" 
 {
     Properties 
     {
@@ -8,6 +8,12 @@
     	_Threshold ("_Threshold", Range(0, 3)) = 0.5
     	_Offset ("Normal Offset", Range(0.01, 1)) = 0.5
     	_Step ("Step", Range(0.005, 0.5)) = 0.05
+        [Toggle(_SURFACE_PBR)] _SurfPBR ("Opaque PBR Surface (Debug)", Float) = 0
+        _SurfMetallic ("Surf Metallic", Range(0,1)) = 0
+        _SurfSmoothness ("Surf Smoothness", Range(0,1)) = 0.5
+        [Toggle(_WAVE_DEBUG)] _WaveDebug ("Visualize Band Waves (vertex color)", Float) = 0
+        _WaveTex ("Band Wave Height", 3D) = "" {}
+        _WaveDebugGain ("Wave Debug Gain", Range(0.1, 100)) = 10
     }
 	SubShader 
 	{
@@ -75,11 +81,25 @@
 			#pragma vertex vert
 			#pragma fragment frag
 
+			// Opaque PBR debug variant: shades the mesh directly with
+			// UniversalFragmentPBR instead of the refraction/ray-march path.
+			#pragma shader_feature_local_fragment _SURFACE_PBR
+			#pragma shader_feature_local _WAVE_DEBUG
+			#pragma multi_compile_fragment _ _SCREEN_SPACE_OCCLUSION
+
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
 		
 
 			StructuredBuffer<uint4> _Buffer;
+
+#if defined(_WAVE_DEBUG)
+			TEXTURE3D(_WaveTex);
+			// static inline sampler: linear filter, clamp wrap
+			SamplerState my_linear_clamp_sampler;
+#endif
+			float _WaveDebugGain;
+			float3 _Size; // grid world size (GridSize * cellSize)
 
 			struct a2v
 			{
@@ -87,11 +107,12 @@
 				float3 normal : NORMAL;
 			};
 			
-			struct v2f 
+			struct v2f
 			{
 				float4  pos : SV_POSITION;
 				float3 normal : TEXCOORD0;
 				float3 worldPos :TEXCOORD1;
+				float4 waveColor : COLOR;
 			};
 
 			// v2f vert(a2v i)
@@ -105,23 +126,39 @@
 			v2f vert(uint id : SV_VertexID)
 			{
 				uint4 vert = _Buffer[id];
-			
+
 				v2f o;
 				o.normal = DecodeNormal(vert.zw);
-				o.worldPos = float4(DecodePosition(vert.xy) + o.normal * 0.1, 1);
+				float3 surfacePos = DecodePosition(vert.xy);
+				o.worldPos = float4(surfacePos + o.normal * 0.1, 1);
 				o.pos = TransformWorldToHClip(o.worldPos);
-				
+
+#if defined(_WAVE_DEBUG)
+				// Band-wave debug: sample h at the (pre-offset) surface position,
+				// same mapping as BandWaveDisplaceMesh's SampleWaveAt
+				// (uv = pos / gridSize * invCellSize). White = h ~ 0, red = crest,
+				// blue = trough. All-white everywhere means the iso surface sits
+				// outside the wave band (h lives at SDF 0..bandMax on the fluid
+				// side; the density iso sits ~1 cell into the air).
+				float h = SAMPLE_TEXTURE3D_LOD(_WaveTex, my_linear_clamp_sampler, surfacePos / _Size, 0).r;
+				float t = saturate(abs(h) * _WaveDebugGain);
+				float3 tint = h >= 0 ? float3(1.0, 0.15, 0.1) : float3(0.1, 0.4, 1.0);
+				o.waveColor = float4(lerp((float3)1.0, tint, t), 1.0);
+#else
+				o.waveColor = float4(1, 1, 1, 1);
+#endif
 				return o;
 			}
 			
             TEXTURE3D(_Density);        SAMPLER(sampler_Density);
             TEXTURECUBE(_Cube);         SAMPLER(sampler_Cube);
-			float3 _Size;
 			float4 _Color;
 			float _Range;
 			float _Threshold;
 			float _Step;
 			float _Offset;
+			float _SurfMetallic;
+			float _SurfSmoothness;
 			
             float2 insect(float3 ro,float3 rd,float3 p0,float3 p1)
             {
@@ -312,6 +349,27 @@
 			
 			float4 frag(v2f i) : SV_Target
 			{
+#if defined(_SURFACE_PBR)
+				// Opaque PBR surface — one lighting evaluation, no ray
+				// marching. For debugging geometry/ripples without paying
+				// for the refraction path.
+				InputData inputData = (InputData)0;
+				inputData.positionWS = i.worldPos;
+				inputData.normalWS = normalize(i.normal);
+				inputData.viewDirectionWS = normalize(_WorldSpaceCameraPos.xyz - i.worldPos);
+				inputData.shadowCoord = TransformWorldToShadowCoord(i.worldPos);
+				inputData.bakedGI = SampleSH(inputData.normalWS);
+				inputData.normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(i.pos);
+
+				SurfaceData surfaceData = (SurfaceData)0;
+				surfaceData.albedo = _Color.rgb * i.waveColor.rgb;
+				surfaceData.metallic = _SurfMetallic;
+				surfaceData.smoothness = _SurfSmoothness;
+				surfaceData.occlusion = 1.0;
+				surfaceData.alpha = 1.0;
+
+				return UniversalFragmentPBR(inputData, surfaceData);
+#else
 				float3 posWS = i.worldPos;
 				// return float4((posWS > 0?float3(1,1,1):float3(0,0,0)), 1);
                 float3 V = normalize(posWS - _WorldSpaceCameraPos);
@@ -348,8 +406,9 @@
                 // return reflectProb2;
                 const float3 color2 = lerp(GetSkyColor(refracted2), GetSkyColor(normalize(reflect2*(1-outBoxN*0.3))), reflectProb2);
                 float3 color1 = lerp(color2, reflectColor1, reflectProb1);
-                return float4(color1, 1);
+                return float4(color1 * i.waveColor.rgb, 1);
 #endif
+#endif // _SURFACE_PBR
 			}
 
 			ENDHLSL

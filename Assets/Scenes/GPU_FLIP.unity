@@ -166,6 +166,7 @@ MonoBehaviour:
   threshold: 0.5
   drawType: 0
   meshMat: {fileID: 2100000, guid: b10ed8ca361f71d4db26639892ce1e22, type: 2}
+  volumeMat: {fileID: 2100000, guid: da8422341ce842b48bc7e47f453fb437, type: 2}
 --- !u!4 &911704354
 Transform:
   m_ObjectHideFlags: 0

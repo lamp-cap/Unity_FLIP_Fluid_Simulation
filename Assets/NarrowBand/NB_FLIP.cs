@@ -24,7 +24,7 @@ public class NB_FLIP : MonoBehaviour
     public ComputeShader JFACs;
     public ComputeShader projectionCs;
     public ComputeShader G2PCs;
-    public ComputeShader sortCs;
+    public ComputeShader countingSortCs;
     
     public ComputeShader mcCs;
     public ComputeShader solverCs;
@@ -70,9 +70,7 @@ public class NB_FLIP : MonoBehaviour
     private readonly GPUTexture3D _gridSDF = new();
     
     private readonly GPUDoubleTexture3D _gridSeed = new();
-    
-    private ComputeBuffer globalHist;
-    private ComputeBuffer passHist;
+
     private ComputeBuffer _argsBuffer;
     private ComputeBuffer _verticesBuffer;
     
@@ -80,6 +78,7 @@ public class NB_FLIP : MonoBehaviour
     private ComputeBuffer _counterBuffer;
     
     private const int ParticlesBufferSize = 256 * 128 * 100;
+    private const float InitScale = 0.7f;
     private static readonly int3 GridSize = new int3(256, 128, 128);
     private const float GridSpacing = 0.2f;
     private int NumGrids => GridSize.x * GridSize.y * GridSize.z;
@@ -87,16 +86,13 @@ public class NB_FLIP : MonoBehaviour
     private int _kernelInitParticles;
     private int _kernelInitSDF;
     private int _kernelParticlesCounterInit;
-    
-    private int _kernelUpsweep;
-    private int _kernelScan;
-    private int _kernelDownsweep;
 
-    private int _kernelMakePair;
     private int _kernelClearGrid;
-    private int _kernelSetRange;
+    private int _kernelCounting;
+    private int _kernelClearScanFlagsSort;
+    private int _kernelScanRange;
     private int _kernelRearrange;
-    
+
     private int _kernelSetGridType;
     private int _kernelSetGridLevel;
     private int _kernelClearScanFlags;
@@ -123,11 +119,14 @@ public class NB_FLIP : MonoBehaviour
     private int _kernelRendering;
     
     private const int _pGroupThreadsX = ((ParticlesBufferSize) + 127) / 128;
+    // Every GROUP_THREADS_D3 kernel dispatched with _gGroupThreads here
+    // (Normalize / AddForce in SplatParticleToGrid, Divergence /
+    // UpdateVelocity in PressureProjection) includes NBFlipUtils.hlsl, i.e.
+    // [numthreads(8,8,8)] — (GridSize+7)/8 covers the domain exactly once.
+    // Do NOT widen these dispatches: UpdateVelocity is an in-place
+    // read-modify-write of _VelocityW, so over-dispatch is a data race that
+    // applies the pressure gradient several times per cell and kills flow.
     private readonly int3 _gGroupThreads = (GridSize + new int3(7, 7, 7)) / new int3(8, 8, 8);
-    
-    private const int k_radix = 256;
-    private const int k_radixPasses = 4;
-    private const int k_partitionSize = 3840;
     
     private MaterialPropertyBlock _mpb;
     private float ParticleRadius => GridSpacing * 0.5f;
@@ -177,27 +176,20 @@ public class NB_FLIP : MonoBehaviour
             _gridCoefficientPymaid[i].Init(GridSize >> i, RenderTextureFormat.ARGBHalf);
         }
         
-        _gridWeightsTemp.Init(NumGrids * 6);
+        _gridWeightsTemp.Init(NumGrids * 7);
         _dotBuffer = new ComputeBuffer(2, sizeof(uint));
         _counterBuffer = new ComputeBuffer(1, sizeof(uint));
         _counterBuffer.SetData(new uint[] { 0 });
-        
-        globalHist = new ComputeBuffer(k_radix * k_radixPasses, 4);
-        passHist = new ComputeBuffer(k_radix * DivRoundUp(ParticlesBufferSize, k_partitionSize) * k_radixPasses, 4);
-        
+
         _kernelInitParticles = initCs.FindKernel("InitParticles");
         _kernelInitSDF = initCs.FindKernel("InitLevel");
         _kernelParticlesCounterInit = initCs.FindKernel("ParticlesCounter");
 
-        _kernelMakePair = buildLutCs.FindKernel("MakePair");
-        
-        _kernelUpsweep = sortCs.FindKernel("UpSweep");
-        _kernelScan = sortCs.FindKernel("Scan");
-        _kernelDownsweep = sortCs.FindKernel("DownSweep");
-        
-        _kernelClearGrid = buildLutCs.FindKernel("ClearGrid");
-        _kernelSetRange = buildLutCs.FindKernel("SetRange");
-        _kernelRearrange = buildLutCs.FindKernel("Rearrange");
+        _kernelClearGrid = countingSortCs.FindKernel("ClearGrid");
+        _kernelCounting = countingSortCs.FindKernel("Counting");
+        _kernelClearScanFlagsSort = countingSortCs.FindKernel("ClearScanFlags");
+        _kernelScanRange = countingSortCs.FindKernel("ScanRange");
+        _kernelRearrange = countingSortCs.FindKernel("Rearrange");
         
         _kernelBlockRange = splatP2GCs.FindKernel("BlockRange");
         _kernelClearGridWeight = splatP2GCs.FindKernel("ClearGridWeight");
@@ -369,12 +361,28 @@ public class NB_FLIP : MonoBehaviour
 
     private void InitParticles()
     {
-        initCs.SetFloat("_Scale", 0.7f);
+        initCs.SetFloat("_Scale", InitScale);
         initCs.SetFloat("_CellSize", GridSpacing);
         initCs.SetFloat("_InvCellSize", 1f / GridSpacing);
         initCs.SetInt("_NumParticles", ParticlesBufferSize);
-        initCs.SetVector("_InitMin0", new float4((float3)GridSize * new float3(0.02f, 0.25f, 0.04f) * GridSpacing, 1));
-        initCs.SetVector("_InitMin1", new float4((float3)GridSize * new float3(0.6f, 0.25f, 0.26f) * GridSpacing, 1));
+
+        // Both init blocks sit flush in opposite floor corners rather than floating,
+        // matching FLIPWithSurfaceTurbulence. Resting on the floor means the liquid
+        // starts at its settled height instead of falling into it, so the narrow band
+        // does not have to carry a full-height transient on the first frames.
+        //
+        // Extent is fixed by the Morton fill: half of ParticlesBufferSize reaches
+        // coord 127 on each axis, so 127 * GridSpacing * _Scale = 17.78 world units
+        // per side. Cell 0 is the wall (ResampleParticles.compute GetType returns
+        // SOLID out of bounds), so the first fluid cell is at GridSpacing.
+        const float blockExtent = 127f * GridSpacing * InitScale;
+        float3 domain = (float3)GridSize * GridSpacing;
+        float lo = GridSpacing;
+        float3 nearCorner = new float3(lo, lo, lo);
+        float3 farCorner = new float3(domain.x - lo - blockExtent, lo,
+                                      domain.z - lo - blockExtent);
+        initCs.SetVector("_InitMin0", new float4(nearCorner, 1));
+        initCs.SetVector("_InitMin1", new float4(farCorner, 1));
         initCs.SetVector("_GridSize", new Vector4(GridSize.x, GridSize.y, GridSize.z, 1));
         initCs.SetBuffer(_kernelInitParticles, "_ParticlesW", _particles.Read);
         initCs.SetBuffer(_kernelInitParticles, "_ParticlesIDW", _particleID.Read);
@@ -459,41 +467,47 @@ public class NB_FLIP : MonoBehaviour
 
     private void BuildLut(CommandBuffer cmd)
     {
-        var cs = buildLutCs;
+        var cs = countingSortCs;
         SetParams(cmd, cs);
-        
+
         // clear grid data
         int kernel = _kernelClearGrid;
         cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeW", _gridParticleRange.Read);
         cmd.SetComputeTextureParam(cs, kernel, "_PressureW", _gridPressurePymaid[0]);
         cmd.DispatchCompute(cs, kernel, _gGroupThreads.x, _gGroupThreads.y, _gGroupThreads.z);
-        
-        // make pair
-        kernel = _kernelMakePair;
+
+        // clear scan flags
+        kernel = _kernelClearScanFlagsSort;
+        cmd.SetComputeBufferParam(cs, kernel, "_PartitionScanDescriptors", _scanFlags);
+        cmd.DispatchCompute(cs, kernel, DivRoundUp(NumGrids / 512 + 2, 128), 1, 1);
+
+        // counting pass - rank particles (each thread handles 15 particles)
+        int countingGroups = DivRoundUp(ParticlesBufferSize, 128 * 8);
+        kernel = _kernelCounting;
         cmd.SetComputeBufferParam(cs, kernel, "_CounterR", _counterBuffer);
         cmd.SetComputeBufferParam(cs, kernel, "_ParticlesR", _particles.Read);
-        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesIDW", _particleID.Read);
-        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesHashW", _particleHash.Read);
-        cmd.DispatchCompute(cs, kernel, _pGroupThreadsX, 1, 1);
-        
-        // sort
-        Sort(cmd, _particleHash, _particleID, 24);
-        
-        // set range
-        kernel = _kernelSetRange;
-        cmd.SetComputeBufferParam(cs, kernel, "_CounterR", _counterBuffer);
         cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeW", _gridParticleRange.Read);
-        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesHashR", _particleHash.Read);
-        cmd.DispatchCompute(cs, kernel, _pGroupThreadsX, 1, 1);
-        
-        // rearrange
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesHashW", _particleHash.Read);
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesIDW", _particleID.Write);
+        cmd.DispatchCompute(cs, kernel, countingGroups, 1, 1);
+
+        // scan ranges to compute start offsets
+        kernel = _kernelScanRange;
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeW", _gridParticleRange.Read);
+        cmd.SetComputeBufferParam(cs, kernel, "_PartitionScanDescriptors", _scanFlags);
+        cmd.DispatchCompute(cs, kernel, DivRoundUp(NumGrids, 512), 1, 1);
+
+        // rearrange particles (each thread handles 15 particles)
         kernel = _kernelRearrange;
         cmd.SetComputeBufferParam(cs, kernel, "_CounterR", _counterBuffer);
-        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesIDR", _particleID.Read);
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesIDR", _particleID.Write);
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesHashR", _particleHash.Read);
+        cmd.SetComputeBufferParam(cs, kernel, "_ParticlesRangeR", _gridParticleRange.Read);
         cmd.SetComputeBufferParam(cs, kernel, "_ParticlesR", _particles.Read);
         cmd.SetComputeBufferParam(cs, kernel, "_ParticlesW", _particles.Write);
-        cmd.DispatchCompute(cs, kernel, _pGroupThreadsX, 1, 1);
+        cmd.DispatchCompute(cs, kernel, countingGroups, 1, 1);
         _particles.Swap();
+        _particleID.Swap();
     }
 
     private void ResampleParticles(CommandBuffer cmd)
@@ -714,47 +728,6 @@ public class NB_FLIP : MonoBehaviour
         cmd.DispatchCompute(cs, 1, GridSize.x / 8 + 1, GridSize.y / 8, GridSize.z / 8 + 1);
     }
 
-    private void Sort(CommandBuffer cmd, GPUDoubleBuffer<uint> toSort, GPUDoubleBuffer<uint> payload, int maxDigit = 32)
-    {
-        int sortSize = toSort.Size;
-        int numThreadBlocks = (sortSize + k_partitionSize) / k_partitionSize;
-        
-        cmd.SetComputeIntParam(sortCs, "e_numKeys", sortSize);
-        cmd.SetComputeIntParam(sortCs, "e_threadBlocks", numThreadBlocks);
-
-        cmd.SetComputeBufferParam(sortCs, 0, "b_globalHist", globalHist);
-
-        cmd.SetComputeBufferParam(sortCs, _kernelUpsweep, "b_passHist", passHist);
-        cmd.SetComputeBufferParam(sortCs, _kernelUpsweep, "b_globalHist", globalHist);
-
-        cmd.SetComputeBufferParam(sortCs, _kernelScan, "b_passHist", passHist);
-
-        cmd.SetComputeBufferParam(sortCs, _kernelDownsweep, "b_passHist", passHist);
-        cmd.SetComputeBufferParam(sortCs, _kernelDownsweep, "b_globalHist", globalHist);
-        
-        cmd.DispatchCompute(sortCs, 0, 1, 1, 1);
-        
-        for (int radixShift = 0; radixShift < maxDigit; radixShift += 8)
-        {
-            cmd.SetComputeIntParam(sortCs, "e_radixShift", radixShift);
-
-            cmd.SetComputeBufferParam(sortCs, _kernelUpsweep, "b_sort", toSort.Read);
-            cmd.DispatchCompute(sortCs, _kernelUpsweep, numThreadBlocks, 1, 1);
-
-            cmd.DispatchCompute(sortCs, _kernelScan, k_radix, 1, 1);
-
-            cmd.SetComputeBufferParam(sortCs, _kernelDownsweep, "b_sort", toSort.Read);
-            cmd.SetComputeBufferParam(sortCs, _kernelDownsweep, "b_sortPayload", payload.Read);
-            cmd.SetComputeBufferParam(sortCs, _kernelDownsweep, "b_alt", toSort.Write);
-            cmd.SetComputeBufferParam(sortCs, _kernelDownsweep, "b_altPayload", payload.Write);
-            cmd.DispatchCompute(sortCs, _kernelDownsweep, numThreadBlocks, 1, 1);
-
-            toSort.Swap();
-            payload.Swap();
-        }
-        
-    }
-
     private void MGPCG(CommandBuffer cmd)
     {
         var cs = solverCs;
@@ -920,10 +893,7 @@ public class NB_FLIP : MonoBehaviour
         
         _gridWeightsTemp.Dispose();
         _dotBuffer.Dispose();
-        
-        globalHist.Dispose();
-        passHist.Dispose();
-        
+
         _particleRenderingBufferWithArgs.Dispose();
         
         _argsBuffer.Dispose();

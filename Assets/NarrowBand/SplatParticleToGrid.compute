@@ -79,15 +79,15 @@ void BlockRange(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 }
 
 // ============================================================
-// ClearGridWeight: zero the fixed-point accumulator (6 int
+// ClearGridWeight: zero the fixed-point accumulator (7 int
 // planes: velocity.xyz, weight.xyz, density). One thread per
-// cell clears all 6 planes.
+// cell clears all 7 planes.
 // ============================================================
 [numthreads(256, 1, 1)]
 void ClearGridWeight(uint3 id : SV_DispatchThreadID)
 {
     [unroll]
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 7; ++i)
         _WeightsSumW[id.x + i * _NumCells] = 0;
 }
 // ============================================================
@@ -99,8 +99,8 @@ void ClearGridWeight(uint3 id : SV_DispatchThreadID)
 #define SCALER 2048.0
 #define SPLAT_SIZE 128
 
-// 10*10*10 cells * 6 planes (vel.xyz, weight.xyz, density)
-groupshared int g_dataSum[10 * 10 * 10 * 6];
+// 10*10*10 cells * 7 planes (vel.xyz, weight.xyz, density)
+groupshared int g_dataSum[10 * 10 * 10 * 7];
 
 inline int LocalIdx(int3 coord)
 {
@@ -111,6 +111,17 @@ inline int3 LocalCoord(int i)
     return int3(i % 10, i / 10 % 10, i / 100);
 }
 
+// Per-axis kernel factor. Mirrors the kernel choice GetWeight makes in
+// NBFlipUtils.hlsl so switching USE_LINEAR_KERNEL stays consistent.
+inline float3 SeparableWeight(float3 abs_x)
+{
+#if defined(USE_LINEAR_KERNEL)
+    return GetLinearWeight(abs_x);
+#else
+    return GetQuadraticWeight(abs_x);
+#endif
+}
+
 void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
 {
     float3 pos = DecodePosition(p.packedPosition);
@@ -119,8 +130,15 @@ void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
     int3 pCoord = PositionCoord(p.packedPosition);
     int3 localCoord = pCoord - coordMin;
 
-    // segment same-cell lanes: a lane is a segment boundary when the
-    // previous lane targets a different local cell.
+    // Segment same-cell lanes: a lane is a segment boundary when the previous
+    // lane targets a different local cell. `interval` is the length of the
+    // trailing run of same-cell lanes above this one.
+    //
+    // Note: WaveMatch/WaveMultiPrefixSum can express this more compactly, but
+    // both are emulated by DXC (ballot + shuffle loops), and WaveMultiPrefixSum
+    // costs one scan per component per stencil tap - 6 scans x 27 taps. That is
+    // far more than folding a run which, for Morton-sorted particles, is only
+    // 1-3 lanes deep. The explicit shuffle fold below is the faster form.
     int laneid = WaveGetLaneIndex();
     int local_idx = LocalIdx(localCoord);
     bool is_boundary = WaveIsFirstLane();
@@ -134,28 +152,62 @@ void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
     uint chk = laneid < 31 ? ((mark << (laneid + 1)) | ((1U << (laneid + 1)) - 1)) : 0xFFFFFFFF;
     int interval = 31 - asint(firstbithigh(chk)); // trailing run of same-cell lanes
     int iter = WaveActiveMax(interval);
-    // 3x3x3 splat (quadratic kernel support), same footprint as full-sim splat
+
+    // The kernel is separable: w(p - c) = wx(dx) * wy(dy) * wz(dz), so the 27
+    // stencil taps only need 3 distinct factors per axis. Precompute them once
+    // instead of re-deriving cell centres and evaluating the polynomial 3x per
+    // iteration (81 evaluations -> 9).
+    //
+    // The grid is staggered, so component vx is offset by -0.5 cells on x only,
+    // vy on y only, vz on z only. Per axis that gives two factor sets: the
+    // half-shifted one (used by the component living on that axis) and the
+    // cell-centred one (used by the other two components).
+    //
+    // Distance from particle to the tap at cellCenter, in cell units:
+    //   dCentre = pos/h - (coord + 0.5),  dStagger = dCentre + 0.5
+    const float3 posCells = pos * _InvCellSize;
+    const float3 dCentre0 = posCells - ((float3)pCoord + 0.5f);
+    const float3 dStagger0 = dCentre0 + 0.5f;
+
+    // wCentre[o] / wStagger[o] hold the per-axis factors for stencil offset o-1.
+    float3 wCentre[3];
+    float3 wStagger[3];
+    [unroll]
+    for (int o = 0; o < 3; ++o)
+    {
+        const float fo = (float)(o - 1);
+        wCentre[o]  = SeparableWeight(abs(dCentre0  - fo));
+        wStagger[o] = SeparableWeight(abs(dStagger0 - fo));
+    }
+
+    // 3x3x3 splat (quadratic kernel support), same footprint as full-sim splat.
+    // [unroll] is required, not cosmetic: it makes the wCentre/wStagger indices
+    // compile-time constants. Left dynamic, those local arrays spill to scratch
+    // memory instead of staying in registers.
+    [unroll]
     for (int offi = -1; offi <= 1; ++offi)
+    [unroll]
     for (int offj = -1; offj <= 1; ++offj)
+    [unroll]
     for (int offk = -1; offk <= 1; ++offk)
     {
         int3 neighborCoord = pCoord + int3(offi, offj, offk);
 
-        float3 cellCenter = (neighborCoord + 0.5f) * _CellSize;
-        float3 position_vx = cellCenter + float3(-0.5f * _CellSize, 0, 0);
-        float3 position_vy = cellCenter + float3(0, -0.5f * _CellSize, 0);
-        float3 position_vz = cellCenter + float3(0, 0, -0.5f * _CellSize);
-
+        const int3 o3 = int3(offi, offj, offk) + 1;
+        // vx: staggered on x, centred on y/z. vy: staggered on y. vz: on z.
         float3 weights = float3(
-            GetWeight(pos, position_vx, _InvCellSize),
-            GetWeight(pos, position_vy, _InvCellSize),
-            GetWeight(pos, position_vz, _InvCellSize));
+            wStagger[o3.x].x * wCentre[o3.y].y  * wCentre[o3.z].z,
+            wCentre[o3.x].x  * wStagger[o3.y].y * wCentre[o3.z].z,
+            wCentre[o3.x].x  * wCentre[o3.y].y  * wStagger[o3.z].z);
 
         float3 warp_velocity_sum = weights * vel;
         float3 warp_weight_sum = weights;
 
-        float3 vec = pos - cellCenter;
-        // float density = SmoothingKernelPoly6(dot(vec, vec) * _InvCellSize * _InvCellSize);
+        // density kernel is NOT separable - evaluate poly6 on the centred
+        // distance to this tap (same as GPU_FLIP's pos - cellCenter, but in
+        // cell units reusing the precomputed offset: posCells - (coord+o+0.5))
+        const float3 dCentre = dCentre0 - (o3 - 1);
+        float density = SmoothingKernelPoly6(dot(dCentre, dCentre));
 
         // fold this offset's contribution across the same-cell lane run
         int stride = 1;
@@ -163,12 +215,12 @@ void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
         {
             float3 neighbor_velocity = WaveReadLaneAt(warp_velocity_sum, laneid + stride);
             float3 neighbor_weights = WaveReadLaneAt(warp_weight_sum, laneid + stride);
-            // float neighbor_density = WaveReadLaneAt(density, laneid + stride);
+            float neighbor_density = WaveReadLaneAt(density, laneid + stride);
             if (stride <= interval)
             {
                 warp_velocity_sum += neighbor_velocity;
                 warp_weight_sum += neighbor_weights;
-                // density += neighbor_density;
+                density += neighbor_density;
             }
             stride <<= 1;
         }
@@ -184,18 +236,19 @@ void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
             InterlockedAdd(g_dataSum[index + 3 * 1000], (int)round(warp_weight_sum.x * SCALER));
             InterlockedAdd(g_dataSum[index + 4 * 1000], (int)round(warp_weight_sum.y * SCALER));
             InterlockedAdd(g_dataSum[index + 5 * 1000], (int)round(warp_weight_sum.z * SCALER));
-            // InterlockedAdd(g_dataSum[index + 6 * 1000], (int)round(density * SCALER));
+
+            InterlockedAdd(g_dataSum[index + 6 * 1000], (int)round(density * SCALER));
         }
     }
 }
 [numthreads(SPLAT_SIZE, 1, 1)]
 void P2G(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
-    // clear the 10x10x10x6 groupshared accumulator
+    // clear the 10x10x10x7 groupshared accumulator
     for (int c = gi; c < 1000; c += SPLAT_SIZE)
     {
         [unroll]
-        for (int j = 0; j < 6; ++j)
+        for (int j = 0; j < 7; ++j)
             g_dataSum[c + j * 1000] = 0;
     }
     GroupMemoryBarrierWithGroupSync();
@@ -236,13 +289,13 @@ void P2G(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
         if (interior)
         {
             [unroll]
-            for (int j = 0; j < 6; ++j)
+            for (int j = 0; j < 7; ++j)
                 _WeightsSumW[globalIdx + j * _NumCells] = g_dataSum[idx + j * 1000];
         }
         else
         {
             [unroll]
-            for (int j = 0; j < 6; ++j)
+            for (int j = 0; j < 7; ++j)
                 InterlockedAdd(_WeightsSumW[globalIdx + j * _NumCells], g_dataSum[idx + j * 1000]);
         }
     }
@@ -257,7 +310,14 @@ void Normalize(uint3 id : SV_DispatchThreadID)
 {
     float sdf = _GridSDFR[id];
     if (sdf > Band1 || sdf < -Band1)
+    {
+    
+        if (sdf < -Band1)
+            _VelocityOldW[id] = float4(0, 0, 0, 0.0);
+        else if (sdf > Band1)
+            _VelocityOldW[id] = float4(_VelocityOldW[id].xyz, 4.0);
         return;
+    }
     int idx = Morton3DEncode(id);
     float3 velocity = float3(
         _WeightsSumR[idx + 0 * _NumCells],
@@ -267,7 +327,7 @@ void Normalize(uint3 id : SV_DispatchThreadID)
         _WeightsSumR[idx + 3 * _NumCells],
         _WeightsSumR[idx + 4 * _NumCells],
         _WeightsSumR[idx + 5 * _NumCells],
-        SCALER) / SCALER;
+        _WeightsSumR[idx + 6 * _NumCells]) / SCALER;
 
     _VelocityOldW[id] = float4(weights.xyz > 1e-6f ? velocity / weights.xyz : 0, weights.w);
 }
@@ -292,9 +352,9 @@ void AddForce(uint3 id : SV_DispatchThreadID)
 
     // add mouse force
     const float3 position = id * _CellSize;
-    const float3 position_vx = position + float3(-0.5f * _InvCellSize, 0.0f, 0.0f);
-    const float3 position_vy = position + float3(0.0f, -0.5f * _InvCellSize, 0.0f);
-    const float3 position_vz = position + float3(0.0f, 0.0f, -0.5f * _InvCellSize);
+    const float3 position_vx = position + float3(-0.5f * _CellSize, 0.0f, 0.0f);
+    const float3 position_vy = position + float3(0.0f, -0.5f * _CellSize, 0.0f);
+    const float3 position_vz = position + float3(0.0f, 0.0f, -0.5f * _CellSize);
     float3 mouse_force = float3(GetMouseForce(position_vx), GetMouseForce(position_vy), GetMouseForce(position_vz));
     mouse_force *= _MouseForceParameter.xyz;
     velocity.xyz += mouse_force * _DeltaTime;

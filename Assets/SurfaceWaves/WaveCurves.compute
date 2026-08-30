@@ -1,0 +1,554 @@
+#pragma use_dxc
+#pragma target 6.0
+
+// =============================================================================
+// Wave curves — Lagrangian dispersive ripples riding the FLIP free surface.
+//
+// Port of Skrivan et al., "Wave Curves: Simulating Lagrangian water waves on
+// dynamically deforming surfaces" (SIGGRAPH Asia 2019), drafted against
+// Michael Stark's bare-bones Houdini VEX reference (github.com/mstarktv/
+// waves-curves, MIT — the only public implementation). Where the VEX deviates
+// from the paper this port keeps the deviation and lists it under DEVIATIONS
+// so the two references stay diffable.
+//
+// Carrier: one StructuredBuffer of 64 B curve points. Each point is a
+// Lagrangian wave packet carrying (pos, k, theta, action, radius). Connected
+// polylines are NOT stored: the Houdini file only needs connectivity for its
+// resample SOP, which this draft skips (points drift in spacing over a
+// curve's ~1 s lifetime — the theta-Taylor re-fix from the VEX is therefore
+// also unnecessary; revisit both together if maxAge grows).
+//
+// Per-frame dispatch chain (see FLIPWithSurfaceTurbulence.WaveCurves.cs):
+//   WaveCurvesResetCounters — zero seed count, births, segment alloc cursor
+//   WaveCurvesScatterSeeds  — full grid; cells in the SDF surface layer
+//                             analyse the velocity gradient (growth rate G,
+//                             Eq. 20 reduced to -div) and Poisson-emit seeds
+//                             round-robin over the wavelength bands
+//   WaveCurvesEvolve        — full-capacity IN-PLACE slot rewrite (Eqs. 13-17
+//                             + Appendix C clamps + cull rules); culled slots
+//                             become dead markers
+//   WaveCurvesGenerate      — fixed dispatch over seed capacity: geodesic
+//                             march both directions from each seed (Eq. 27)
+//                             into ONE contiguous reservation (budgeted)
+//
+// Rendering is NOT a mesh merge anymore: the C# side draws the points as
+// camera-facing ribbons via DrawProcedural (WaveCurveLines.shader), segment
+// i joining points i and i+1 whenever curveId matches. Generate appends each
+// curve as one contiguous run, so connectivity rides in curveId — no LUT, no
+// index buffer, no readback.
+//
+// DEVIATIONS from the paper (inherited from the VEX unless noted):
+//   - action grows by beta(k)*growthRate*dt plus exponential damping, not the
+//     advected-area conservation of Eq. 25
+//   - g* may come from the pressure gradient (Eq. 26, _WcUsePressureGravity,
+//     THIS port's addition — the solver has pressure, the VEX only had U) or
+//     from finite-difference particle accel like the VEX
+//   - g* floored at _WcGStarFloor: no Rayleigh-Taylor amplification
+//   - Eq. 16's grad-g* refraction term dropped (compile-time toggle below)
+//   - seeding G = max(-horizontal divergence, 0) + noise floor, not full Eq. 20
+//   - curve growth is pure geodesic (Eq. 28 blending alpha = 0, not 2)
+//   - radius fixed at 2*lambda at birth (no Eq. 24 stretching)
+//   - 3 wavelength bands, not 5
+// =============================================================================
+
+#include "../GPU_FLIP/FlipUtils.hlsl"
+
+#pragma kernel WaveCurvesResetCounters
+#pragma kernel WaveCurvesScatterSeeds
+#pragma kernel WaveCurvesEvolve
+#pragma kernel WaveCurvesGenerate
+
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
+
+// Eq. 16's -dOmega/dg* * grad g* term. Off = VEX parity. Requires one extra
+// g* sample pair per point per frame; leave off until the basics read right.
+// #define WC_GSTAR_GRADIENT
+
+// gamma/rho for water at 20 C in m^3/s^2 (surface tension 0.0728 N/m, 1000 kg/m^3)
+#define WC_GAMMA_RHO 7.28e-5
+
+// =============================================================================
+// data
+// =============================================================================
+
+struct WaveCurvePoint
+{
+    float3 pos;      // grid-local world (cell * cellSize, FlipUtils frame)
+    float  theta;    // phase (Eq. 12)
+    float3 k;        // wavevector, tangent to the surface
+    float  action;   // wave action A = E/Omega (Eq. 10)
+    float  age;      // seconds since birth; drives fade-in and culling
+    float  radius;   // kernel half-width Psi (Eq. 22), 2*lambda at birth
+    float  amp;      // reconstructed amplitude (Eq. 10 inverted)
+    float  band;     // 0/1/2 -> _WcBandLambdas slot
+    float3 prevVel;  // U at last step, for the accel fallback route of g*
+    float  gStar;    // cached effective gravity (debug / viz only)
+    uint   curveId;  // frame-salted (frame*maxSeeds*4 + seedIdx*4 + side):
+                     // seed indices are re-compacted every frame, so without
+                     // the salt two generations collide and the ribbon
+                     // renderer chords distant curves together
+    float  _pad0;
+    float2 _pad1;
+};
+
+struct WaveSeed
+{
+    float3 pos;      // surface-projected seed position
+    float  G;        // growth-rate density (reduced Eq. 20)
+    float3 normal;   // outward surface normal
+    float  band;     // wavelength band this seed spawns
+    float3 kHat;     // fastest-growing wave direction (eigvec of D, 4.3)
+    float  pad0;
+    float3 vel;      // sampled U, becomes the curve's initial prevVel
+    float  pad1;
+};
+
+// double-buffered curve state: C# binds Read as SRV, Write as UAV, swaps after
+StructuredBuffer<WaveCurvePoint>  _WcCurveR;
+RWStructuredBuffer<WaveCurvePoint> _WcCurveW;
+
+// written by ScatterSeeds, read by Generate (separate dispatches, no hazard)
+RWStructuredBuffer<WaveSeed> _WcSeeds;
+
+// Storage model — in-place evolve + ring of generations, NO global count:
+//   - Evolve rewrites EVERY slot every frame (survivor or dead marker), so
+//     both buffers stay fully coherent — no slot is ever stale, and curve
+//     runs never reshuffle. Slot i -> slot i is order-preserving for free.
+//   - The buffer is partitioned into generation segments; frame f allocates
+//     inside segment f mod G. A curve lives at most _WcMaxAge and G exceeds
+//     that lifetime, so when a segment recycles its occupants are all
+//     markers — reclaim is free, no GC kernel, no wraparound pop.
+//   - Allocation uses a per-frame cursor (_WcSeedCountBuf[2], reset to 0,
+//     offset by _WcSegBase) with whole-curve reservations; a birth budget
+//     (_WcSeedBudget) fits reservations inside the segment under seed storms.
+//   - The renderer draws the whole capacity; markers (curveId 0xffffffff,
+//     k = 0) park their segments outside the frustum.
+RWStructuredBuffer<uint> _WcSeedCountBuf;   // [0] = seed count, [1] = births
+                                            // this frame, [2] = alloc cursor
+#define _WcSeedCount  ((int)_WcSeedCountBuf[0])
+
+// dead-slot marker id: Evolve culls these next frame via the k-length guard,
+// the ribbon renderer drops any segment touching one
+#define WC_DEAD_CURVE 0xffffffffu
+
+// ===== solver inputs (same bindings as BandWaves) =====
+Texture3D<float>  _GridSDFR;    // 0 surface, >0 fluid, <0 air (integer levels)
+Texture3D<float4> _VelocityR;   // xyz = velocity
+Texture3D<float4> _DensityR;    // .w = MC density: smooth normal source
+Texture3D<float>  _PressureR;   // MGPCG solution; kinematic (m^2/s^2) assumed,
+                                // i.e. p already divided by rho -> a = -grad p
+
+// ===== params =====
+float  _WcGrowthRate;        // multiplies beta(k) = 3.6/k in the action source
+float  _WcDamping;           // exp(-_WcDamping * k * dt), WWP Lagrangian model
+float  _WcGStarFloor;        // clamp on g* (VEX: 0.1); paper allows < 0 (RTI)
+float  _WcMaxAge;            // seconds before cull (VEX ships 1.0 — aggressive)
+float  _WcMinSteepness;      // cull when age > 0.5 and A*k < this (VEX: 0.01*2pi)
+float  _WcUsePressureGravity; // 0 = finite-diff accel (VEX), 1 = -N.grad p (Eq. 26)
+float  _WcSeedRate;          // expected seeds per surface cell per unit G
+float  _WcGThreshold;        // discard seeds below this G (VEX: 0.02)
+float  _WcNoiseFloor;        // isotropic floor added to G (paper 4.3 heuristic)
+float  _WcCycles;            // curve length in wavelengths per side (VEX: 8)
+float  _WcLengthMult;        // artistic length scale
+float  _WcMarchRes;          // march step in world units (VEX: 0.05)
+float  _WcInitAction;        // birth action (VEX: 1e-4 * combined strength)
+float3 _WcBandLambdas;       // metres; paper uses 5 bands, this draft 3
+uint   _WcMaxPoints;         // capacity of the curve buffers
+uint   _WcMaxSeeds;
+uint   _WcSeedBudget;        // max curve births per frame; C# derives it from
+                             // segment size / worst-case points per curve
+uint   _WcSegBase;           // this frame's generation segment, in slots
+uint   _WcSegEnd;            // segment end (exclusive) — allocation limit
+int    _WcFrame;             // seed RNG salt
+
+// =============================================================================
+// helpers
+// =============================================================================
+
+// world -> volume uv, exactly FlipUtils' SampleGridXYZ convention (grid-local
+// coordinates: world = cell * cellSize, origin at the grid corner). All curve
+// points live in this frame — including the ribbon renderer's positions.
+float3 WcWorldToUv(float3 p) { return p * _InvCellSize / (float3)_GridSize; }
+
+float3 SampleVelAt(float3 p)
+{
+    return _VelocityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p), 0).xyz;
+}
+float SampleSdfAt(float3 p)
+{
+    return _GridSDFR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p), 0);
+}
+float SamplePressureAt(float3 p)
+{
+    return _PressureR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p), 0);
+}
+
+// outward normal from the density gradient (density falls off outward across
+// the iso). Smoother than the integer-SDF gradient by far — BandWaves made
+// this call first and it holds here.
+float3 DensityNormalOut(float3 p, float eps)
+{
+    float dl, dr;
+    float3 g;
+    dl = _DensityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p - float3(eps, 0, 0)), 0).w;
+    dr = _DensityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p + float3(eps, 0, 0)), 0).w;
+    g.x = dr - dl;
+    dl = _DensityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p - float3(0, eps, 0)), 0).w;
+    dr = _DensityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p + float3(0, eps, 0)), 0).w;
+    g.y = dr - dl;
+    dl = _DensityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p - float3(0, 0, eps)), 0).w;
+    dr = _DensityR.SampleLevel(my_linear_clamp_sampler, WcWorldToUv(p + float3(0, 0, eps)), 0).w;
+    g.z = dr - dl;
+    float gl = length(g);
+    return (gl > 1e-6) ? -g / gl : float3(0, 1, 0); // -grad = outward
+}
+
+// one Newton step onto the SDF zero level (BandWaves' projection; the SDF is
+// integer-valued so this is a band snap, not a polished closest point).
+float3 ProjectToSurface(float3 p, float3 nOut)
+{
+    return p + SampleSdfAt(p) * _CellSize * nOut;
+}
+
+float3 SamplePressureGrad(float3 p, float eps)
+{
+    float3 g;
+    g.x = SamplePressureAt(p + float3(eps, 0, 0)) - SamplePressureAt(p - float3(eps, 0, 0));
+    g.y = SamplePressureAt(p + float3(0, eps, 0)) - SamplePressureAt(p - float3(0, eps, 0));
+    g.z = SamplePressureAt(p + float3(0, 0, eps)) - SamplePressureAt(p - float3(0, 0, eps));
+    return g / (2.0 * eps);
+}
+
+// 3x3 grad U by central differences (VEX eps was a fixed 0.05; here half a
+// cell so the stencil follows the sim resolution).
+void SampleGradU(float3 p, float eps, out float3 colX, out float3 colY, out float3 colZ)
+{
+    colX = (SampleVelAt(p + float3(eps, 0, 0)) - SampleVelAt(p - float3(eps, 0, 0))) / (2 * eps);
+    colY = (SampleVelAt(p + float3(0, eps, 0)) - SampleVelAt(p - float3(0, eps, 0))) / (2 * eps);
+    colZ = (SampleVelAt(p + float3(0, 0, eps)) - SampleVelAt(p - float3(0, 0, eps))) / (2 * eps);
+}
+
+uint WcHash(uint s)
+{
+    s ^= 2747636419u; s *= 2654435769u;
+    s ^= s >> 15; s *= 2246822519u;
+    s ^= s >> 13; s *= 3266489917u;
+    s ^= s >> 16;
+    return s;
+}
+float WcRand(uint3 c, uint salt) { return (WcHash(c.x + 197u * c.y + 7907u * c.z + 104729u * salt) & 0x00ffffffu) / 16777216.0; }
+
+WaveCurvePoint WcDeadPoint()
+{
+    WaveCurvePoint o;
+    o.pos = 0; o.theta = 0; o.k = 0; o.action = 0;
+    o.age = 0; o.radius = 0; o.amp = 0; o.band = 0;
+    o.prevVel = 0; o.gStar = 0;
+    o.curveId = WC_DEAD_CURVE; o._pad0 = 0; o._pad1 = 0;
+    return o;
+}
+
+// =============================================================================
+// stage 0 — reset counters
+// =============================================================================
+
+[numthreads(1, 1, 1)]
+void WaveCurvesResetCounters(uint3 id : SV_DispatchThreadID)
+{
+    _WcSeedCountBuf[0] = 0; // seed count
+    _WcSeedCountBuf[1] = 0; // births this frame (budget)
+    _WcSeedCountBuf[2] = 0; // segment alloc cursor
+}
+
+// =============================================================================
+// stage 1 — seeding analysis (reduced Eq. 20 + eigvec of D, paper 4.3)
+//
+// Runs on texel space like BandWaveStep: gradient stencils are texel offsets,
+// only the emitted seed position converts to world. k_hat comes from the most
+// negative eigenvalue of the tangent-projected D (2x2 closed form, same as
+// the VEX's horizontal 2x2 but on the surface's own tangent plane).
+// =============================================================================
+
+[numthreads(8, 8, 8)]
+void WaveCurvesScatterSeeds(uint3 id : SV_DispatchThreadID)
+{
+    float d = _GridSDFR[id];
+    if (d < -1.0 || d > 1.0) return; // surface layer only
+
+    float3 p = ((float3)id + 0.5) * _CellSize;
+    float3 nOut = DensityNormalOut(p, _CellSize);
+
+    // grad U columns at texel resolution
+    float eps = _CellSize;
+    float3 colX, colY, colZ;
+    SampleGradU(p, eps, colX, colY, colZ);
+    // D = sym(grad U)
+    float3 dx = 0.5 * (colX + float3(colX.x, colY.x, colZ.x));
+    float3 dy = 0.5 * (colY + float3(colX.y, colY.y, colZ.y));
+    float3 dz = 0.5 * (colZ + float3(colX.z, colY.z, colZ.z));
+
+    // tangent basis
+    float3 t1 = normalize(cross(nOut, (abs(nOut.y) < 0.9) ? float3(0, 1, 0) : float3(1, 0, 0)));
+    float3 t2 = cross(nOut, t1);
+
+    // 2x2 Dt = T^T D T
+    float a = dot(t1, float3(dot(dx, t1), dot(dy, t1), dot(dz, t1)));
+    float b = 0.5 * (dot(t1, float3(dot(dx, t2), dot(dy, t2), dot(dz, t2)))
+                   + dot(t2, float3(dot(dx, t1), dot(dy, t1), dot(dz, t1))));
+    float c = dot(t2, float3(dot(dx, t2), dot(dy, t2), dot(dz, t2)));
+
+    float tr = a + c, det = a * c - b * b;
+    float disc = sqrt(max(0.25 * tr * tr - det, 0.0));
+    float lamNeg = 0.5 * tr - disc; // most negative = fastest compression
+
+    float2 e = (abs(b) > 1e-6) ? normalize(float2(lamNeg - c, b)) : ((a < c) ? float2(1, 0) : float2(0, 1));
+    float3 kHat = normalize(e.x * t1 + e.y * t2);
+
+    // reduced growth-rate density: horizontal divergence compression + noise
+    // floor (paper's "small constant isotropic term", 4.3)
+    float divH = colX.x + colY.y; // du/dx + dv/dy, VEX parity
+    float G = max(-divH, 0.0) + _WcNoiseFloor * WcRand(id, (uint)_WcFrame);
+    if (G < _WcGThreshold) return;
+
+    // Poisson-style emission: P(seed) grows with G; round-robin bands per cell
+    if (WcRand(id, (uint)_WcFrame + 1u) > _WcSeedRate * G) return;
+
+    uint slot;
+    InterlockedAdd(_WcSeedCountBuf[0], 1u, slot);
+    if (slot >= _WcMaxSeeds) return;
+
+    WaveSeed s;
+    s.pos = ProjectToSurface(p, nOut);
+    s.G = G;
+    s.normal = nOut;
+    s.band = (float)(WcRand(id, 7u) * 3.0); // floor at consumption
+    s.kHat = kHat;
+    s.vel = _VelocityR[id].xyz;
+    s.pad0 = s.pad1 = 0;
+    _WcSeeds[slot] = s;
+}
+
+// =============================================================================
+// stage 2 — evolve (Eqs. 13-17, Appendix C, cull rules)
+//
+// IN PLACE over the FULL capacity: slot i reads from the read buffer and
+// writes slot i of the write buffer — a survivor or a dead marker, so the
+// buffers stay coherent and curve runs never reshuffle. Markers pass through
+// (their age stays 0, cost is one read + one write).
+// =============================================================================
+
+[numthreads(128, 1, 1)]
+void WaveCurvesEvolve(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _WcMaxPoints) return;
+    WaveCurvePoint pt = _WcCurveR[id.x];
+
+    // markers pass through (k = 0 is their signature); a live point whose k
+    // collapsed under noisy grad U is a dead wave — write it a marker too,
+    // otherwise it freezes in place (age stuck, never culled) until the
+    // generation ring recycles its slot
+    float kLen = length(pt.k);
+    if (kLen < 0.001)
+    {
+        // ternary can't return a struct on d3d11 — explicit write
+        if (pt.curveId != WC_DEAD_CURVE) _WcCurveW[id.x] = WcDeadPoint();
+        else _WcCurveW[id.x] = pt;
+        return;
+    }
+    float3 kHat = pt.k / kLen;
+    float3 nOut = DensityNormalOut(pt.pos, _CellSize);
+    float3 U = SampleVelAt(pt.pos);
+
+    // --- effective gravity (Eq. 13). Route A: a = -grad p (Eq. 26; pressure
+    // assumed kinematic). Route B: finite-difference U (VEX). ---
+    float3 accel;
+    if (_WcUsePressureGravity > 0.5)
+        accel = -SamplePressureGrad(pt.pos, _CellSize);
+    else
+        accel = (U - pt.prevVel) / max(_DeltaTime, 1e-5);
+
+    float gStar = -dot(nOut, float3(0, -9.81, 0) - accel);
+    gStar = max(gStar, _WcGStarFloor);
+    pt.gStar = gStar;
+
+    // --- dispersion (Eq. 14) and group speed ---
+    float Omega = sqrt(max((gStar + WC_GAMMA_RHO * kLen * kLen) * kLen, 1e-12));
+    float dOmegaDk = (gStar + 3.0 * WC_GAMMA_RHO * kLen * kLen) / max(2.0 * Omega, 1e-6);
+    float3 cg = dOmegaDk * kHat;
+
+    // --- grad U ---
+    float3 colX, colY, colZ;
+    SampleGradU(pt.pos, 0.5 * _CellSize, colX, colY, colZ);
+    float3 gradUTk = float3(dot(colX, pt.k), dot(colY, pt.k), dot(colZ, pt.k));
+
+    // --- forward Euler (Eqs. 15-17) ---
+    float3 pos = pt.pos + (U + cg) * _DeltaTime;
+    float3 kNew = pt.k - gradUTk * _DeltaTime;
+#ifdef WC_GSTAR_GRADIENT
+    // dOmega/dg* = k / (2 Omega). g* differenced half a cell apart along the
+    // normal (tangential variation rides in through the tangent projection
+    // of kNew below). Requires the pressure route for a stable g* sample.
+    float3 gVec = float3(0, -9.81, 0);
+    float gAtPos = -dot(nOut, gVec + SamplePressureGrad(pos, _CellSize));
+    float3 nFar = DensityNormalOut(pos + nOut * _CellSize, _CellSize);
+    float gFar = -dot(nFar, gVec + SamplePressureGrad(pos + nOut * _CellSize, _CellSize));
+    float3 gradG = ((gFar - gAtPos) / _CellSize) * nOut;
+    kNew -= (kLen / max(2.0 * Omega, 1e-6)) * gradG * _DeltaTime;
+#endif
+
+    // stay on the surface, stay tangent
+    nOut = DensityNormalOut(pos, _CellSize);
+    pos = ProjectToSurface(pos, nOut);
+    kNew -= dot(kNew, nOut) * nOut;
+
+    // left the box or lost the surface band: cull. Border-clamped sampling
+    // would otherwise keep outside points alive forever on a stale normal —
+    // past the edge the SDF sample freezes at the border texel, so the
+    // projection has nothing to pull the point back with (this is the
+    // "lines spill outside the domain" bug)
+    float3 domainMax = (float3)_GridSize * _CellSize;
+    if (any(pos < float3(0, 0, 0)) || any(pos > domainMax)
+        || abs(SampleSdfAt(pos)) > 2.0)
+    {
+        _WcCurveW[id.x] = WcDeadPoint();
+        return;
+    }
+
+    float theta = pt.theta + (-Omega + dot(cg, pt.k)) * _DeltaTime;
+
+    // --- action: source beta(k) = 3.6/k (4.3) + WWP damping, then Eq. 10 ---
+    pt.age += _DeltaTime;
+    float fadeIn = saturate(pt.age / 0.5);
+    float action = pt.action + (3.6 / max(kLen, 0.001)) * _WcGrowthRate * _DeltaTime;
+    action *= exp(-_WcDamping * kLen * _DeltaTime);
+    float amp = sqrt(max(action * 2.0 * Omega / max(kLen, 0.001), 0.0)) * fadeIn;
+
+    // --- steepness clamp (Appendix C, 0.7) ---
+    float steep = amp * kLen;
+    if (steep > 0.7)
+    {
+        amp = 0.7 / kLen;
+        action = amp * amp * kLen / max(2.0 * Omega, 1e-6);
+    }
+
+    // --- cull rules (VEX): age, steepness after fade-in, near-vertical wall ---
+    if (pt.age > _WcMaxAge) { _WcCurveW[id.x] = WcDeadPoint(); return; }
+    if (pt.age > 0.5 && steep < _WcMinSteepness) { _WcCurveW[id.x] = WcDeadPoint(); return; }
+    if (abs(nOut.y) < 0.2) { _WcCurveW[id.x] = WcDeadPoint(); return; }
+
+    WaveCurvePoint o;
+    o.pos = pos; o.theta = theta; o.k = kNew; o.action = action;
+    o.age = pt.age; o.radius = pt.radius; o.amp = amp; o.band = pt.band;
+    o.prevVel = U; o.gStar = gStar;
+    o.curveId = pt.curveId; o._pad0 = 0; o._pad1 = 0;
+
+    _WcCurveW[id.x] = o;
+}
+
+// =============================================================================
+// stage 3 — curve generation (Eq. 27 geodesic march, VEX parity at alpha = 0)
+//
+// One thread per seed. The WHOLE curve (both side runs + centre) is one
+// contiguous reservation: per-point InterlockedAdd interleaves concurrent
+// curves into fragments, and the ribbon renderer needs each run contiguous.
+// Slots the march does not reach (early surface break) stay dead markers.
+// March step projects onto the surface and re-derives the direction from the
+// LOCAL normal every step (cross(nOut, kHat) sign-preserved), so the curve
+// bends with the surface instead of leaving it.
+// =============================================================================
+
+[numthreads(64, 1, 1)]
+void WaveCurvesGenerate(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= min(_WcSeedCount, (int)_WcMaxSeeds)) return;
+
+    // birth budget as RANDOM thinning, not an index-order race: an atomic
+    // race picks whichever threads execute first = a scan-ordered slab of
+    // surface cells, concentrating every curve on one side of the domain.
+    // Hash-based thinning keeps the survivors spatially uniform; the
+    // segment-end guard below absorbs the binomial overshoot.
+    float budgetProb = saturate((float)_WcSeedBudget / max(_WcSeedCount, 1));
+    if (WcRand(uint3(id.x, (uint)_WcFrame, 777u), 1234567u) > budgetProb) return;
+
+    // births counter is diagnostics only (1 Hz poll on the C# side)
+    InterlockedAdd(_WcSeedCountBuf[1], 1u);
+
+    WaveSeed s = _WcSeeds[id.x];
+
+    uint bandIdx = (uint)clamp(floor(s.band), 0.0, 2.0);
+    float lambda = _WcBandLambdas[bandIdx];
+    float kMag = 2.0 * PI / max(lambda, 1e-4);
+    float radius = 2.0 * lambda;
+
+    float sideLen = lambda * _WcCycles * _WcLengthMult;
+    int steps = (int)max(sideLen / max(_WcMarchRes, 1e-4), 4.0);
+
+    // curve strength: seed G relative to nothing here (no scene-wide max on
+    // GPU without a reduction — TODO if curves look uniformly weak/strong)
+    float combined = 1.0;
+
+    uint total = (uint)(2 * steps + 1);
+    uint cursor;
+    InterlockedAdd(_WcSeedCountBuf[2], total, cursor);
+    uint baseSlot = _WcSegBase + cursor;
+    if (baseSlot + total > _WcSegEnd) return; // whole curve dropped
+
+    // pre-fill the reservation with markers, overwrite live points after;
+    // side 0 owns [base, base+steps), side 1 [base+steps, base+2*steps),
+    // the seed centre takes the last slot
+    [loop]
+    for (uint f = 0; f < total; ++f)
+        _WcCurveW[baseSlot + f] = WcDeadPoint();
+
+    // frame-salted curve id — see the struct comment
+    uint cid = (uint)_WcFrame * _WcMaxSeeds * 4u + id.x * 4u;
+
+    [unroll]
+    for (int side = 0; side < 2; ++side)
+    {
+        float dirSign = (side == 0) ? -1.0 : 1.0;
+        float3 marchDir = cross(s.normal, s.kHat);
+        marchDir -= dot(marchDir, s.normal) * s.normal;
+        if (length(marchDir) < 1e-3) continue;
+        marchDir = normalize(marchDir) * dirSign;
+
+        float3 curPos = s.pos;
+        uint w = 0;
+        for (int i = 0; i < steps; ++i)
+        {
+            float3 nxt = curPos + marchDir * _WcMarchRes;
+            float3 nOut = DensityNormalOut(nxt, _CellSize);
+            nxt = ProjectToSurface(nxt, nOut);
+
+            float3 nd = cross(nOut, s.kHat);
+            nd -= dot(nd, nOut) * nOut;
+            if (length(nd) < 1e-3) break;
+            marchDir = normalize(nd) * dirSign;
+            curPos = nxt;
+
+            float t = (float)i / max((float)(steps - 1), 1.0);
+            float endFalloff = 1.0 - t;
+
+            WaveCurvePoint o = WcDeadPoint(); // zeros theta/amp/age/gStar
+            o.pos = curPos; o.k = s.kHat * kMag;
+            o.action = _WcInitAction * combined * endFalloff;
+            o.radius = radius; o.band = (float)bandIdx;
+            o.prevVel = s.vel;
+            o.curveId = cid + (uint)side;
+            _WcCurveW[baseSlot + (uint)side * (uint)steps + w] = o;
+            ++w;
+        }
+    }
+
+    // seed centre — its own curveId (+2) so the renderer does not chord it
+    // to either directional run's far end
+    WaveCurvePoint o = WcDeadPoint();
+    o.pos = s.pos; o.k = s.kHat * kMag;
+    o.action = _WcInitAction * combined;
+    o.radius = radius; o.band = (float)bandIdx;
+    o.prevVel = s.vel;
+    o.curveId = cid + 2u;
+    _WcCurveW[baseSlot + total - 1u] = o;
+}

@@ -2,6 +2,11 @@ Shader "ParticleRendering/ParticleInstance"
 {
     Properties
     {
+        _Radius ("Radius", Float) = 0.1
+        _VelocityRange ("Range", Vector) = (2,8,0,0)
+        _SlowColor ("_SlowColor", Color) = (1, 1, 1, 1)
+        _FastColor ("_FastColor", Color) = (1, 1, 1, 1)
+        _FresnelPower ("Fresnel Power", Float) = 1
     }
 
     SubShader

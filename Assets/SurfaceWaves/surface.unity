@@ -122,6 +122,114 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
+--- !u!1 &124971797
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 124971799}
+  - component: {fileID: 124971798}
+  m_Layer: 0
+  m_Name: GameObject (1)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &124971798
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 124971797}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 50008a5f345c5794d8b23c3113e96dd1, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  bandWavesCs: {fileID: 7200000, guid: be4c0d038f69b524382345fc4a447072, type: 3}
+  bandWaveSourceGain: 0.5
+  bandWaveBandMax: 4
+  bandWaveAirBand: 2
+  bandWaveDisplaceMesh: 1
+  bandWaveDisplaceScale: 0.26
+  bandWaveDisplaceNormalGain: 1
+  initCs: {fileID: 7200000, guid: 422e398747efe8443ae25b822342d12b, type: 3}
+  buildLutCs: {fileID: 7200000, guid: 33617cb477456e84abbd8fa816668ea1, type: 3}
+  splatP2GCs: {fileID: 7200000, guid: 9a0fe422cfb0abf42ba174299b7387a3, type: 3}
+  NBCs: {fileID: 7200000, guid: 2ddbcad5d4541254c9a007007bbf60af, type: 3}
+  JFACs: {fileID: 7200000, guid: 924262f5600572c4b9bc84b5eedde2e3, type: 3}
+  projectionCs: {fileID: 7200000, guid: 5107aea0fb96e8947937cfcf5620d5de, type: 3}
+  G2PCs: {fileID: 7200000, guid: 59ac626b26e2b9c4bbf52b926591dc04, type: 3}
+  countingSortCs: {fileID: 7200000, guid: d75f29bbac2feb94a95f2cc8e45a1b6f, type: 3}
+  mcCs: {fileID: 7200000, guid: cbefffa4c1505b54689332f612d627e6, type: 3}
+  solverCs: {fileID: 7200000, guid: 8fa57cc5d1843c941ac20f52df051f53, type: 3}
+  damping: 0.6667
+  flipness: 0.99
+  mouseForce: 0.27
+  mouseForceRange: 2
+  threshold: 1
+  drawBaseParticles: 0
+  drawType: 0
+  surfaceDetail: 3
+  meshMat: {fileID: 2100000, guid: d47ff4db7d92dd746a90c7e7558c6a35, type: 2}
+  digitMat: {fileID: 2100000, guid: a26dfe4acedb8504a9e77fee932f8775, type: 2}
+  surfaceTurbulenceCs: {fileID: 7200000, guid: bf306558399182641bab71b6ff9fd902, type: 3}
+  deviceRadixSortCs: {fileID: 7200000, guid: 4fcc53129daad234eaadc315481517f8, type: 3}
+  prefixScanCs: {fileID: 7200000, guid: b0ad1154dc9cf0e40b1575d58449ff62, type: 3}
+  drawSurfacePoints: 1
+  pollDiagnostics: 1
+  outerRadius: 0.2
+  surfaceDensity: 20
+  nbSurfaceMaintenanceIterations: 1
+  enableDensityThinning: 1
+  waveSpeed: 1.5
+  waveDamping: 0.05
+  waveSeedFrequency: 4
+  waveMaxAmplitude: 0.4
+  waveMaxFrequency: 100
+  waveMaxSeedingAmplitude: 0.4
+  waveSeedingCurvatureThresholdRegionCenter: 0.01
+  waveSeedingCurvatureThresholdRegionRadius: 0.01
+  waveSeedStepSizeRatioOfMax: 0.01
+  maxSurfacePoints: 1024000
+  surfaceMemoryBudgetMB: 512
+  waveCurvesCs: {fileID: 7200000, guid: 942922b1a1e8dc14a97d6384245f3366, type: 3}
+  waveCurveGrowthRate: 0.01
+  waveCurveDamping: 0.0001
+  waveCurveMaxAge: 8
+  waveCurveGStarFloor: 0.1
+  waveCurveUsePressureGravity: 0
+  waveCurveBandLambdas: {x: 0.2, y: 0.1, z: 0.05}
+  waveCurveCycles: 128
+  waveCurveMarchRes: 0.1
+  waveCurveInitAction: 0.0001
+  waveCurveSeedRate: 1
+  waveCurveGThreshold: 0.05
+  waveCurveNoiseFloor: 0.02
+  waveCurveLineWidth: 0.02
+  waveCurveAmpGain: 3
+  waveCurveMaxPoints: 1280000
+  waveCurveMaxSeeds: 131072
+--- !u!4 &124971799
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 124971797}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 25.6, y: 12.8, z: 12.8}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &638668128
 GameObject:
   m_ObjectHideFlags: 0
@@ -138,7 +246,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &638668129
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -315,6 +423,7 @@ GameObject:
   - component: {fileID: 2113729194}
   - component: {fileID: 2113729193}
   - component: {fileID: 2113729196}
+  - component: {fileID: 2113729197}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -419,8 +528,8 @@ MonoBehaviour:
     m_Bits: 1
   m_VolumeTrigger: {fileID: 0}
   m_VolumeFrameworkUpdateModeOption: 2
-  m_RenderPostProcessing: 0
-  m_Antialiasing: 0
+  m_RenderPostProcessing: 1
+  m_Antialiasing: 3
   m_AntialiasingQuality: 2
   m_StopNaN: 0
   m_Dithering: 0
@@ -440,6 +549,23 @@ MonoBehaviour:
     m_MipBias: 0
     m_VarianceClampScale: 0.9
     m_ContrastAdaptiveSharpening: 0
+--- !u!114 &2113729197
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2113729192}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 728fe81bb13dde042af47c7a64de78dd, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  _rotationSensitivity: 5
+  _upDownSensitivity: 0.5
+  _zoomWheelSensitivity: 12
+  _zoomMiddleClickSensitivity: 1
+  target: {fileID: 124971799}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -447,3 +573,4 @@ SceneRoots:
   - {fileID: 2113729195}
   - {fileID: 1635263409}
   - {fileID: 638668130}
+  - {fileID: 124971799}

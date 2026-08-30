@@ -804,14 +804,23 @@ namespace SurfaceWaves
 
             public void Execute(int i)
             {
-                if (SurfAlive[i] == 0) return;
+                // This job owns the reset: initialize the flag here so the serial cascade in
+                // AddDeleteSurfacePointsJob runs against these results instead of re-resetting
+                // SurfAlive (which previously discarded every deletion marked below).
+                SurfAlive[i] = 1;
                 if (!HasCoarseNeighbor(SurfPos[i], 2f * OuterRadius, CoarseHead, CoarseNext, CoarsePos))
                 {
                     SurfAlive[i] = 0;
                     return;
                 }
                 float level = ConstraintLevel(CoarsePos, CoarseHead, CoarseNext, SurfPos[i], OuterRadius, InnerRadius, ConstraintA);
-                if (level < -0.2f || level > 1.2f) SurfAlive[i] = 0;
+                // Only the outward ("too far from surface") side is used here. The inward
+                // side (level < -0.2) is intentionally dropped: in this 2D narrow-band setup
+                // surface points sit ~0.75 from the nearest boundary-cell particles, so the
+                // Gaussian sum saturates lvl > 1 -> level == -1.0 for EVERY surface point,
+                // which made "level < -0.2" delete the whole surface. Deep-interior removal is
+                // already covered by the SDF-based deepInterior check in the serial cascade.
+                if (level > 1.2f) SurfAlive[i] = 0;
             }
         }
 
@@ -843,10 +852,13 @@ namespace SurfaceWaves
             {
                 int n = SurfCount.Value;
 
-                // Phase 2a: mark deletions (domain + density clustering, must be sequential for cascade)
-                for (int i = 0; i < n; i++) SurfAlive[i] = 1;
+                // Phase 2a: mark deletions (domain + density clustering, must be sequential for cascade).
+                // SurfAlive is initialized by MarkDeletionsParallelJob; points already killed there
+                // (coarse-neighbor / constraint-level checks) are skipped so they don't rejoin the
+                // density clustering and pollute HasLiveNeighborOtherF2's cascade semantics.
                 for (int i = 0; i < n; i++)
                 {
+                    if (SurfAlive[i] == 0) continue;
                     float2 pos = SurfPos[i];
                     bool deepInterior = ReadGrid(GetCoord(pos), GridSDF) >= Band2;
                     bool kill = deepInterior || !IsInDomain(pos, DomainMin, DomainMax) ||
@@ -1185,6 +1197,8 @@ namespace SurfaceWaves
             [ReadOnly] public NativeArray<int> SurfHead;
             [ReadOnly] public NativeArray<int> SurfNext;
             public float TangentRadius;
+            public float2 DomainMin;
+            public float2 DomainMax;
             [WriteOnly] public NativeArray<float> Slope;
 
             public void Execute(int idx)
@@ -1202,20 +1216,43 @@ namespace SurfaceWaves
                     int id = SurfHead[Coord2Idx(cx, cy)];
                     while (id >= 0)
                     {
-                        float2 off = SurfPos[id] - pos;
-                        float d = math.length(off);
-                        if (d <= TangentRadius)
-                        {
-                            float x = math.dot(off, t1);
-                            float z = SurfH[id];
-                            float w = WeightSurfaceTangent(d, TangentRadius);
-                            sw += w; swx += w * x; swx2 += w * x * x; swz += w * z; swxz += w * x * z;
-                        }
+                        float2 np = SurfPos[id];
+                        float h = SurfH[id];
+
+                        // Ghost/mirror reflections so the wave slope sees a reflecting wall
+                        // instead of a one-sided drop-off at the domain edge.
+                        if (np.x - DomainMin.x <= TangentRadius)
+                            Accumulate(new float2(2f * DomainMin.x - np.x, np.y), h, pos, t1, TangentRadius,
+                                ref sw, ref swx, ref swx2, ref swz, ref swxz);
+                        if (DomainMax.x - np.x <= TangentRadius)
+                            Accumulate(new float2(2f * DomainMax.x - np.x, np.y), h, pos, t1, TangentRadius,
+                                ref sw, ref swx, ref swx2, ref swz, ref swxz);
+                        if (np.y - DomainMin.y <= TangentRadius)
+                            Accumulate(new float2(np.x, 2f * DomainMin.y - np.y), h, pos, t1, TangentRadius,
+                                ref sw, ref swx, ref swx2, ref swz, ref swxz);
+                        if (DomainMax.y - np.y <= TangentRadius)
+                            Accumulate(new float2(np.x, 2f * DomainMax.y - np.y), h, pos, t1, TangentRadius,
+                                ref sw, ref swx, ref swx2, ref swz, ref swxz);
+                        Accumulate(np, h, pos, t1, TangentRadius, ref sw, ref swx, ref swx2, ref swz, ref swxz);
+
                         id = SurfNext[id];
                     }
                 }
                 float det = sw * swx2 - swx * swx;
                 Slope[idx] = math.abs(det) < 1e-6f ? 0f : (sw * swxz - swx * swz) / det;
+            }
+
+            private static void Accumulate(float2 gPos, float h, float2 pos, float2 t1, float tangentRadius,
+                ref float sw, ref float swx, ref float swx2, ref float swz, ref float swxz)
+            {
+                float2 off = gPos - pos;
+                float d = math.length(off);
+                if (d <= tangentRadius)
+                {
+                    float x = math.dot(off, t1);
+                    float w = WeightSurfaceTangent(d, tangentRadius);
+                    sw += w; swx += w * x; swx2 += w * x * x; swz += w * h; swxz += w * x * h;
+                }
             }
         }
 
@@ -1229,6 +1266,8 @@ namespace SurfaceWaves
             [ReadOnly] public NativeArray<int> SurfHead;
             [ReadOnly] public NativeArray<int> SurfNext;
             public float TangentRadius;
+            public float2 DomainMin;
+            public float2 DomainMax;
             [WriteOnly] public NativeArray<float> Laplacian;
 
             public void Execute(int idx)
@@ -1249,21 +1288,45 @@ namespace SurfaceWaves
                     int id = SurfHead[Coord2Idx(cx, cy)];
                     while (id >= 0)
                     {
-                        float2 dir = SurfPos[id] - pPos;
-                        float len = math.length(dir);
-                        if (len > 1e-5f)
-                        {
-                            float2 tangentDir = len * math.normalizesafe(dir - math.dot(dir, n) * n);
-                            float dirX = math.dot(tangentDir, t1);
-                            float dz = SurfH[id] - ph - slope * dirX;
-                            float w = WeightSurfaceTangent(len, TangentRadius);
-                            wTotal += w;
-                            laplacian += math.clamp(w * 4f * dz / (len * len), -100f, 100f);
-                        }
+                        float2 np = SurfPos[id];
+                        float h = SurfH[id];
+
+                        // Ghost/mirror reflections so the wave Laplacian sees a reflecting
+                        // wall instead of a one-sided drop-off at the domain edge.
+                        if (np.x - DomainMin.x <= TangentRadius)
+                            Accumulate(new float2(2f * DomainMin.x - np.x, np.y), h, pPos, n, t1, slope, ph, TangentRadius,
+                                ref laplacian, ref wTotal);
+                        if (DomainMax.x - np.x <= TangentRadius)
+                            Accumulate(new float2(2f * DomainMax.x - np.x, np.y), h, pPos, n, t1, slope, ph, TangentRadius,
+                                ref laplacian, ref wTotal);
+                        if (np.y - DomainMin.y <= TangentRadius)
+                            Accumulate(new float2(np.x, 2f * DomainMin.y - np.y), h, pPos, n, t1, slope, ph, TangentRadius,
+                                ref laplacian, ref wTotal);
+                        if (DomainMax.y - np.y <= TangentRadius)
+                            Accumulate(new float2(np.x, 2f * DomainMax.y - np.y), h, pPos, n, t1, slope, ph, TangentRadius,
+                                ref laplacian, ref wTotal);
+                        Accumulate(np, h, pPos, n, t1, slope, ph, TangentRadius, ref laplacian, ref wTotal);
+
                         id = SurfNext[id];
                     }
                 }
                 Laplacian[idx] = wTotal > 0f ? laplacian / wTotal : 0f;
+            }
+
+            private static void Accumulate(float2 gPos, float h, float2 pPos, float2 n, float2 t1, float slope, float ph,
+                float tangentRadius, ref float laplacian, ref float wTotal)
+            {
+                float2 dir = gPos - pPos;
+                float len = math.length(dir);
+                if (len > 1e-5f)
+                {
+                    float2 tangentDir = len * math.normalizesafe(dir - math.dot(dir, n) * n);
+                    float dirX = math.dot(tangentDir, t1);
+                    float dz = h - ph - slope * dirX;
+                    float w = WeightSurfaceTangent(len, tangentRadius);
+                    wTotal += w;
+                    laplacian += math.clamp(w * 4f * dz / (len * len), -100f, 100f);
+                }
             }
         }
 
@@ -1681,6 +1744,8 @@ namespace SurfaceWaves
                 SurfHead = _surfHead,
                 SurfNext = _surfNext,
                 TangentRadius = _tangentRadius,
+                DomainMin = _domainMin,
+                DomainMax = _domainMax,
                 Slope = _surfWaveSlope,
             }.Schedule(_surfCount.Value, 64).Complete();
 

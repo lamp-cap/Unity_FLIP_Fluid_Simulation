@@ -241,6 +241,68 @@ MonoBehaviour:
   m_LightCookieSize: {x: 1, y: 1}
   m_LightCookieOffset: {x: 0, y: 0}
   m_SoftShadowQuality: 0
+--- !u!1 &698787111
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 698787113}
+  - component: {fileID: 698787112}
+  m_Layer: 0
+  m_Name: GameObject (3)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &698787112
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 698787111}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ad46c21ab87c0b2428b0cd97a1b412b8, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  gravity: -9
+  flipness: 0.99
+  mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
+  mat: {fileID: 2100000, guid: 878651dacc481f54da85c4070620f1f6, type: 2}
+  outerRadius: 0.5
+  surfaceDensity: 30
+  nbSurfaceMaintenanceIterations: 5
+  waveSpeed: 7
+  waveDamping: 0.5
+  waveSeedFrequency: 5
+  waveMaxAmplitude: 0.4
+  waveMaxFrequency: 80
+  waveMaxSeedingAmplitude: 0.25
+  waveSeedingCurvatureThresholdRegionCenter: 0.005
+  waveSeedingCurvatureThresholdRegionRadius: 0.01
+  waveSeedStepSizeRatioOfMax: 0.05
+  surfMat: {fileID: 2100000, guid: 77a7cbeef053af649b718c67584bebdf, type: 2}
+  drawSurfaceGizmos: 1
+--- !u!4 &698787113
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 698787111}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 6.6366305, y: 5.468906, z: 1.1433594}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &753355350
 GameObject:
   m_ObjectHideFlags: 0
@@ -633,13 +695,14 @@ GameObject:
   - component: {fileID: 1848604089}
   - component: {fileID: 1848604088}
   - component: {fileID: 1848604090}
+  - component: {fileID: 1848604091}
   m_Layer: 0
   m_Name: GameObject (1)
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &1848604088
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -647,7 +710,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1848604087}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 51bc1325b5f15674da74c004228d182b, type: 3}
   m_Name: 
@@ -676,14 +739,31 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1848604087}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 452b10b12d65afa429a2b2044ce86c4a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
   solverType: 2
-  gravity: -9
+  iterations: 19
+  gravity: -6.56
   flipness: 0.95
+  mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
+  mat: {fileID: 2100000, guid: e18c57763f7bbce4e91ebffe70bc613b, type: 2}
+--- !u!114 &1848604091
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1848604087}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e48ac02686340574083101dc0c24a51c, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  gravity: -9
+  flipness: 0.99
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: e18c57763f7bbce4e91ebffe70bc613b, type: 2}
 --- !u!1 &1985490831
@@ -866,3 +946,4 @@ SceneRoots:
   - {fileID: 1081869980}
   - {fileID: 1115696561}
   - {fileID: 1848604089}
+  - {fileID: 698787113}
