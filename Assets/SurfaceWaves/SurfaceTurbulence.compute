@@ -17,7 +17,6 @@
 #pragma kernel ComputeSurfaceNormals
 #pragma kernel ComputeAveragedNormals
 #pragma kernel AssignNormals
-#pragma kernel ComputeSurfaceDensities
 #pragma kernel ComputeSurfaceDisplacements
 #pragma kernel ApplySurfaceDisplacements
 #pragma kernel ConstrainSurface
@@ -36,8 +35,7 @@
 #pragma kernel ClearSurfaceStatus
 #pragma kernel WriteSurfaceDispatchArgs
 #pragma kernel AddSeed
-#pragma kernel ComputeSurfaceWaveNormal
-#pragma kernel ComputeSurfaceWaveLaplacians
+#pragma kernel ComputeSurfaceWaveNormalLaplacian
 #pragma kernel EvolveWave
 #pragma kernel ComputeSurfaceCurvature
 #pragma kernel SmoothCurvature
@@ -197,13 +195,29 @@ void InitSurfacePoints(uint3 id : SV_DispatchThreadID)
 
             // valid: no OTHER coarse particle within outerRadius of the candidate
             bool valid = true;
-            LOOP_COARSE_NEIGHBORS_BEGIN(position, 2.0 * _OuterRadius)
-                if ((uint)idn != id.x && dot(npos - position, npos - position) < outerRadius2)
+            // Expanded from LOOP_COARSE_NEIGHBORS_BEGIN(position, 2.0 * _OuterRadius).
+            // Current-position buckets: padded by COARSE_CELL_PAD cells because a
+            // particle may have drifted out of the cell it was bucketed in.
+            {
+                int3 minCell = max((int3)floor((position - 2.0 * _OuterRadius) * _InvCellSize) - COARSE_CELL_PAD, int3(0, 0, 0));
+                int3 maxCell = min((int3)floor((position + 2.0 * _OuterRadius) * _InvCellSize) + COARSE_CELL_PAD, _GridSize - int3(1, 1, 1));
+                for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+                for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+                for (int cx = minCell.x; cx <= maxCell.x; ++cx)
                 {
-                    valid = false;
-                    break;
+                    uint2 rng = _CoarseRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+                    for (uint pid = rng.x; pid < rng.y; ++pid)
+                    {
+                        int idn = (int)pid;
+                        float3 npos = DecodePosition(_CoarseParticles[idn].packedPosition);
+                        if ((uint)idn != id.x && dot(npos - position, npos - position) < outerRadius2)
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
                 }
-            LOOP_COARSE_NEIGHBORS_END
+            }
             if (!valid)
             {
                 InterlockedAdd(_SeedReject[2], 1);
@@ -238,13 +252,30 @@ void AdvectSurfacePoints(uint idx : SV_DispatchThreadID)
     float totalWeight = 0.0;
     float3 p = _SurfacePos[idx];
 
-    LOOP_COARSE_PREV_NEIGHBORS_BEGIN(p, 2.0 * _OuterRadius)
-        float3 disp = curPos - prevPos;
-        float distance = length(prevPos - p);
-        float w = WeightAdvection(distance);
-        avgDisplacement += w * disp;
-        totalWeight += w;
-    LOOP_COARSE_PREV_NEIGHBORS_END
+    // Expanded from LOOP_COARSE_PREV_NEIGHBORS_BEGIN(p, 2.0 * _OuterRadius):
+    // sweep the cell neighborhood of p, then every particle in each cell's
+    // prev-frame bucket. Bucketed on the snapshot layout, which is exactly what
+    // prevPos lives in, so no cell padding is needed here.
+    {
+        int3 minCell = max((int3)floor((p - 1.3 * _OuterRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((p + 1.3 * _OuterRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _CoarsePrevRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                float3 curPos = DecodePosition(_CoarseParticles[pid].packedPosition);
+                float3 prevPos = DecodePosition(_CoarsePrevParticles[pid].packedPosition);
+                float3 disp = curPos - prevPos;
+                float distance = length(prevPos - p);
+                float w = WeightAdvection(distance);
+                avgDisplacement += w * disp;
+                totalWeight += w;
+            }
+        }
+    }
 
     if (totalWeight != 0.0) avgDisplacement /= totalWeight;
     _SurfacePos[idx] = p + avgDisplacement;
@@ -265,28 +296,61 @@ void ComputeSurfaceNormals(uint idx : SV_DispatchThreadID)
     GetTangentFrame(n, t1, t2);
 
     float sw = 0, swx = 0, swy = 0, swxy = 0, swx2 = 0, swy2 = 0, swxz = 0, swyz = 0, swz = 0;
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
-        LOOP_GHOSTS_POS_BEGIN(npos, _NormalRadius)
-            float x = dot(gPos - pos, t1);
-            float y = dot(gPos - pos, t2);
-            float z = dot(gPos - pos, n);
-            float w = WeightSurfaceNormal(length(pos - gPos));
-            swx2 += w * x * x;
-            swy2 += w * y * y;
-            swxy += w * x * y;
-            swxz += w * x * z;
-            swyz += w * y * z;
-            swx  += w * x;
-            swy  += w * y;
-            swz  += w * z;
-            sw   += w;
-        LOOP_GHOSTS_END
-    LOOP_SURFACE_NEIGHBORS_END
+    // Expanded from LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius) wrapping
+    // LOOP_GHOSTS_POS_BEGIN(npos, _NormalRadius): per live surface point, emit its
+    // mirrored copies within _NormalRadius of a domain boundary (gf = 0..5), then
+    // the real position (gf = 6).
+    {
+        int3 minCell = max((int3)floor((pos - _NormalRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + _NormalRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    int gf = -1;
+                    float3 gPos;
+                    while (gf < 6)
+                    {
+                        if (gf < 0 && npos.x - _BndMin.x <= _NormalRadius) { gf = 0; gPos = float3(2.0 * _BndMin.x - npos.x, npos.y, npos.z); }
+                        else if (gf < 1 && _BndMax.x - npos.x <= _NormalRadius) { gf = 1; gPos = float3(2.0 * _BndMax.x - npos.x, npos.y, npos.z); }
+                        else if (gf < 2 && npos.y - _BndMin.y <= _NormalRadius) { gf = 2; gPos = float3(npos.x, 2.0 * _BndMin.y - npos.y, npos.z); }
+                        else if (gf < 3 && _BndMax.y - npos.y <= _NormalRadius) { gf = 3; gPos = float3(npos.x, 2.0 * _BndMax.y - npos.y, npos.z); }
+                        else if (gf < 4 && npos.z - _BndMin.z <= _NormalRadius) { gf = 4; gPos = float3(npos.x, npos.y, 2.0 * _BndMin.z - npos.z); }
+                        else if (gf < 5 && _BndMax.z - npos.z <= _NormalRadius) { gf = 5; gPos = float3(npos.x, npos.y, 2.0 * _BndMax.z - npos.z); }
+                        else { gf = 6; gPos = npos; }
+
+                        float x = dot(gPos - pos, t1);
+                        float y = dot(gPos - pos, t2);
+                        float z = dot(gPos - pos, n);
+                        float w = WeightSurfaceNormal(length(pos - gPos));
+                        swx2 += w * x * x;
+                        swy2 += w * y * y;
+                        swxy += w * x * y;
+                        swxz += w * x * z;
+                        swyz += w * y * z;
+                        swx  += w * x;
+                        swy  += w * y;
+                        swz  += w * z;
+                        sw   += w;
+                    }
+                }
+            }
+        }
+    }
 
     float det = -sw * swxy * swxy + 2.0 * swx * swxy * swy - swx2 * swy * swy
               - swx * swx * swy2 + sw * swx2 * swy2;
     if (det == 0.0)
     {
+        // Density stays valid on a degenerate fit: it is just the weight sum.
+        _TempFloat[idx] = sw;
         _SurfaceNormal[idx] = float3(0, 0, 0);
         return;
     }
@@ -299,6 +363,13 @@ void ComputeSurfaceNormals(uint idx : SV_DispatchThreadID)
     float3 normal = -SafeNormalize(t1 * abc.x + t2 * abc.y - n);
     if (dot(gradient, normal) < 0.0) normal = -normal;
     _SurfaceNormal[idx] = normal;
+
+    // Density rides along: `sw` sums WeightSurfaceNormal(|pos - gPos|) over the
+    // exact ghost-expanded neighbourhood the old ComputeSurfaceDensities
+    // kernel walked as its own pass, so that sweep is gone. _TempFloat keeps
+    // the old producer/consumer timing (read by MarkDeletionsDensity next
+    // maintenance iteration).
+    _TempFloat[idx] = sw;
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
@@ -307,10 +378,27 @@ void ComputeAveragedNormals(uint idx : SV_DispatchThreadID)
     if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
     float3 pos = _SurfacePos[idx];
     float3 newNormal = float3(0, 0, 0);
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
-        float w = WeightSurfaceNormal(length(pos - npos));
-        newNormal += w * _SurfaceNormal[idn];
-    LOOP_SURFACE_NEIGHBORS_END
+    // LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius), expanded.
+    {
+        int3 minCell = max((int3)floor((pos - _NormalRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + _NormalRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    float w = WeightSurfaceNormal(length(pos - npos));
+                    newNormal += w * _SurfaceNormal[idn];
+                }
+            }
+        }
+    }
     _TempVec3[idx] = SafeNormalize(newNormal);
 }
 
@@ -322,19 +410,37 @@ void AssignNormals(uint idx : SV_DispatchThreadID)
 }
 
 // ===== regularization (C++ regularizeSurfacePoints) =====
+//
+// C++ computeSurfaceDensities used to be its own kernel here walking the same
+// normalRadius ghost neighbourhood as the normal fit; its sum is exactly the
+// fit's `sw` accumulator, so ComputeSurfaceNormals now writes it to
+// _TempFloat and the extra sweep is gone.
 
-[numthreads(GROUP_THREADS_X, 1, 1)]
-void ComputeSurfaceDensities(uint idx : SV_DispatchThreadID)
+// One neighbour copy's contribution to the regularization displacement.
+// Inlined at both call sites of ComputeSurfaceDisplacements: the ghost/mirror
+// machine and the ghost-free fast path. Early return == the C++ `continue`.
+void AccumulateDisplacement(uint idn, float3 gPos, float3 gNormal, float3 pos, float3 normal,
+                             inout float3 displacementNormal, inout float3 displacementTangent, inout float wTotal)
 {
-    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
-    float3 pos = _SurfacePos[idx];
-    float density = 0.0;
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
-        LOOP_GHOSTS_POS_BEGIN(npos, _NormalRadius)
-            density += WeightSurfaceNormal(length(pos - gPos));
-        LOOP_GHOSTS_END
-    LOOP_SURFACE_NEIGHBORS_END
-    _TempFloat[idx] = density;
+    // Density test first: skipped neighbours cost nothing below (the C++
+    // computed dir/dn/dt before its `continue`; moved up, same result).
+    float density = _TempFloat[idn];
+    if (density == 0.0) return;
+
+    float3 dir = pos - gPos;
+    float lengthDir = length(dir);
+    float3 dn = dot(dir, normal) * normal;
+    float3 dt = dir - dn;
+    float w = WeightSurfaceNormal(lengthDir) / density;
+
+    float3 crossVec = SafeNormalize(cross(normal, -dir));
+    float3 projectedNormal = SafeNormalize(gNormal - dot(crossVec, gNormal) * crossVec);
+    if (dot(projectedNormal, normal) < 0.0 || abs(dot(normal, normal + projectedNormal)) < 1e-6) return;
+    dn = -dot(normal + projectedNormal, dir) / dot(normal, normal + projectedNormal) * normal;
+
+    displacementNormal += w * dn;
+    displacementTangent += w * SafeNormalize(dt);
+    wTotal += w;
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
@@ -349,25 +455,75 @@ void ComputeSurfaceDisplacements(uint idx : SV_DispatchThreadID)
     float3 displacementTangent = float3(0, 0, 0);
     float wTotal = 0.0;
 
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius)
-        LOOP_GHOSTS_POS_NORMAL_BEGIN(npos, _SurfaceNormal[idn], _NormalRadius)
-            float3 dir = pos - gPos;
-            float lengthDir = length(dir);
-            float3 dn = dot(dir, normal) * normal;
-            float3 dt = dir - dn;
-            if (_TempFloat[idn] == 0.0) continue;
-            float w = WeightSurfaceNormal(lengthDir) / _TempFloat[idn];
+    // Expanded from LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _NormalRadius) wrapping
+    // LOOP_GHOSTS_POS_NORMAL_BEGIN(npos, _SurfaceNormal[idn], _NormalRadius):
+    // like the position ghosts, but each mirror also flips the copied normal on
+    // the mirrored axis.
+    {
+        int3 minCell = max((int3)floor((pos - _NormalRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + _NormalRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
 
-            float3 crossVec = SafeNormalize(cross(normal, -dir));
-            float3 projectedNormal = SafeNormalize(gNormal - dot(crossVec, gNormal) * crossVec);
-            if (dot(projectedNormal, normal) < 0.0 || abs(dot(normal, normal + projectedNormal)) < 1e-6) continue;
-            dn = -dot(normal + projectedNormal, dir) / dot(normal, normal + projectedNormal) * normal;
+        // Ghost-free fast path. A mirror exists only for a neighbour within
+        // _NormalRadius of a boundary — i.e. inside the outer world-space band
+        // [_BndMin, _BndMin + _NormalRadius] (resp. [_BndMax - _NormalRadius,
+        // _BndMax]). Every neighbour this scan can visit lives in cells
+        // [minCell, maxCell], whose world spans are [minCell*h, (maxCell+1)*h].
+        // When those spans clear the band on all six sides, no visited
+        // neighbour can have a mirror and the per-neighbour state machine
+        // would always emit exactly the real position/normal — so skip it.
+        // Boundary-adjacent points (where the grid clamp pins minCell to 0 /
+        // maxCell to _GridSize-1, i.e. the boundary itself) trip this the
+        // natural way and keep the machine. Conservative by construction: a
+        // false "no ghost" is impossible, a wasted machine pass is not.
+        bool anyGhost =
+            (float)minCell.x * _CellSize <= _BndMin.x + _NormalRadius ||
+            (float)(maxCell.x + 1) * _CellSize >= _BndMax.x - _NormalRadius ||
+            (float)minCell.y * _CellSize <= _BndMin.y + _NormalRadius ||
+            (float)(maxCell.y + 1) * _CellSize >= _BndMax.y - _NormalRadius ||
+            (float)minCell.z * _CellSize <= _BndMin.z + _NormalRadius ||
+            (float)(maxCell.z + 1) * _CellSize >= _BndMax.z - _NormalRadius;
 
-            displacementNormal += w * dn;
-            displacementTangent += w * SafeNormalize(dt);
-            wTotal += w;
-        LOOP_GHOSTS_END
-    LOOP_SURFACE_NEIGHBORS_END
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    float3 nNormal = _SurfaceNormal[idn];
+
+                    if (!anyGhost)
+                    {
+                        AccumulateDisplacement(idn, npos, nNormal, pos, normal,
+                                               displacementNormal, displacementTangent, wTotal);
+                    }
+                    else
+                    {
+                        int gf = -1;
+                        float3 gPos;
+                        float3 gNormal;
+                        while (gf < 6)
+                        {
+                            if (gf < 0 && npos.x - _BndMin.x <= _NormalRadius) { gf = 0; gPos = float3(2.0 * _BndMin.x - npos.x, npos.y, npos.z); gNormal = float3(-nNormal.x, nNormal.y, nNormal.z); }
+                            else if (gf < 1 && _BndMax.x - npos.x <= _NormalRadius) { gf = 1; gPos = float3(2.0 * _BndMax.x - npos.x, npos.y, npos.z); gNormal = float3(-nNormal.x, nNormal.y, nNormal.z); }
+                            else if (gf < 2 && npos.y - _BndMin.y <= _NormalRadius) { gf = 2; gPos = float3(npos.x, 2.0 * _BndMin.y - npos.y, npos.z); gNormal = float3(nNormal.x, -nNormal.y, nNormal.z); }
+                            else if (gf < 3 && _BndMax.y - npos.y <= _NormalRadius) { gf = 3; gPos = float3(npos.x, 2.0 * _BndMax.y - npos.y, npos.z); gNormal = float3(nNormal.x, -nNormal.y, nNormal.z); }
+                            else if (gf < 4 && npos.z - _BndMin.z <= _NormalRadius) { gf = 4; gPos = float3(npos.x, npos.y, 2.0 * _BndMin.z - npos.z); gNormal = float3(nNormal.x, nNormal.y, -nNormal.z); }
+                            else if (gf < 5 && _BndMax.z - npos.z <= _NormalRadius) { gf = 5; gPos = float3(npos.x, npos.y, 2.0 * _BndMax.z - npos.z); gNormal = float3(nNormal.x, nNormal.y, -nNormal.z); }
+                            else { gf = 6; gPos = npos; gNormal = nNormal; }
+
+                            AccumulateDisplacement(idn, gPos, gNormal, pos, normal,
+                                                   displacementNormal, displacementTangent, wTotal);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if (wTotal != 0.0)
     {
@@ -420,17 +576,34 @@ void InterpolateNewWaveData(uint idx : SV_DispatchThreadID)
     _SurfaceWaveSeedAmp[idx] = 0.0;
     float wTotal = 0.0;
 
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius)
-        if ((_SurfaceStatus[idn] & 1u) == 0)
+    // LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius), expanded.
+    {
+        int3 minCell = max((int3)floor((pos - _TangentRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + _TangentRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
         {
-            float w = WeightSurfaceTangent(length(pos - npos));
-            _SurfaceWaveH[idx] += w * _SurfaceWaveH[idn];
-            _SurfaceWaveDtH[idx] += w * _SurfaceWaveDtH[idn];
-            _SurfaceWaveSeed[idx] += w * _SurfaceWaveSeed[idn];
-            _SurfaceWaveSeedAmp[idx] += w * _SurfaceWaveSeedAmp[idn];
-            wTotal += w;
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    if ((_SurfaceStatus[idn] & 1u) == 0)
+                    {
+                        float w = WeightSurfaceTangent(length(pos - npos));
+                        _SurfaceWaveH[idx] += w * _SurfaceWaveH[idn];
+                        _SurfaceWaveDtH[idx] += w * _SurfaceWaveDtH[idn];
+                        _SurfaceWaveSeed[idx] += w * _SurfaceWaveSeed[idn];
+                        _SurfaceWaveSeedAmp[idx] += w * _SurfaceWaveSeedAmp[idn];
+                        wTotal += w;
+                    }
+                }
+            }
         }
-    LOOP_SURFACE_NEIGHBORS_END
+    }
 
     if (wTotal != 0.0)
     {
@@ -450,24 +623,48 @@ void ComputeAdditions(uint idx : SV_DispatchThreadID)
     _HasCandidate[idx] = 0;
 
     float3 pos = _SurfacePos[idx];
-    float3 gradient = ConstraintGradient(pos);
+    // Tangent frame for the candidate direction. Was ConstraintGradient(pos) —
+    // a full coarse-bucket sweep per point (~27 cells) just to orient a
+    // displacement of one mfd. _SurfaceNormal already carries the
+    // density-weighted blend of that same gradient from the normals pass one
+    // sub-step earlier, which the direction tolerates. Fall back to the sweep
+    // only while the normal is still unset (first pass after seeding).
+    float3 gradient = SafeNormalize(_SurfaceNormal[idx]);
+    if (all(gradient == float3(0, 0, 0))) gradient = ConstraintGradient(pos);
 
     float3 tangentDisplacement = float3(0, 0, 0);
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius)
-        if (idn != idx)
+    // LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius), expanded.
+    {
+        int3 minCell = max((int3)floor((pos - _TangentRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + _TangentRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
         {
-            float3 dir = pos - npos;
-            float lengthDir = length(dir);
-            if (lengthDir > 1e-8)
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
             {
-                dir /= lengthDir;
-                float3 dn = dot(dir, gradient) * gradient;
-                float3 dt = dir - dn;
-                float w = WeightSurfaceTangent(lengthDir);
-                tangentDisplacement += w * dt;
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    if (idn != idx)
+                    {
+                        float3 dir = pos - npos;
+                        float lengthDir = length(dir);
+                        if (lengthDir > 1e-8)
+                        {
+                            dir /= lengthDir;
+                            float3 dn = dot(dir, gradient) * gradient;
+                            float3 dt = dir - dn;
+                            float w = WeightSurfaceTangent(lengthDir);
+                            tangentDisplacement += w * dt;
+                        }
+                    }
+                }
             }
         }
-    LOOP_SURFACE_NEIGHBORS_END
+    }
 
     if (length(tangentDisplacement) != 0.0) tangentDisplacement = SafeNormalize(tangentDisplacement);
     float3 creationPos = pos + _MeanFineDistance * tangentDisplacement;
@@ -477,9 +674,26 @@ void ComputeAdditions(uint idx : SV_DispatchThreadID)
     if (IsInDomain(creationPos) && !IsDeepInterior(creationPos))
     {
         bool has = false;
-        LOOP_SURFACE_NEIGHBORS_BEGIN(creationPos, _MeanFineDistance - 1e-6)
-            if (length(npos - creationPos) <= _MeanFineDistance - 1e-6) { has = true; break; }
-        LOOP_SURFACE_NEIGHBORS_END
+        // LOOP_SURFACE_NEIGHBORS_BEGIN(creationPos, _MeanFineDistance - 1e-6), expanded.
+        {
+            int3 minCell = max((int3)floor((creationPos - (_MeanFineDistance - 1e-6)) * _InvCellSize), int3(0, 0, 0));
+            int3 maxCell = min((int3)floor((creationPos + (_MeanFineDistance - 1e-6)) * _InvCellSize), _GridSize - int3(1, 1, 1));
+            for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+            for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+            for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+            {
+                uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+                for (uint pid = rng.x; pid < rng.y; ++pid)
+                {
+                    int idn = _SurfaceID[pid];
+                    if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                    {
+                        float3 npos = _SurfacePos[idn];
+                        if (length(npos - creationPos) <= _MeanFineDistance - 1e-6) { has = true; break; }
+                    }
+                }
+            }
+        }
         if (!has)
         {
             _CandidatePos[idx] = creationPos;
@@ -543,13 +757,30 @@ void MarkDeletionsDensity(uint idx : SV_DispatchThreadID)
     const float r = 0.67 * _MeanFineDistance;
     float3 pos = _SurfacePos[idx];
 
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, r)
-        if ((uint)idn > idx && length(npos - pos) <= r)
+    // LOOP_SURFACE_NEIGHBORS_BEGIN(pos, r), expanded.
+    {
+        int3 minCell = max((int3)floor((pos - r) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + r) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
         {
-            _SurfaceKill[idx] = 1;
-            break;
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    if ((uint)idn > idx && length(npos - pos) <= r)
+                    {
+                        _SurfaceKill[idx] = 1;
+                        break;
+                    }
+                }
+            }
         }
-    LOOP_SURFACE_NEIGHBORS_END
+    }
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
@@ -587,6 +818,22 @@ void SnapshotCoarse(uint3 id : SV_DispatchThreadID)
 //   4. AppendCandidates - write new points at survivors + candDst[i], flagged
 //      PNEW so InterpolateNewWaveData picks them up.
 //   5. WriteSurfaceDispatchArgs - derive the indirect args from the new count.
+//
+// SORTED COMPACTION: steps 1 and 3 run in SORTED order (over _SurfaceID), not
+// original slot order, so the survivors leave the gather physically arranged by
+// Morton cell — the rearrangement the bucket build itself never performs. Zero
+// extra passes: the gather moves the same records through the same permutation
+// the neighbor sweeps were already chasing; only the write order changes.
+// Downstream, every later bucket build's sorted id payload comes out
+// near-identity (points moved only a fraction of a cell since the last
+// compaction, and advective transport is smooth), so _SurfacePos[_SurfaceID[pid]]
+// neighbor reads walk the array almost sequentially instead of jumping across
+// the whole buffer.
+//
+// Side effect: over-density thinning now keeps the spatially-LAST member of a
+// cluster instead of the insertion-last one (see MarkDeletionsDensity — any
+// fixed total order works, the cascade equivalence only needs consistency
+// within the pass).
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void StageAliveForScan(uint3 id : SV_DispatchThreadID)
@@ -595,7 +842,19 @@ void StageAliveForScan(uint3 id : SV_DispatchThreadID)
     if (id.x >= cap) return;
     // Rewrites the whole padded range every frame: the previous scan left prefix
     // sums here, and a nonzero tail would corrupt the new total.
-    _ScanBuf[id.x] = (id.x < (uint)_SurfaceCount && _SurfaceAlive[id.x] != 0) ? 1u : 0u;
+    //
+    // Stages in SORTED order: MakeSurfacePair hashed every slot below the count
+    // and sent the rest to the sentinel tail, so the sorted prefix [0, count) is
+    // exactly a permutation of the live-set indices and _SurfaceID[pid] there is
+    // always valid. Scanning this order makes GatherSurvivors emit survivors
+    // already arranged by cell.
+    uint v = 0u;
+    if (id.x < (uint)_SurfaceCount)
+    {
+        const uint idn = _SurfaceID[id.x];
+        if (idn < (uint)_SurfaceCount) v = _SurfaceAlive[idn] != 0 ? 1u : 0u;
+    }
+    _ScanBuf[id.x] = v;
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
@@ -606,25 +865,33 @@ void StageCandidatesForScan(uint3 id : SV_DispatchThreadID)
     _ScanBuf[id.x] = (id.x < (uint)_SurfaceCount && _HasCandidate[id.x] != 0) ? 1u : 0u;
 }
 
-// _ScanBuf holds exclusive destinations, _ScanTotal[0] the survivor count.
+// _ScanBuf holds exclusive destinations in SORTED order (see StageAliveForScan);
+// _SurvivorCount[0] is the survivor count.
+//
+// Gathers in sorted order: slot pid's record comes from _SurfaceID[pid], so the
+// output lands Morton-sorted — the physical rearrangement the bucket build never
+// performed. Same records, same permutation the sweeps were chasing; writes
+// become sequential.
 [numthreads(GROUP_THREADS_X, 1, 1)]
 void GatherSurvivors(uint3 id : SV_DispatchThreadID)
 {
-    const uint idx = id.x;
-    if (idx >= (uint)_SurfaceCount) return;
-    if (_SurfaceAlive[idx] == 0) return;
+    const uint pid = id.x;
+    if (pid >= (uint)_SurfaceCount) return;
+    const uint idn = _SurfaceID[pid];
+    if (idn >= (uint)_SurfaceCount) return; // sorted-prefix invariant; defensive
+    if (_SurfaceAlive[idn] == 0) return;
 
-    const uint dst = _ScanBuf[idx];
+    const uint dst = _ScanBuf[pid];
     if (dst >= (uint)_MaxSurfacePoints) return;
 
-    _SurfacePosOut[dst]          = _SurfacePos[idx];
-    _SurfaceNormalOut[dst]       = _SurfaceNormal[idx];
-    _SurfaceWaveHOut[dst]        = _SurfaceWaveH[idx];
-    _SurfaceWaveDtHOut[dst]      = _SurfaceWaveDtH[idx];
-    _SurfaceWaveSeedOut[dst]     = _SurfaceWaveSeed[idx];
-    _SurfaceWaveSeedAmpOut[dst]  = _SurfaceWaveSeedAmp[idx];
-    _SurfaceWaveSourceOut[dst]   = _SurfaceWaveSource[idx];
-    _SurfaceStatusOut[dst]       = _SurfaceStatus[idx];
+    _SurfacePosOut[dst]          = _SurfacePos[idn];
+    _SurfaceNormalOut[dst]       = _SurfaceNormal[idn];
+    _SurfaceWaveHOut[dst]        = _SurfaceWaveH[idn];
+    _SurfaceWaveDtHOut[dst]      = _SurfaceWaveDtH[idn];
+    _SurfaceWaveSeedOut[dst]     = _SurfaceWaveSeed[idn];
+    _SurfaceWaveSeedAmpOut[dst]  = _SurfaceWaveSeedAmp[idn];
+    _SurfaceWaveSourceOut[dst]   = _SurfaceWaveSource[idn];
+    _SurfaceStatusOut[dst]       = _SurfaceStatus[idn];
 }
 
 // Runs after the survivor gather has been swapped in, so the *Out buffers here
@@ -713,8 +980,12 @@ void AddSeed(uint idx : SV_DispatchThreadID)
     _SurfaceWaveH[idx] += _SurfaceWaveSeed[idx];
 }
 
+// C++ computeSurfaceWaveNormal + computeSurfaceWaveLaplacians fused: both walk
+// the same tangentRadius ghost neighbourhood, and the laplacian's per-neighbour
+// term is linear in the fitted plane slopes, so ONE sweep accumulates the fit
+// sums plus slope-free laplacian factors, and the slopes combine them after.
 [numthreads(GROUP_THREADS_X, 1, 1)]
-void ComputeSurfaceWaveNormal(uint idx : SV_DispatchThreadID)
+void ComputeSurfaceWaveNormalLaplacian(uint idx : SV_DispatchThreadID)
 {
     if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
 
@@ -722,31 +993,78 @@ void ComputeSurfaceWaveNormal(uint idx : SV_DispatchThreadID)
     float3 n = SafeNormalize(_SurfaceNormal[idx]);
     float3 t1, t2;
     GetTangentFrame(n, t1, t2);
+    float ph = _SurfaceWaveH[idx];
 
     float sw = 0, swx = 0, swy = 0, swxy = 0, swx2 = 0, swy2 = 0, swxz = 0, swyz = 0, swz = 0;
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius)
-        LOOP_GHOSTS_POS_BEGIN(npos, _TangentRadius)
-            float x = dot(gPos - pos, t1);
-            float y = dot(gPos - pos, t2);
-            float z = _SurfaceWaveH[idn];
-            float w = WeightSurfaceTangent(length(pos - gPos));
-            swx2 += w * x * x;
-            swy2 += w * y * y;
-            swxy += w * x * y;
-            swxz += w * x * z;
-            swyz += w * y * z;
-            swx  += w * x;
-            swy  += w * y;
-            swz  += w * z;
-            sw   += w;
-        LOOP_GHOSTS_END
-    LOOP_SURFACE_NEIGHBORS_END
+    // laplacian = 4*(lapA + sx*lapBx + sy*lapBy) with sx/sy the fitted plane
+    // slopes (pWaveNormal.x/z, .y/z) — only known after the sweep.
+    float lapW = 0, lapA = 0, lapBx = 0, lapBy = 0;
+    // Expanded from LOOP_SURFACE_NEIGHBORS_BEGIN(pos, _TangentRadius) wrapping
+    // LOOP_GHOSTS_POS_BEGIN(npos, _TangentRadius).
+    {
+        int3 minCell = max((int3)floor((pos - _TangentRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + _TangentRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    float nh = _SurfaceWaveH[idn];
+                    int gf = -1;
+                    float3 gPos;
+                    while (gf < 6)
+                    {
+                        if (gf < 0 && npos.x - _BndMin.x <= _TangentRadius) { gf = 0; gPos = float3(2.0 * _BndMin.x - npos.x, npos.y, npos.z); }
+                        else if (gf < 1 && _BndMax.x - npos.x <= _TangentRadius) { gf = 1; gPos = float3(2.0 * _BndMax.x - npos.x, npos.y, npos.z); }
+                        else if (gf < 2 && npos.y - _BndMin.y <= _TangentRadius) { gf = 2; gPos = float3(npos.x, 2.0 * _BndMin.y - npos.y, npos.z); }
+                        else if (gf < 3 && _BndMax.y - npos.y <= _TangentRadius) { gf = 3; gPos = float3(npos.x, 2.0 * _BndMax.y - npos.y, npos.z); }
+                        else if (gf < 4 && npos.z - _BndMin.z <= _TangentRadius) { gf = 4; gPos = float3(npos.x, npos.y, 2.0 * _BndMin.z - npos.z); }
+                        else if (gf < 5 && _BndMax.z - npos.z <= _TangentRadius) { gf = 5; gPos = float3(npos.x, npos.y, 2.0 * _BndMax.z - npos.z); }
+                        else { gf = 6; gPos = npos; }
+
+                        float x = dot(gPos - pos, t1);
+                        float y = dot(gPos - pos, t2);
+                        float z = nh;
+                        float w = WeightSurfaceTangent(length(pos - gPos));
+                        swx2 += w * x * x;
+                        swy2 += w * y * y;
+                        swxy += w * x * y;
+                        swxz += w * x * z;
+                        swyz += w * y * z;
+                        swx  += w * x;
+                        swy  += w * y;
+                        swz  += w * z;
+                        sw   += w;
+
+                        // Laplacian factors for this ghost. The C++ skipped the
+                        // neighbour at |dir| < 1e-5 while the fit above keeps
+                        // it, so zero the inverse instead of skipping.
+                        float3 dir = gPos - pos;
+                        float lengthDir = length(dir);
+                        float invLen2 = lengthDir >= 1e-5 ? 1.0 / (lengthDir * lengthDir) : 0.0;
+                        float3 tangentDir = lengthDir * SafeNormalize(dir - dot(dir, n) * n);
+                        lapW  += w;
+                        lapA  += w * (nh - ph) * invLen2;
+                        lapBx += w * dot(tangentDir, t1) * invLen2;
+                        lapBy += w * dot(tangentDir, t2) * invLen2;
+                    }
+                }
+            }
+        }
+    }
 
     float det = -sw * swxy * swxy + 2.0 * swx * swxy * swy - swx2 * swy * swy
               - swx * swx * swy2 + sw * swx2 * swy2;
     if (det == 0.0)
     {
         _TempVec3[idx] = float3(0, 0, 0);
+        _TempFloat[idx] = 0.0;
         return;
     }
 
@@ -758,24 +1076,8 @@ void ComputeSurfaceWaveNormal(uint idx : SV_DispatchThreadID)
     // C++ reconstructs the wave normal in the world basis (vx, vy, z-up), not t1/t2.
     float3 vx = float3(1, 0, 0);
     float3 vy = float3(0, 1, 0);
-    _TempVec3[idx] = -SafeNormalize(vx * abc.x + vy * abc.y - float3(0, 0, 1));
-}
-
-[numthreads(GROUP_THREADS_X, 1, 1)]
-void ComputeSurfaceWaveLaplacians(uint idx : SV_DispatchThreadID)
-{
-    if (idx >= _SurfaceCount || _SurfaceAlive[idx] == 0) return;
-
-    float laplacian = 0.0;
-    float wTotal = 0.0;
-    float3 pPos = _SurfacePos[idx];
-    float3 pNormal = _SurfaceNormal[idx];
-
-    float3 t1, t2;
-    GetTangentFrame(pNormal, t1, t2);
-
-    float3 pWaveNormal = _TempVec3[idx];
-    float ph = _SurfaceWaveH[idx];
+    float3 pWaveNormal = -SafeNormalize(vx * abc.x + vy * abc.y - float3(0, 0, 1));
+    _TempVec3[idx] = pWaveNormal;
 
     if (pWaveNormal.z == 0.0)
     {
@@ -783,23 +1085,14 @@ void ComputeSurfaceWaveLaplacians(uint idx : SV_DispatchThreadID)
         return;
     }
 
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _TangentRadius)
-        float nh = _SurfaceWaveH[idn];
-        LOOP_GHOSTS_POS_BEGIN(npos, _TangentRadius)
-            float3 dir = gPos - pPos;
-            float lengthDir = length(dir);
-            if (lengthDir < 1e-5) continue;
-            float3 tangentDir = lengthDir * SafeNormalize(dir - dot(dir, pNormal) * pNormal);
-            float dirX = dot(tangentDir, t1);
-            float dirY = dot(tangentDir, t2);
-            float dz = nh - ph - (-pWaveNormal.x / pWaveNormal.z) * dirX - (-pWaveNormal.y / pWaveNormal.z) * dirY;
-            float w = WeightSurfaceTangent(length(pPos - gPos));
-            wTotal += w;
-            laplacian += clamp(w * 4.0 * dz / (lengthDir * lengthDir), -100.0, 100.0);
-        LOOP_GHOSTS_END
-    LOOP_SURFACE_NEIGHBORS_END
-
-    _TempFloat[idx] = wTotal != 0.0 ? laplacian / wTotal : 0.0;
+    // Combine the slope-free laplacian factors with the fitted slopes. The C++
+    // clamped each neighbour's term to +-100 before summing; with the
+    // regrouped sums the clamp moves onto the combined value — same blow-up
+    // guard, differs only when a single term already exceeded 100.
+    float slopeX = pWaveNormal.x / pWaveNormal.z;
+    float slopeY = pWaveNormal.y / pWaveNormal.z;
+    float laplacian = clamp(4.0 * (lapA + slopeX * lapBx + slopeY * lapBy), -100.0, 100.0);
+    _TempFloat[idx] = lapW != 0.0 ? laplacian / lapW : 0.0;
 }
 
 [numthreads(GROUP_THREADS_X, 1, 1)]
@@ -827,19 +1120,51 @@ void ComputeSurfaceCurvature(uint idx : SV_DispatchThreadID)
     float curv = 0.0;
     float3 pNormal = _SurfaceNormal[idx];
 
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _NormalRadius)
-        LOOP_GHOSTS_POS_NORMAL_BEGIN(npos, _SurfaceNormal[idn], _NormalRadius)
-            float3 dir = pPos - gPos;
-            if (dot(pNormal, gNormal) < 0.0) continue; // backfacing
-            float dist = length(dir);
-            if (dist < _NormalRadius / 100.0) continue;
+    // Expanded from LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _NormalRadius) wrapping
+    // LOOP_GHOSTS_POS_NORMAL_BEGIN(npos, _SurfaceNormal[idn], _NormalRadius).
+    // The `continue`s below skip to the next ghost, not the next neighbor.
+    {
+        int3 minCell = max((int3)floor((pPos - _NormalRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pPos + _NormalRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    float3 nNormal = _SurfaceNormal[idn];
+                    int gf = -1;
+                    float3 gPos;
+                    float3 gNormal;
+                    while (gf < 6)
+                    {
+                        if (gf < 0 && npos.x - _BndMin.x <= _NormalRadius) { gf = 0; gPos = float3(2.0 * _BndMin.x - npos.x, npos.y, npos.z); gNormal = float3(-nNormal.x, nNormal.y, nNormal.z); }
+                        else if (gf < 1 && _BndMax.x - npos.x <= _NormalRadius) { gf = 1; gPos = float3(2.0 * _BndMax.x - npos.x, npos.y, npos.z); gNormal = float3(-nNormal.x, nNormal.y, nNormal.z); }
+                        else if (gf < 2 && npos.y - _BndMin.y <= _NormalRadius) { gf = 2; gPos = float3(npos.x, 2.0 * _BndMin.y - npos.y, npos.z); gNormal = float3(nNormal.x, -nNormal.y, nNormal.z); }
+                        else if (gf < 3 && _BndMax.y - npos.y <= _NormalRadius) { gf = 3; gPos = float3(npos.x, 2.0 * _BndMax.y - npos.y, npos.z); gNormal = float3(nNormal.x, -nNormal.y, nNormal.z); }
+                        else if (gf < 4 && npos.z - _BndMin.z <= _NormalRadius) { gf = 4; gPos = float3(npos.x, npos.y, 2.0 * _BndMin.z - npos.z); gNormal = float3(nNormal.x, nNormal.y, -nNormal.z); }
+                        else if (gf < 5 && _BndMax.z - npos.z <= _NormalRadius) { gf = 5; gPos = float3(npos.x, npos.y, 2.0 * _BndMax.z - npos.z); gNormal = float3(nNormal.x, nNormal.y, -nNormal.z); }
+                        else { gf = 6; gPos = npos; gNormal = nNormal; }
 
-            float distn = dot(dir, pNormal);
-            float w = WeightSurfaceNormal(dist);
-            curv += w * distn;
-            wTotal += w;
-        LOOP_GHOSTS_END
-    LOOP_SURFACE_NEIGHBORS_END
+                        float3 dir = pPos - gPos;
+                        if (dot(pNormal, gNormal) < 0.0) continue; // backfacing
+                        float dist = length(dir);
+                        if (dist < _NormalRadius / 100.0) continue;
+
+                        float distn = dot(dir, pNormal);
+                        float w = WeightSurfaceNormal(dist);
+                        curv += w * distn;
+                        wTotal += w;
+                    }
+                }
+            }
+        }
+    }
 
     if (wTotal != 0.0) curv /= wTotal;
     _TempFloat[idx] = abs(curv);
@@ -854,11 +1179,28 @@ void SmoothCurvature(uint idx : SV_DispatchThreadID)
     float curv = 0.0;
     float wTotal = 0.0;
 
-    LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _NormalRadius)
-        float w = WeightSurfaceNormal(length(pPos - npos));
-        curv += w * _TempFloat[idn];
-        wTotal += w;
-    LOOP_SURFACE_NEIGHBORS_END
+    // LOOP_SURFACE_NEIGHBORS_BEGIN(pPos, _NormalRadius), expanded.
+    {
+        int3 minCell = max((int3)floor((pPos - _NormalRadius) * _InvCellSize), int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pPos + _NormalRadius) * _InvCellSize), _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _SurfaceRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                int idn = _SurfaceID[pid];
+                if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0)
+                {
+                    float3 npos = _SurfacePos[idn];
+                    float w = WeightSurfaceNormal(length(pPos - npos));
+                    curv += w * _TempFloat[idn];
+                    wTotal += w;
+                }
+            }
+        }
+    }
 
     _SurfaceWaveSource[idx] = wTotal != 0.0 ? curv / wTotal : 0.0;
 }
@@ -902,5 +1244,9 @@ void DisplaceForRender(uint idx : SV_DispatchThreadID)
     float3 pos = _SurfacePos[idx];
     float3 normal = _SurfaceNormal[idx];
     float h = _SurfaceWaveH[idx];
-    _SurfaceRender[idx] = float4(pos + normal * h, h);
+    // Render-only scale on the normal displacement, independent of the wave
+    // physics (bandWaveDisplaceScale is the same knob for BandWaves). 0 shows
+    // the raw constrained positions — the coarse-particle hull — while w keeps
+    // the true h so the color ramp still reads the wave field either way.
+    _SurfaceRender[idx] = float4(pos + normal * (h * _RenderDisplacementScale), h);
 }

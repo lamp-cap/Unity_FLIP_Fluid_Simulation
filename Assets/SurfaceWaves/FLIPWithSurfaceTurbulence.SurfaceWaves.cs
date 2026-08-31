@@ -63,6 +63,11 @@ namespace SurfaceWaves
         public float waveSeedingCurvatureThresholdRegionRadius = 0.02f;
         public float waveSeedStepSizeRatioOfMax = 0.01f;
 
+        // Render-only multiplier on the normal*h displacement (1 = faithful to
+        // the C++). Set 0 to show the raw constrained positions and tell a
+        // fragmented constraint hull apart from an over-displaced wave field.
+        public float renderDisplacementScale = 1f;
+
         // Capacity of every per-surface-point buffer. ~172 B/point once the
         // compaction ping-pong is counted, so 1<<17 is ~22 MB of point state (plus
         // ~86 MB of fixed overhead for _surfRange and _particlesPrev).
@@ -155,7 +160,7 @@ namespace SurfaceWaves
         private int _kClearSurfaceRange, _kMakeSurfacePair, _kSetSurfaceRange;
         private int _kInitSurfacePoints, _kAdvectSurfacePoints;
         private int _kComputeSurfaceNormals, _kComputeAveragedNormals, _kAssignNormals;
-        private int _kComputeSurfaceDensities, _kComputeSurfaceDisplacements, _kApplySurfaceDisplacements;
+        private int _kComputeSurfaceDisplacements, _kApplySurfaceDisplacements;
         private int _kConstrainSurface, _kInterpolateNewWaveData;
         private int _kComputeAdditions, _kMarkDeletions;
         private int _kMarkDeletionsDensity, _kApplyDensityKills;
@@ -163,7 +168,7 @@ namespace SurfaceWaves
         private int _kStageAliveForScan, _kStageCandidatesForScan;
         private int _kGatherSurvivors, _kAppendCandidates, _kFinalizeSurfaceCount;
         private int _kResetAliveAfterCompaction, _kClearSurfaceStatus, _kWriteSurfaceDispatchArgs;
-        private int _kAddSeed, _kComputeSurfaceWaveNormal, _kComputeSurfaceWaveLaplacians, _kEvolveWave;
+        private int _kAddSeed, _kComputeSurfaceWaveNormalLaplacian, _kEvolveWave;
         private int _kComputeSurfaceCurvature, _kSmoothCurvature, _kSeedWaves, _kDisplaceForRender;
 
         // Whether the buffers were actually allocated. Disposal must key off this,
@@ -296,7 +301,6 @@ namespace SurfaceWaves
             _kComputeSurfaceNormals = cs.FindKernel("ComputeSurfaceNormals");
             _kComputeAveragedNormals = cs.FindKernel("ComputeAveragedNormals");
             _kAssignNormals = cs.FindKernel("AssignNormals");
-            _kComputeSurfaceDensities = cs.FindKernel("ComputeSurfaceDensities");
             _kComputeSurfaceDisplacements = cs.FindKernel("ComputeSurfaceDisplacements");
             _kApplySurfaceDisplacements = cs.FindKernel("ApplySurfaceDisplacements");
             _kConstrainSurface = cs.FindKernel("ConstrainSurface");
@@ -315,8 +319,7 @@ namespace SurfaceWaves
             _kClearSurfaceStatus = cs.FindKernel("ClearSurfaceStatus");
             _kWriteSurfaceDispatchArgs = cs.FindKernel("WriteSurfaceDispatchArgs");
             _kAddSeed = cs.FindKernel("AddSeed");
-            _kComputeSurfaceWaveNormal = cs.FindKernel("ComputeSurfaceWaveNormal");
-            _kComputeSurfaceWaveLaplacians = cs.FindKernel("ComputeSurfaceWaveLaplacians");
+            _kComputeSurfaceWaveNormalLaplacian = cs.FindKernel("ComputeSurfaceWaveNormalLaplacian");
             _kEvolveWave = cs.FindKernel("EvolveWave");
             _kComputeSurfaceCurvature = cs.FindKernel("ComputeSurfaceCurvature");
             _kSmoothCurvature = cs.FindKernel("SmoothCurvature");
@@ -444,6 +447,7 @@ namespace SurfaceWaves
             cmd.SetComputeFloatParam(cs, "_SeedThresholdCenter", waveSeedingCurvatureThresholdRegionCenter);
             cmd.SetComputeFloatParam(cs, "_SeedThresholdRadius", waveSeedingCurvatureThresholdRegionRadius);
             cmd.SetComputeFloatParam(cs, "_SeedStepSizeRatio", waveSeedStepSizeRatioOfMax);
+            cmd.SetComputeFloatParam(cs, "_RenderDisplacementScale", renderDisplacementScale);
 
             cmd.SetComputeIntParam(cs, "_FrameCount", _stFrameCount);
             cmd.SetComputeIntParam(cs, "_MaxSurfacePoints", maxSurfacePoints);
@@ -543,9 +547,12 @@ namespace SurfaceWaves
         // ===== surface neighbor bucket =====
         //
         // ClearSurfaceRange -> MakeSurfacePair -> DeviceRadixSort(hash, id) ->
-        // SetSurfaceRange, which is the layout the shader's LOOP_SURFACE_NEIGHBORS
-        // macro expects (range indexes the sorted id payload, surface records stay
-        // put so ids remain stable).
+        // SetSurfaceRange: the range indexes the sorted id payload. The records
+        // themselves are not permuted here — compaction (CompactSurfacePoints)
+        // gathers survivors in sorted order, so the arrays already sit arranged
+        // by cell when this runs and the fresh sort's id payload comes out
+        // near-identity. Neighbor reads then walk _SurfacePos almost sequentially
+        // instead of jumping through _SurfaceID across the whole buffer.
         private void BuildSurfaceBucket(CommandBuffer cmd)
         {
             cmd.BeginSample("ST.BuildBucket");
@@ -860,8 +867,8 @@ namespace SurfaceWaves
                 DispatchSurfaceIndirect(cmd, _kComputeAveragedNormals);
                 DispatchSurfaceIndirect(cmd, _kAssignNormals);
 
-                // regularization: density -> displacement -> apply
-                DispatchSurfaceIndirect(cmd, _kComputeSurfaceDensities);
+                // regularization: displacement -> apply. Density rides along in
+                // ComputeSurfaceNormals (its `sw` accumulator IS the density sum).
                 DispatchSurfaceIndirect(cmd, _kComputeSurfaceDisplacements);
                 DispatchSurfaceIndirect(cmd, _kApplySurfaceDisplacements);
 
@@ -886,9 +893,9 @@ namespace SurfaceWaves
 
             DispatchSurfaceIndirect(cmd, _kAddSeed);
 
-            // wave normal -> _TempVec3, laplacian -> _TempFloat, then evolve
-            DispatchSurfaceIndirect(cmd, _kComputeSurfaceWaveNormal);
-            DispatchSurfaceIndirect(cmd, _kComputeSurfaceWaveLaplacians);
+            // one tangentRadius sweep: wave normal -> _TempVec3 and laplacian
+            // -> _TempFloat, then evolve
+            DispatchSurfaceIndirect(cmd, _kComputeSurfaceWaveNormalLaplacian);
             DispatchSurfaceIndirect(cmd, _kEvolveWave);
 
             // curvature -> _TempFloat, smoothed -> _SurfaceWaveSource, then seed

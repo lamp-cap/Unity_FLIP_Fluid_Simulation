@@ -175,7 +175,7 @@ MonoBehaviour:
   threshold: 1
   drawBaseParticles: 0
   drawType: 0
-  surfaceDetail: 3
+  surfaceDetail: 1
   meshMat: {fileID: 2100000, guid: d47ff4db7d92dd746a90c7e7558c6a35, type: 2}
   digitMat: {fileID: 2100000, guid: a26dfe4acedb8504a9e77fee932f8775, type: 2}
   surfaceTurbulenceCs: {fileID: 7200000, guid: bf306558399182641bab71b6ff9fd902, type: 3}
@@ -183,20 +183,21 @@ MonoBehaviour:
   prefixScanCs: {fileID: 7200000, guid: b0ad1154dc9cf0e40b1575d58449ff62, type: 3}
   drawSurfacePoints: 1
   pollDiagnostics: 1
-  outerRadius: 0.2
-  surfaceDensity: 20
+  outerRadius: 0.13
+  surfaceDensity: 16
   nbSurfaceMaintenanceIterations: 1
   enableDensityThinning: 1
-  waveSpeed: 1.5
+  waveSpeed: 1
   waveDamping: 0.05
   waveSeedFrequency: 4
-  waveMaxAmplitude: 0.4
+  waveMaxAmplitude: 0.5
   waveMaxFrequency: 100
-  waveMaxSeedingAmplitude: 0.4
+  waveMaxSeedingAmplitude: 0.5
   waveSeedingCurvatureThresholdRegionCenter: 0.01
   waveSeedingCurvatureThresholdRegionRadius: 0.01
   waveSeedStepSizeRatioOfMax: 0.01
-  maxSurfacePoints: 1024000
+  renderDisplacementScale: 0.5
+  maxSurfacePoints: 2097152
   surfaceMemoryBudgetMB: 512
   waveCurvesCs: {fileID: 7200000, guid: 942922b1a1e8dc14a97d6384245f3366, type: 3}
   waveCurveGrowthRate: 0.01

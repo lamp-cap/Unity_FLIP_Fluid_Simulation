@@ -950,7 +950,7 @@ namespace SurfaceWaves
             cmd.SetComputeIntParam(cs, "_NumCells", GridSize.x * GridSize.y * GridSize.z);
             cmd.SetComputeFloatParam(cs, "_CellSize", GridSpacing);
             cmd.SetComputeFloatParam(cs, "_InvCellSize", 1f / GridSpacing);
-            cmd.SetComputeFloatParam(cs, "_DeltaTime", 1f / (_slowDown ? 600f : 60f));
+            cmd.SetComputeFloatParam(cs, "_DeltaTime", 1f / (_slowDown ? 300f : 60f));
             cmd.SetComputeIntParam(cs, "_NumPartitions", DivRoundUp(NumGrids, 512));
         }
     

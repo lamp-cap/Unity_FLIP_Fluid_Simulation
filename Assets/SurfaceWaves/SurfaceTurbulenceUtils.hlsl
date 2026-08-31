@@ -43,6 +43,7 @@ float _WaveMaxSeedingAmplitude;
 float _SeedThresholdCenter;
 float _SeedThresholdRadius;
 float _SeedStepSizeRatio;
+float _RenderDisplacementScale; // render-only multiplier on normal*h (1 = C++)
 
 int _FrameCount;
 int _MaxSurfacePoints; // capacity of the surface point buffers
@@ -237,9 +238,11 @@ void GetTangentFrame(float3 n, out float3 t1, out float3 t2)
 
 // ===== neighbor loops (sorted-LUT buckets, C++ LOOP_NEIGHBORS_*) =====
 //
-// Each macro opens a scope block, iterates the 3x3x3 cell neighborhood around
-// `center` within `radius`, and yields the neighbor identity + position for the
-// user body placed between BEGIN and END.
+// The three loop families (coarse / coarse-prev / surface) used to be macros
+// here; they are now hand-inlined at each use site in SurfaceTurbulence.compute
+// so they can be tuned per kernel. Shared shape: clamp the cell range covering
+// [center - radius, center + radius] to the grid, walk each cell's sorted range,
+// then every particle in it.
 
 // The coarse bucket is built from the PRE-advection positions (C# runs the
 // surface step after G2P, reusing the cell ranges the solver already had), so a
@@ -266,78 +269,19 @@ void GetTangentFrame(float3 n, out float3 t1, out float3 t2)
 #define COARSE_CELL_PAD 0
 #endif
 
-// Coarse neighbor (current positions): yields `int idn` + `float3 npos`.
-#define LOOP_COARSE_NEIGHBORS_BEGIN(center, radius) \
-    { int3 _minC = max((int3)floor((center - radius) * _InvCellSize) - COARSE_CELL_PAD, int3(0, 0, 0)); \
-      int3 _maxC = min((int3)floor((center + radius) * _InvCellSize) + COARSE_CELL_PAD, _GridSize - int3(1, 1, 1)); \
-      for (int _cz = _minC.z; _cz <= _maxC.z; ++_cz) \
-      for (int _cy = _minC.y; _cy <= _maxC.y; ++_cy) \
-      for (int _cx = _minC.x; _cx <= _maxC.x; ++_cx) { \
-          uint2 _rng = _CoarseRange[Coord2Idx((uint)_cx, (uint)_cy, (uint)_cz)]; \
-          for (uint _pid = _rng.x; _pid < _rng.y; ++_pid) { \
-              int idn = (int)_pid; \
-              float3 npos = DecodePosition(_CoarseParticles[idn].packedPosition); {
-#define LOOP_COARSE_NEIGHBORS_END } } } }
-
-// Coarse prev-frame neighbor (for advection): yields `idn` + `curPos` + `prevPos`.
-// Bucketed on the snapshot layout, which is exactly what prevPos lives in, so no
-// padding is needed here.
-#define LOOP_COARSE_PREV_NEIGHBORS_BEGIN(center, radius) \
-    { int3 _minC = max((int3)floor((center - radius) * _InvCellSize), int3(0, 0, 0)); \
-      int3 _maxC = min((int3)floor((center + radius) * _InvCellSize), _GridSize - int3(1, 1, 1)); \
-      for (int _cz = _minC.z; _cz <= _maxC.z; ++_cz) \
-      for (int _cy = _minC.y; _cy <= _maxC.y; ++_cy) \
-      for (int _cx = _minC.x; _cx <= _maxC.x; ++_cx) { \
-          uint2 _rng = _CoarsePrevRange[Coord2Idx((uint)_cx, (uint)_cy, (uint)_cz)]; \
-          for (uint _pid = _rng.x; _pid < _rng.y; ++_pid) { \
-              int idn = (int)_pid; \
-              float3 curPos = DecodePosition(_CoarseParticles[idn].packedPosition); \
-              float3 prevPos = DecodePosition(_CoarsePrevParticles[idn].packedPosition); {
-#define LOOP_COARSE_PREV_NEIGHBORS_END } } } }
-
-// Surface neighbor: yields `int idn` + `float3 npos` (skips dead points).
-#define LOOP_SURFACE_NEIGHBORS_BEGIN(center, radius) \
-    { int3 _minC = max((int3)floor((center - radius) * _InvCellSize), int3(0, 0, 0)); \
-      int3 _maxC = min((int3)floor((center + radius) * _InvCellSize), _GridSize - int3(1, 1, 1)); \
-      for (int _cz = _minC.z; _cz <= _maxC.z; ++_cz) \
-      for (int _cy = _minC.y; _cy <= _maxC.y; ++_cy) \
-      for (int _cx = _minC.x; _cx <= _maxC.x; ++_cx) { \
-          uint2 _rng = _SurfaceRange[Coord2Idx((uint)_cx, (uint)_cy, (uint)_cz)]; \
-          for (uint _pid = _rng.x; _pid < _rng.y; ++_pid) { \
-              int idn = _SurfaceID[_pid]; \
-              if (idn < _SurfaceCount && _SurfaceAlive[idn] != 0) { \
-                  float3 npos = _SurfacePos[idn]; {
-#define LOOP_SURFACE_NEIGHBORS_END } } } } }
+// Buffer per family, for finding the inline copies: coarse reads _CoarseRange +
+// _CoarseParticles (current positions, pad with COARSE_CELL_PAD); coarse-prev
+// reads _CoarsePrevRange + _CoarsePrevParticles (snapshot layout, exact, no
+// pad); surface reads _SurfaceRange + _SurfaceID and skips dead points.
 
 // ===== ghost / mirror reflection (C++ LOOP_GHOSTS_*) =====
 //
-// For a neighbor near a domain boundary, emit up to 6 mirrored positions
-// (one per boundary) followed by the real position. Body runs once per ghost.
-
-#define LOOP_GHOSTS_POS_BEGIN(pos, radius) \
-    { int _gf = -1; float3 gPos; \
-    while (_gf < 6) { \
-        if (_gf < 0 && pos.x - _BndMin.x <= radius) { _gf = 0; gPos = float3(2.0 * _BndMin.x - pos.x, pos.y, pos.z); } \
-        else if (_gf < 1 && _BndMax.x - pos.x <= radius) { _gf = 1; gPos = float3(2.0 * _BndMax.x - pos.x, pos.y, pos.z); } \
-        else if (_gf < 2 && pos.y - _BndMin.y <= radius) { _gf = 2; gPos = float3(pos.x, 2.0 * _BndMin.y - pos.y, pos.z); } \
-        else if (_gf < 3 && _BndMax.y - pos.y <= radius) { _gf = 3; gPos = float3(pos.x, 2.0 * _BndMax.y - pos.y, pos.z); } \
-        else if (_gf < 4 && pos.z - _BndMin.z <= radius) { _gf = 4; gPos = float3(pos.x, pos.y, 2.0 * _BndMin.z - pos.z); } \
-        else if (_gf < 5 && _BndMax.z - pos.z <= radius) { _gf = 5; gPos = float3(pos.x, pos.y, 2.0 * _BndMax.z - pos.z); } \
-        else { _gf = 6; gPos = pos; }
-
-#define LOOP_GHOSTS_POS_NORMAL_BEGIN(pos, normal, radius) \
-    { int _gf = -1; float3 gPos; float3 gNormal; \
-    while (_gf < 6) { \
-        if (_gf < 0 && pos.x - _BndMin.x <= radius) { _gf = 0; gPos = float3(2.0 * _BndMin.x - pos.x, pos.y, pos.z); gNormal = float3(-normal.x, normal.y, normal.z); } \
-        else if (_gf < 1 && _BndMax.x - pos.x <= radius) { _gf = 1; gPos = float3(2.0 * _BndMax.x - pos.x, pos.y, pos.z); gNormal = float3(-normal.x, normal.y, normal.z); } \
-        else if (_gf < 2 && pos.y - _BndMin.y <= radius) { _gf = 2; gPos = float3(pos.x, 2.0 * _BndMin.y - pos.y, pos.z); gNormal = float3(normal.x, -normal.y, normal.z); } \
-        else if (_gf < 3 && _BndMax.y - pos.y <= radius) { _gf = 3; gPos = float3(pos.x, 2.0 * _BndMax.y - pos.y, pos.z); gNormal = float3(normal.x, -normal.y, normal.z); } \
-        else if (_gf < 4 && pos.z - _BndMin.z <= radius) { _gf = 4; gPos = float3(pos.x, pos.y, 2.0 * _BndMin.z - pos.z); gNormal = float3(normal.x, normal.y, -normal.z); } \
-        else if (_gf < 5 && _BndMax.z - pos.z <= radius) { _gf = 5; gPos = float3(pos.x, pos.y, 2.0 * _BndMax.z - pos.z); gNormal = float3(normal.x, normal.y, -normal.z); } \
-        else { _gf = 6; gPos = pos; gNormal = normal; }
-
-#define LOOP_GHOSTS_END \
-    } }
+// Also inlined. For a neighbor near a domain boundary, emit up to 6 mirrored
+// positions (one per boundary) followed by the real position; the +normal
+// variant also flips the copied normal on the mirrored axis. The gf counter
+// both selects the mirror and advances the state: each branch tests gf < k and
+// sets gf = k, the final else emits the real point (gf = 6) and the while
+// condition ends the loop. `continue` inside the body skips to the next ghost.
 
 // ===== constraint level-set (C++ computeConstraintLevel / Gradient) =====
 //
@@ -364,9 +308,23 @@ void GetTangentFrame(float3 n, out float3 t1, out float3 t2)
 float ConstraintLevel(float3 pos)
 {
     float lvl = 0.0;
-    LOOP_COARSE_NEIGHBORS_BEGIN(pos, CONSTRAINT_QUERY_SCALE * _OuterRadius)
-        lvl += exp(-_ConstraintA * dot(npos - pos, npos - pos));
-    LOOP_COARSE_NEIGHBORS_END
+    // Expanded from LOOP_COARSE_NEIGHBORS_BEGIN(pos, CONSTRAINT_QUERY_SCALE * _OuterRadius).
+    {
+        const float queryRadius = CONSTRAINT_QUERY_SCALE * _OuterRadius;
+        int3 minCell = max((int3)floor((pos - queryRadius) * _InvCellSize) - COARSE_CELL_PAD, int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + queryRadius) * _InvCellSize) + COARSE_CELL_PAD, _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _CoarseRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                float3 npos = DecodePosition(_CoarseParticles[pid].packedPosition);
+                lvl += exp(-_ConstraintA * dot(npos - pos, npos - pos));
+            }
+        }
+    }
     if (lvl > 1.0) lvl = 1.0;
     return (sqrt(-log(lvl) / _ConstraintA) - _InnerRadius) / (_OuterRadius - _InnerRadius);
 }
@@ -374,9 +332,23 @@ float ConstraintLevel(float3 pos)
 float3 ConstraintGradient(float3 pos)
 {
     float3 gradient = float3(0, 0, 0);
-    LOOP_COARSE_NEIGHBORS_BEGIN(pos, CONSTRAINT_QUERY_SCALE * _OuterRadius)
-        gradient += 2.0 * _ConstraintA * exp(-_ConstraintA * dot(npos - pos, npos - pos)) * (pos - npos);
-    LOOP_COARSE_NEIGHBORS_END
+    // Expanded from LOOP_COARSE_NEIGHBORS_BEGIN(pos, CONSTRAINT_QUERY_SCALE * _OuterRadius).
+    {
+        const float queryRadius = CONSTRAINT_QUERY_SCALE * _OuterRadius;
+        int3 minCell = max((int3)floor((pos - queryRadius) * _InvCellSize) - COARSE_CELL_PAD, int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + queryRadius) * _InvCellSize) + COARSE_CELL_PAD, _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _CoarseRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                float3 npos = DecodePosition(_CoarseParticles[pid].packedPosition);
+                gradient += 2.0 * _ConstraintA * exp(-_ConstraintA * dot(npos - pos, npos - pos)) * (pos - npos);
+            }
+        }
+    }
     return SafeNormalize(gradient);
 }
 
@@ -387,11 +359,25 @@ void ConstraintLevelGradient(float3 pos, out float level, out float3 gradient)
 {
     float lvl = 0.0;
     float3 grad = float3(0, 0, 0);
-    LOOP_COARSE_NEIGHBORS_BEGIN(pos, CONSTRAINT_QUERY_SCALE * _OuterRadius)
-        float e = exp(-_ConstraintA * dot(npos - pos, npos - pos));
-        lvl += e;
-        grad += 2.0 * _ConstraintA * e * (pos - npos);
-    LOOP_COARSE_NEIGHBORS_END
+    // Expanded from LOOP_COARSE_NEIGHBORS_BEGIN(pos, CONSTRAINT_QUERY_SCALE * _OuterRadius).
+    {
+        const float queryRadius = CONSTRAINT_QUERY_SCALE * _OuterRadius;
+        int3 minCell = max((int3)floor((pos - queryRadius) * _InvCellSize) - COARSE_CELL_PAD, int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + queryRadius) * _InvCellSize) + COARSE_CELL_PAD, _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _CoarseRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                float3 npos = DecodePosition(_CoarseParticles[pid].packedPosition);
+                float e = exp(-_ConstraintA * dot(npos - pos, npos - pos));
+                lvl += e;
+                grad += 2.0 * _ConstraintA * e * (pos - npos);
+            }
+        }
+    }
     if (lvl > 1.0) lvl = 1.0;
     level = (sqrt(-log(lvl) / _ConstraintA) - _InnerRadius) / (_OuterRadius - _InnerRadius);
     gradient = SafeNormalize(grad);
@@ -400,9 +386,22 @@ void ConstraintLevelGradient(float3 pos, out float level, out float3 gradient)
 // Existence predicate over the coarse bucket (C++ hasNeighbor).
 bool HasCoarseNeighbor(float3 pos, float radius)
 {
-    LOOP_COARSE_NEIGHBORS_BEGIN(pos, radius)
-        if (length(npos - pos) <= radius) return true;
-    LOOP_COARSE_NEIGHBORS_END
+    // Expanded from LOOP_COARSE_NEIGHBORS_BEGIN(pos, radius).
+    {
+        int3 minCell = max((int3)floor((pos - radius) * _InvCellSize) - COARSE_CELL_PAD, int3(0, 0, 0));
+        int3 maxCell = min((int3)floor((pos + radius) * _InvCellSize) + COARSE_CELL_PAD, _GridSize - int3(1, 1, 1));
+        for (int cz = minCell.z; cz <= maxCell.z; ++cz)
+        for (int cy = minCell.y; cy <= maxCell.y; ++cy)
+        for (int cx = minCell.x; cx <= maxCell.x; ++cx)
+        {
+            uint2 rng = _CoarseRange[Coord2Idx((uint)cx, (uint)cy, (uint)cz)];
+            for (uint pid = rng.x; pid < rng.y; ++pid)
+            {
+                float3 npos = DecodePosition(_CoarseParticles[pid].packedPosition);
+                if (length(npos - pos) <= radius) return true;
+            }
+        }
+    }
     return false;
 }
 
