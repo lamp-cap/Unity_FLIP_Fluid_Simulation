@@ -42,7 +42,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     }
     public SolverType solverType;
 
-    [Range(0, 64)] public int iterations = 8;
+    [Range(100, 256)] public int iterations = 108;
     [Range(-10, 10)] public float gravity = -9;
     [Range(0, 1)] public float flipness = 0.95f;
     public Mesh mesh;
@@ -98,6 +98,8 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         _hashes = new NativeArray<int2>(NumParticles, Allocator.Persistent);
         if (mat != null)
             mat.SetBuffer("_ParticleBuffer", _posBuffer);
+
+            Init();
     }
 
     public void Init()
@@ -188,11 +190,12 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             var type = _mbg.GridTypes[i];
             if ((type & 3u) == 2) vel = 0;
             if (((type >> 2) & 3u) == 2) vel.x = 0;
-            if (((type >> 6) & 3u) == 2) vel.x = 0;
+            if (((type >> 6) & 3u) == 2) vel.y = 0;
             _mbg.GridVelocity[i] = vel;
         }
         
         _mbg.Solve();
+        _rs = _mbg.LastResidual;
         
         Debug.Log($"MGPCG_FLIP initialized, particle num: {pCounter}, allocate cells: {count}.");
 
@@ -204,10 +207,39 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     // Update is called once per frame
     private void Update()
     {
+        if (Application.isPlaying)
+        {
+            Step();
+            // the GPU buffer only sees what we upload — push the live range every
+            // frame or the render stays frozen at Init's final snapshot
+            if (_particleCount.Value > 0)
+                _posBuffer.SetData(_particlePos, 0, 0, _particleCount.Value);
+        }
+
         if (_particleCount.Value > 0 && mat != null && mesh != null)
         {
+            // rebind every frame: mat may be assigned after OnEnable, and the buffer
+            // is recreated on every enable cycle — an unbound StructuredBuffer reads as 0
+            mat.SetBuffer("_ParticleBuffer", _posBuffer);
             Graphics.DrawMeshInstancedProcedural(mesh, 0, mat, _bounds, _particleCount.Value);
         }
+    }
+
+    private GUIStyle _labelStyle;
+
+    private void OnGUI()
+    {
+        _labelStyle ??= new GUIStyle()
+        {
+            alignment = TextAnchor.UpperLeft,
+            fontSize = 32,
+            normal = { textColor = Color.white }
+        };
+        GUI.Label(new Rect(0, 0, 100, 36), $"residual: {_rs:F3}", _labelStyle);
+        GUI.Label(new Rect(0, 36, 100, 36),
+            $"cells: {(_mbg != null ? _mbg.CellCount : 0)} / {bCount * 64}", _labelStyle);
+        GUI.Label(new Rect(0, 72, 100, 36),
+            $"particles: {_particleCount.Value} / {NumParticles}", _labelStyle);
     }
 
     private void TestStep()
@@ -257,9 +289,16 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             Range = _range,
         }.Schedule(_range.Length, batchCount).Complete();
         
+        new DemoteInteriorJob()
+        {
+            BlockLevel = _mbg.BlockLevel
+        }.Run();
+
         new SetBlockLevelJob()
         {
             Range = _range,
+            Lut = _mbg.GridInfos,
+            SDF = _mbg.SDF,
             BlockLevel = _mbg.BlockLevel
         }.Schedule(bCount, 1).Complete();
         
@@ -284,7 +323,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         _mbg.IterateCellSDF();
         
         new ParticlesCounterJob(_mbg.GridInfos, _mbg.SDF, _range, _particleID, _particleCount).Run();
-        Debug.Log("Resample particle count: " + _particleCount.Value);
+        // Debug.Log("Resample particle count: " + _particleCount.Value + (_particleCount.Value == NumParticles ? " (pool full)" : ""));
         
         new ResampleParticlesJob()
         {
@@ -326,6 +365,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         }.Schedule(cellCount, batchCount).Complete();
         
         _mbg.Solve();
+        _rs = _mbg.LastResidual;
         
         new GridToParticleJob
         {
@@ -362,11 +402,11 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
 
         for (int i = 0; i < iterations; i++)
         {
-            Step(i);
+            Step();
         }
     }
 
-    private void Step(int frame)
+    private void Step()
     {
         int batchCount = 32;
         int cellCount = _mbg.CellCount;
@@ -387,9 +427,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             Hashes = _hashes,
         }.Schedule(_particleCount.Value, batchCount).Complete();
 
-        Profiler.BeginSample("Sort");
         _hashes.Slice(0, _particleCount.Value).SortJob(new Int2Comparer()).Schedule().Complete();
-        Profiler.EndSample();
         
         new ShuffleJob
         {
@@ -422,9 +460,16 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         
         Profiler.BeginSample("Resample");
 
+        new DemoteInteriorJob()
+        {
+            BlockLevel = _mbg.BlockLevel
+        }.Run();
+
         new SetBlockLevelJob()
         {
             Range = _range,
+            Lut = _mbg.GridInfos,
+            SDF = _mbg.SDF,
             BlockLevel = _mbg.BlockLevel
         }.Schedule(bCount, 1).Complete();
         
@@ -451,7 +496,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         // if (frame < iterations - 1)
         {
             new ParticlesCounterJob(_mbg.GridInfos, _mbg.SDF, _range, _particleID, _particleCount).Run();
-            Debug.Log("Resample particle count: " + _particleCount.Value);
+            // Debug.Log("Resample particle count: " + _particleCount.Value + (_particleCount.Value == NumParticles ? " (pool full)" : ""));
             new ResampleParticlesJob()
             {
                 GridLut = _mbg.GridInfos,
@@ -467,7 +512,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             (_particlePos, _particlePosCopy) = (_particlePosCopy, _particlePos);
             (_particleVelocity, _particleVelocityCopy) = (_particleVelocityCopy, _particleVelocity);
         }
-        
+
         Profiler.EndSample();
         
         Profiler.BeginSample("P2G");
@@ -494,6 +539,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         
         Profiler.BeginSample("Solve Pressure");
         _mbg.Solve();
+        _rs = _mbg.LastResidual;
         Profiler.EndSample();
         
         Profiler.BeginSample("G2P");
@@ -598,33 +644,91 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         }
     }
 
+    // raises interior level-1 blocks to level 2 once the fine band is no longer
+    // adjacent — the opposite direction is already covered by ComputeBlockSDFJob,
+    // which clamps coarse blocks next to the band back down to 1
+    [BurstCompile]
+    private struct DemoteInteriorJob : IJob
+    {
+        public NativeArray<int> BlockLevel;
+
+        public void Execute()
+        {
+            for (int i = 0; i < bCount; i++)
+            {
+                if (BlockLevel[i] != 1) continue;
+                int2 coord = Idx2Coord(i);
+                bool nearBand = false;
+                for (int dy = -1; dy <= 1 && !nearBand; dy++)
+                for (int dx = -1; dx <= 1 && !nearBand; dx++)
+                {
+                    int2 n = coord + new int2(dx, dy);
+                    if (math.any(n < 0) || math.any(n >= gWidth)) continue;
+                    if (BlockLevel[Coord2Idx(n)] == 0)
+                        nearBand = true;
+                }
+                if (!nearBand)
+                    BlockLevel[i] = 2;
+            }
+        }
+    }
+
     [BurstCompile]
     private struct SetBlockLevelJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<int2> Range;
+        // both still hold last frame's data — AllocateBaseCells runs after this job
+        [ReadOnly] public NativeArray<int2> Lut;
+        [ReadOnly] public NativeArray<float> SDF;
         public NativeArray<int> BlockLevel;
 
         public void Execute(int i)
         {
             int oldLevel = BlockLevel[i];
-            int level = oldLevel < 1 ? -1 : 2;
-            if (level < 0)
+
+            // particles in the halo keep the block in the fine band — and promote
+            // coarse blocks back to fine when the surface returns into them
+            int2 coord = Idx2Coord(i);
+            int2 haloStart = math.max(0, coord * bWidth - 1);
+            int2 haloEnd = math.min(bWidth * gWidth, coord * bWidth + bWidth + 1);
+            bool hasParticles = false;
+            for (int y = haloStart.y; y < haloEnd.y && !hasParticles; y++)
+            for (int x = haloStart.x; x < haloEnd.x; x++)
             {
-                int2 coord = Idx2Coord(i);
-                int2 haloStart = math.max(0, coord * bWidth - 1);
-                int2 haloEnd = math.min(bWidth * gWidth, coord * bWidth + bWidth + 1);
-                for (int y = haloStart.y; y < haloEnd.y; y++)
-                for (int x = haloStart.x; x < haloEnd.x; x++)
+                int2 range = Range[x + y * gWidth * bWidth];
+                if (range.y > range.x)
                 {
-                    int2 range = Range[x + y * gWidth * bWidth];
-                    if (range.y > range.x)
-                    {
-                        level = 0;
-                        break;
-                    }
+                    hasParticles = true;
+                    break;
                 }
             }
-            BlockLevel[i] = level;
+
+            if (hasParticles)
+            {
+                BlockLevel[i] = 0;
+                return;
+            }
+            if (oldLevel >= 1)
+            {
+                BlockLevel[i] = oldLevel; // coarse is sticky, only particles bring it back to fine
+                return;
+            }
+            if (oldLevel < 0)
+            {
+                BlockLevel[i] = -1;
+                return;
+            }
+
+            // fine block that lost its particles: demote by fluid depth instead of
+            // releasing outright — the fluid interior must stay covered by cells
+            int ptr = Lut[i].y;
+            float minSdf = float.MaxValue;
+            for (int c = 0; c < bWidth * bWidth; c++)
+                minSdf = math.min(minSdf, SDF[ptr + c]);
+
+            if (minSdf < 0) BlockLevel[i] = -1;              // all air/solid — release
+            else if (minSdf < Band2) BlockLevel[i] = 0;      // surface still runs through here (hysteresis)
+            else BlockLevel[i] = minSdf < Band2 + 4 ? 1 : 2; // shallow interior → 1, deep → 2
         }
     }
 
@@ -848,8 +952,9 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                 if (toAdd == 0) continue;
                 
                 int existCount = range.y - range.x - toAdd;
-                var posArr = new NativeArray<float2>(4, Allocator.Temp);
-                var velArr = new NativeArray<float2>(4, Allocator.Temp);
+                int slotCount = range.y - range.x; // a cell can hold more than 4 particles
+                var posArr = new NativeArray<float2>(slotCount, Allocator.Temp);
+                var velArr = new NativeArray<float2>(slotCount, Allocator.Temp);
                 for (int i = 0; i < existCount; i++)
                 {
                     int p = Ids[range.x + i];
@@ -913,7 +1018,8 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
 
         private static float2 ReadGrid(int2 coord, NativeArray<float2> block)
         {
-            return block[Coord2Idx(math.clamp(coord, 0, bWidth + 1))];
+            // halo block is (bWidth + 2) wide — must not use the grid-stride Coord2Idx here
+            return block[BlockCoord2Idx(math.clamp(coord, 0, bWidth + 1), bWidth + 2)];
         }
         private static void FillHaloBlock(NativeArray<float2> v, NativeArray<int2> infos, NativeArray<float2> block, int2 coord)
         {
@@ -1032,6 +1138,12 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                     int2 range = _range[cid];
                     int count = range.y - range.x;
                     int expect = sdf < 1 ? count : math.max(4, count);
+                    expect = math.min(expect, NumParticles - pCounter); // pool capacity guard
+                    if (expect <= 0)
+                    {
+                        _range[cid] = int2.zero;
+                        continue;
+                    }
                     for (int j = 0; j < expect; j++)
                         _particleIDs[pCounter + j] = j < count ? range.x + j : -1; // if need add particle, set -1
                     
@@ -1833,18 +1945,35 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
 
     private void Clear()
     {
-        _start.Dispose();
-        _end.Dispose();
-        _range.Dispose();
-        _particleID.Dispose();
-        _particlePos.Dispose();
-        _particleVelocity.Dispose();
-        _particlePosCopy.Dispose();
-        _particleVelocityCopy.Dispose();
-        _hashes.Dispose();
-        _particleCount.Dispose();
+        // OnDisable + OnDestroy both run Clear, so it must be idempotent
+        DisposeIfCreated(ref _start);
+        DisposeIfCreated(ref _end);
+        DisposeIfCreated(ref _range);
+        DisposeIfCreated(ref _particleID);
+        DisposeIfCreated(ref _particlePos);
+        DisposeIfCreated(ref _particleVelocity);
+        DisposeIfCreated(ref _particlePosCopy);
+        DisposeIfCreated(ref _particleVelocityCopy);
+        DisposeIfCreated(ref _hashes);
+        if (_particleCount.IsCreated)
+        {
+            _particleCount.Dispose();
+            _particleCount = default;
+        }
         _mbg?.Dispose();
-        _posBuffer.Release();
+        _mbg = null;
+        if (_posBuffer != null)
+        {
+            _posBuffer.Release();
+            _posBuffer = null;
+        }
+    }
+
+    private static void DisposeIfCreated<T>(ref NativeArray<T> array) where T : unmanaged
+    {
+        if (array.IsCreated)
+            array.Dispose();
+        array = default;
     }
 
     private void OnDrawGizmos()
@@ -1904,16 +2033,16 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                 int idx = ptr + BlockCoord2Idx(xx, yy, width);
                 float t = half * 0.8f;
                 float d = _mbg.SDF[idx];
-                Handles.Label(center, $"{d}");
+                // Handles.Label(center * 0.1f, $"{d}");
                 float2 vel = _mbg.GridVelocity[idx];
-                Gizmos.DrawLine(center, center + 0.2f * new Vector3(vel.x, vel.y, 0));
+                Gizmos.DrawLine(center * 0.1f, center * 0.1f + 0.02f * new Vector3(vel.x, vel.y, 0));
                 // float3 ps = _mbg.GridLaplacian[idx];
                 // if ((_mbg.GridTypes[idx] & 3) != 0) continue;
                 // Handles.Label(center, $"{ps.x:F2}");
                 // Handles.Label(center + new Vector3(-t,0,0.01f), $"{ps.y:F2}");
                 // Handles.Label(center + new Vector3(0,-t,0.01f), $"{ps.z:F2}");
                 
-                Gizmos.DrawWireCube(center, new Vector3(h, h, 0f));
+                Gizmos.DrawWireCube(center * 0.1f, new Vector3(h, h, 0f) * 0.1f);
             }
         }
     }
@@ -1982,7 +2111,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         return math.lerp(b, t, weight.y);
     }
     private static float2 ClampPosition(float2 pos) =>
-        math.clamp(pos, 0, 
-            (gWidth * bWidth));
+        // stay strictly below gWidth * bWidth so the cell hash stays within the LUT pool
+        math.clamp(pos, 0, gWidth * bWidth - 1e-3f);
 
 }

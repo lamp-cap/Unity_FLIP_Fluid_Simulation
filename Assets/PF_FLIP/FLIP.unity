@@ -257,7 +257,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &698787112
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -274,6 +274,7 @@ MonoBehaviour:
   flipness: 0.99
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: 878651dacc481f54da85c4070620f1f6, type: 2}
+  drawBaseParticles: 0
   outerRadius: 0.5
   surfaceDensity: 30
   nbSurfaceMaintenanceIterations: 5
@@ -695,7 +696,6 @@ GameObject:
   - component: {fileID: 1848604089}
   - component: {fileID: 1848604088}
   - component: {fileID: 1848604090}
-  - component: {fileID: 1848604091}
   m_Layer: 0
   m_Name: GameObject (1)
   m_TagString: Untagged
@@ -739,31 +739,15 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1848604087}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 452b10b12d65afa429a2b2044ce86c4a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
   solverType: 2
-  iterations: 19
-  gravity: -6.56
-  flipness: 0.95
-  mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
-  mat: {fileID: 2100000, guid: e18c57763f7bbce4e91ebffe70bc613b, type: 2}
---- !u!114 &1848604091
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1848604087}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: e48ac02686340574083101dc0c24a51c, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  gravity: -9
-  flipness: 0.99
+  iterations: 100
+  gravity: -9.19
+  flipness: 0.993
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: e18c57763f7bbce4e91ebffe70bc613b, type: 2}
 --- !u!1 &1985490831
