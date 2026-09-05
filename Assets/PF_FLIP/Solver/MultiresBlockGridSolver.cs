@@ -23,6 +23,8 @@ public class MultiresBlockGridSolver : System.IDisposable
     private NativeArray<float> _z;
     private NativeArray<float> _p;
     private NativeArray<float> _Ap;
+    // reused by Residual() — a fresh TempJob array per call showed up as GC
+    private NativeArray<float> _residualScratch;
     
     private NativeReference<float> _pAp;
     private NativeReference<float> _rzOld;
@@ -50,6 +52,10 @@ public class MultiresBlockGridSolver : System.IDisposable
     private const int LevelCount = 5;
 
     public int CellCount => _cellCount.Value;
+
+    // ||Ax - b|| against the latest pressure/flux pair — recomputed on read,
+    // safe (and cheap enough) to query once per GUI frame
+    public float LastResidual => Residual(GridInfos, GridLaplacian, _pressure, Flux);
     
     public MultiresBlockGridSolver()
     {
@@ -78,6 +84,7 @@ public class MultiresBlockGridSolver : System.IDisposable
         _z = _xPymaid[0];
         _p = new NativeArray<float>(numCells, Allocator.Persistent);
         _Ap = new NativeArray<float>(numCells, Allocator.Persistent);
+        _residualScratch = new NativeArray<float>(numCells, Allocator.Persistent);
         GridVelocity = new NativeArray<float2>(numCells, Allocator.Persistent);
         GridVelocityAlt = new NativeArray<float2>(numCells, Allocator.Persistent);
         GridVelocityDS = new NativeArray<float2>(numCells, Allocator.Persistent);
@@ -106,6 +113,7 @@ public class MultiresBlockGridSolver : System.IDisposable
         }
         _p .Dispose();
         _Ap.Dispose();
+        _residualScratch.Dispose();
         GridVelocityAlt.Dispose();
         GridVelocity.Dispose();
         GridVelocityDS.Dispose();
@@ -268,7 +276,6 @@ public class MultiresBlockGridSolver : System.IDisposable
         
         flux.CopyTo(_r);
 
-        var msg = ("init with residual: " + Residual(ifs[0], As[0], xs[0], bs[0]));
         int numCells = _cellCount.Value; // active cells only — the pool tail must stay 0
         var r =  _r;
         var z =  _z;
@@ -286,11 +293,9 @@ public class MultiresBlockGridSolver : System.IDisposable
         
         MultiGridVCycle(ifs, As, xs, bs);
         z.CopyTo(p);
-        
-        float rzOld = Dot(r, z, _rzOld);
 
-        msg += ("\nbegin with residual: " + Residual(ifs[0],  As[0], xs[0], bs[0]) + " rs: " + rzOld);
-        
+        Dot(r, z, _rzOld); // seeds _rzOld (alpha) for the first UpdateVR
+
         for (int iter = 0; iter < maxIter; iter++)
         {
             ApplyLaplace(infos, matrix, p, Ap);
@@ -318,24 +323,20 @@ public class MultiresBlockGridSolver : System.IDisposable
             float rs = 0;
             for (var i = 0; i < numCells; i++)
                 rs += r[i] * r[i];
-            msg += $"\niter{iter + 1}: \trs:{rs}";
             if (rs < 1e-6f || iter >= maxIter) break;
-            
+
             for (var i = 0; i < numCells; i++)
                 z[i] = 0;
             MultiGridVCycle(ifs, As, xs, bs);
 
-            rzOld = Dot(r, z, _rzNew);
+            float rzNew = Dot(r, z, _rzNew);
 
-            msg += $" \trsNew: {rs}\n";
-            if (rzOld < 1e-6f) break;
+            if (rzNew < 1e-6f) break;
             
             UpdateP(z, p, _rzNew, _rzOld);
 
             (_rzOld, _rzNew) = (_rzNew, _rzOld);
         }
-        
-        Debug.Log(msg + "\nResidual:" + Residual(infos, matrix, v, flux));
     }
 
     // Applies ONE multigrid V-cycle as a linear preconditioner: result = M^{-1} * rhs,
@@ -396,44 +397,7 @@ public class MultiresBlockGridSolver : System.IDisposable
         //     GaussSeidelPhase(3, lvs[3], ids[3], As[3], xs[3], bs[3], true);
         //     GaussSeidelPhase(3, lvs[3], ids[3], As[3], xs[3], bs[3], false);
         // }
-        for (int iter = 0; iter < 32; iter++)
-        {
-            for (int y = 0; y < GridWidth; y++)
-            for (int x = 0; x < GridWidth; x++)
-            {
-                int i = Coord2Idx(x, y);
-                int level = infos[3][i].x;
-                if (level < 0) continue;
-                float3 ac = As[3][i];
-                if (ac.x < 1e-5f) continue;
-                float ar = x < GridWidth - 1 ? As[3][Coord2Idx(x + 1, y)].y : 0;
-                float at = y < GridWidth - 1 ? As[3][Coord2Idx(x, y + 1)].z : 0;
-                float xl = x > 0 ? xs[3][Coord2Idx(x - 1, y)] : 0;
-                float xr = x < GridWidth - 1 ? xs[3][Coord2Idx(x + 1, y)] : 0;
-                float xb = y > 0 ? xs[3][Coord2Idx(x, y - 1)] : 0;
-                float xt = y < GridWidth - 1 ? xs[3][Coord2Idx(x, y + 1)] : 0;
-                float xc = xs[3][Coord2Idx(x, y)];
-                xs[3][i] = math.lerp(xc, (bs[3][i] - (xl * ac.y + xr * ar + xb * ac.z + xt * at)) / ac.x, 1.3f);
-            }
-
-            for (int y = GridWidth - 1; y >= 0; y--)
-            for (int x = GridWidth - 1; x >= 0; x--)
-            {
-                int i = Coord2Idx(x, y);
-                int level = infos[3][i].x;
-                if (level < 0) continue;
-                float3 ac = As[3][i];
-                if (ac.x < 1e-5f) continue;
-                float ar = x < GridWidth - 1 ? As[3][Coord2Idx(x + 1, y)].y : 0;
-                float at = y < GridWidth - 1 ? As[3][Coord2Idx(x, y + 1)].z : 0;
-                float xl = x > 0 ? xs[3][Coord2Idx(x - 1, y)] : 0;
-                float xr = x < GridWidth - 1 ? xs[3][Coord2Idx(x + 1, y)] : 0;
-                float xb = y > 0 ? xs[3][Coord2Idx(x, y - 1)] : 0;
-                float xt = y < GridWidth - 1 ? xs[3][Coord2Idx(x, y + 1)] : 0;
-                float xc = xs[3][Coord2Idx(x, y)];
-                xs[3][i] = math.lerp(xc, (bs[3][i] - (xl * ac.y + xr * ar + xb * ac.z + xt * at)) / ac.x, 1.3f);
-            }
-        }
+        new CoarseGaussSeidelJob(xs[3], As[3], infos[3], bs[3]).Run();
 
         for (int i = 2; i >= 0; i--)
         {
@@ -1046,11 +1010,15 @@ public class MultiresBlockGridSolver : System.IDisposable
     
     private float Residual(NativeArray<int2> infos, NativeArray<float3> a, NativeArray<float> v, NativeArray<float> b)
     {
-        var r = new NativeArray<float>(b.Length, Allocator.TempJob);
-        new ResidualJob(b, a, v, infos, r).Schedule(BlockCount, 1).Complete();
+        // persistent scratch (main-thread only, never reentrant) — a fresh TempJob
+        // array per call meant an allocation every time the GUI read LastResidual.
+        // Must be zeroed first: ResidualJob only writes fluid cells, the rest read 0.
+        int count = _cellCount.Value;
+        for (int i = 0; i < count; i++)
+            _residualScratch[i] = 0;
+        new ResidualJob(b, a, v, infos, _residualScratch).Schedule(BlockCount, 1).Complete();
 
-        new DotJob(r,r, _temp, _cellCount.Value).Run();
-        r.Dispose();
+        new DotJob(_residualScratch, _residualScratch, _temp, count).Run();
         return _temp.Value;
     }
     
@@ -1157,6 +1125,57 @@ public class MultiresBlockGridSolver : System.IDisposable
             }
         }
     }
+
+    // coarsest-level (level 3) smoother: forward + backward Gauss-Seidel sweeps.
+    // Serial IJob on purpose — each cell reads neighbors updated earlier in the same sweep.
+    [BurstCompile]
+    private struct CoarseGaussSeidelJob : IJob
+    {
+        [ReadOnly] private NativeArray<int2> _lut;
+        [ReadOnly] private NativeArray<float3> _a;
+        [ReadOnly] private NativeArray<float> _b;
+        private NativeArray<float> _v;
+
+        public CoarseGaussSeidelJob(NativeArray<float> v, NativeArray<float3> a, NativeArray<int2> lut, NativeArray<float> b)
+        {
+            _v = v;
+            _a = a;
+            _lut = lut;
+            _b = b;
+        }
+
+        public void Execute()
+        {
+            for (int iter = 0; iter < 16; iter++)
+            {
+                for (int y = 0; y < GridWidth; y++)
+                for (int x = 0; x < GridWidth; x++)
+                    Smooth(x, y);
+
+                for (int y = GridWidth - 1; y >= 0; y--)
+                for (int x = GridWidth - 1; x >= 0; x--)
+                    Smooth(x, y);
+            }
+        }
+
+        private void Smooth(int x, int y)
+        {
+            int i = Coord2Idx(x, y);
+            int level = _lut[i].x;
+            if (level < 0) return;
+            float3 ac = _a[i];
+            if (ac.x < 1e-5f) return;
+            float ar = x < GridWidth - 1 ? _a[Coord2Idx(x + 1, y)].y : 0;
+            float at = y < GridWidth - 1 ? _a[Coord2Idx(x, y + 1)].z : 0;
+            float xl = x > 0 ? _v[Coord2Idx(x - 1, y)] : 0;
+            float xr = x < GridWidth - 1 ? _v[Coord2Idx(x + 1, y)] : 0;
+            float xb = y > 0 ? _v[Coord2Idx(x, y - 1)] : 0;
+            float xt = y < GridWidth - 1 ? _v[Coord2Idx(x, y + 1)] : 0;
+            float xc = _v[i];
+            _v[i] = math.lerp(xc, (_b[i] - (xl * ac.y + xr * ar + xb * ac.z + xt * at)) / ac.x, 1.3f);
+        }
+    }
+
     private void Restriction(NativeArray<float> bf, NativeArray<float3> af, NativeArray<float> vf, NativeArray<int2> infof,
         NativeArray<float> rc, NativeArray<float3> ac, NativeArray<float> vc, NativeArray<int2> infoc)
     {

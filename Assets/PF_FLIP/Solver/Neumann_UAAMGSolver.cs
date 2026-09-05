@@ -28,6 +28,7 @@ namespace PF_FLIP
         private NativeReference<float> rs_old;
         private NativeReference<float> pAp;
         private NativeReference<float> rs_new;
+        private bool _warmStarted;
 
         public Neumann_UAAMGSolver(NativeArray<float3> a, NativeArray<float> v, NativeArray<float> b, int gridRes, float h)
         {
@@ -229,9 +230,19 @@ namespace PF_FLIP
 
         public void Solve_MGPCG(int maxIter, out float rs)
         {
-            new ClearJob(V).Schedule().Complete();
-            Z.CopyFrom(V);
-            R.CopyFrom(F);
+            // warm start: keep the previous frame's pressure as the initial
+            // guess — pressure is temporally coherent, so the first V-cycle
+            // starts from a far better point than zero (clear once, first call,
+            // since a fresh NativeArray holds garbage)
+            if (!_warmStarted)
+            {
+                new ClearJob(V).Schedule().Complete();
+                _warmStarted = true;
+            }
+            new Residual(A, V, F, R, GridRes, H).Schedule(R.Length, BatchSize).Complete();
+            new Dot(R, R, rs_new).Schedule().Complete();
+            float bNorm = math.sqrt(rs_new.Value); // for the relative early-exit test
+            new ClearJob(Z).Schedule().Complete();
             MultiGridVCycle().Complete();
             P.CopyFrom(Z);
 
@@ -243,6 +254,11 @@ namespace PF_FLIP
                     var handle = new Laplace(A, P,  Ap, GridRes, H).Schedule(R.Length, BatchSize);
                     handle = new Dot(P, Ap, pAp).Schedule(handle);
                     new UpdateVR(P, Ap, V, R, rs_old, pAp).Schedule(V.Length, BatchSize, handle).Complete();
+
+                    // early exit on relative residual: iterations are only spent
+                    // when the phase mobility contrast actually demands them
+                    new Dot(R, R, rs_new).Schedule().Complete();
+                    if (math.sqrt(rs_new.Value) < 1e-4f * bNorm) break;
 
                     if (iter == maxIter - 1) break;
 
