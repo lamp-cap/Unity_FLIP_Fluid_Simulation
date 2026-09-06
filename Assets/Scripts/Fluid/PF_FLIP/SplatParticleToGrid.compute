@@ -1,0 +1,366 @@
+#pragma use_dxc
+#pragma target 6.0
+
+#include "PF_FlipUtils.hlsl"
+
+#pragma kernel BlockRange
+#pragma kernel ClearGridWeight
+#pragma kernel P2G
+#pragma kernel Normalize
+#pragma kernel AddForce
+
+float4 _Gravity;
+
+StructuredBuffer<Particle> _Particles;
+StructuredBuffer<uint2> _ParticlesRangeR;
+
+StructuredBuffer<uint2> _BlockParticleRangeR;
+RWStructuredBuffer<uint2> _BlockParticleRangeW;
+
+StructuredBuffer<int> _WeightsSumR;
+RWStructuredBuffer<int> _WeightsSumW;
+
+RWTexture3D<float4> _VelocityW;
+Texture3D<float4> _VelocityOldR;
+RWTexture3D<float4> _VelocityOldW;
+
+Texture3D<uint> _GridTypesR;
+
+Texture3D<float> _GridSDFR;
+
+static const float KernelPoly6 = 315.0f / (64.0f * 3.14159265);
+
+static float SmoothingKernelPoly6(float r2)
+{
+    if (r2 < 1)
+    {
+        float v = 1 - r2;
+        return v * v * v * KernelPoly6;
+    }
+    return 0;
+}
+
+// ============================================================
+// BlockRange: reduce per-cell ranges (Morton) into per-block
+// ranges. 512 consecutive Morton cells == one 8x8x8 block, so
+// block b (== Morton code of the block coord) owns per-cell
+// entries [b*512, b*512+512).
+// ============================================================
+groupshared uint2 g_blockRange[8];
+
+[numthreads(256, 1, 1)]
+void BlockRange(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint rangeStart = gid.x * 512;
+    uint2 localRange = uint2(_NumParticles, 0);
+    [unroll(2)]
+    for (int i = 0; i < 2; ++i)
+    {
+        uint idx = i * 256 + gi;
+        uint2 range = _ParticlesRangeR[rangeStart + idx];
+        uint rangeX = WaveActiveMin(range.x);
+        uint rangeY = WaveActiveMax(range.y);
+        if (WaveIsFirstLane())
+            localRange = uint2(min(rangeX, localRange.x), max(rangeY, localRange.y));
+    }
+    if (WaveIsFirstLane())
+        g_blockRange[gi / 32] = localRange;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gi < 8)
+    {
+        uint2 range = g_blockRange[gi];
+        uint rangeX = WaveActiveMin(range.x);
+        uint rangeY = WaveActiveMax(range.y);
+        if (gi == 0)
+            _BlockParticleRangeW[gid.x] = uint2(rangeX, rangeY);
+    }
+}
+
+// ============================================================
+// ClearGridWeight: zero the fixed-point accumulator (7 int
+// planes: velocity.xyz, weight.xyz, density). One thread per
+// cell clears all 7 planes.
+// ============================================================
+[numthreads(256, 1, 1)]
+void ClearGridWeight(uint3 id : SV_DispatchThreadID)
+{
+    [unroll]
+    for (int i = 0; i < 7; ++i)
+        _WeightsSumW[id.x + i * _NumCells] = 0;
+}
+// ============================================================
+// Scatter P2G. Each 8x8x8 block gets a group; particles owned by
+// the block are streamed through 128 threads and splatted into a
+// 10x10x10 groupshared tile (1-cell halo each side) using warp
+// segmented reduction to fold same-cell lanes before atomics.
+// ============================================================
+#define SCALER 2048.0
+#define SPLAT_SIZE 128
+
+// 10*10*10 cells * 7 planes (vel.xyz, weight.xyz, density)
+groupshared int g_dataSum[10 * 10 * 10 * 7];
+
+inline int LocalIdx(int3 coord)
+{
+    return coord.x + coord.y * 10 + coord.z * 100;
+}
+inline int3 LocalCoord(int i)
+{
+    return int3(i % 10, i / 10 % 10, i / 100);
+}
+
+// Per-axis kernel factor. Mirrors the kernel choice GetWeight makes in
+// NBFlipUtils.hlsl so switching USE_LINEAR_KERNEL stays consistent.
+inline float3 SeparableWeight(float3 abs_x)
+{
+#if defined(USE_LINEAR_KERNEL)
+    return GetLinearWeight(abs_x);
+#else
+    return GetQuadraticWeight(abs_x);
+#endif
+}
+
+void ScatterParticleToSharedBlock(Particle p, int3 coordMin)
+{
+    float3 pos = DecodePosition(p.packedPosition);
+    float3 vel = DecodeVelocity(p.packedVelocity);
+
+    int3 pCoord = PositionCoord(p.packedPosition);
+    int3 localCoord = pCoord - coordMin;
+
+    // Segment same-cell lanes: a lane is a segment boundary when the previous
+    // lane targets a different local cell. `interval` is the length of the
+    // trailing run of same-cell lanes above this one.
+    //
+    // Note: WaveMatch/WaveMultiPrefixSum can express this more compactly, but
+    // both are emulated by DXC (ballot + shuffle loops), and WaveMultiPrefixSum
+    // costs one scan per component per stencil tap - 6 scans x 27 taps. That is
+    // far more than folding a run which, for Morton-sorted particles, is only
+    // 1-3 lanes deep. The explicit shuffle fold below is the faster form.
+    int laneid = WaveGetLaneIndex();
+    int local_idx = LocalIdx(localCoord);
+    bool is_boundary = WaveIsFirstLane();
+    if (!is_boundary)
+    {
+        int prev_idx = WaveReadLaneAt(local_idx, laneid - 1);
+        is_boundary = prev_idx != local_idx;
+    }
+
+    uint mark = reversebits(WaveActiveBallot(is_boundary));
+    uint chk = laneid < 31 ? ((mark << (laneid + 1)) | ((1U << (laneid + 1)) - 1)) : 0xFFFFFFFF;
+    int interval = 31 - asint(firstbithigh(chk)); // trailing run of same-cell lanes
+    int iter = WaveActiveMax(interval);
+
+    // The kernel is separable: w(p - c) = wx(dx) * wy(dy) * wz(dz), so the 27
+    // stencil taps only need 3 distinct factors per axis. Precompute them once
+    // instead of re-deriving cell centres and evaluating the polynomial 3x per
+    // iteration (81 evaluations -> 9).
+    //
+    // The grid is staggered, so component vx is offset by -0.5 cells on x only,
+    // vy on y only, vz on z only. Per axis that gives two factor sets: the
+    // half-shifted one (used by the component living on that axis) and the
+    // cell-centred one (used by the other two components).
+    //
+    // Distance from particle to the tap at cellCenter, in cell units:
+    //   dCentre = pos/h - (coord + 0.5),  dStagger = dCentre + 0.5
+    const float3 posCells = pos * _InvCellSize;
+    const float3 dCentre0 = posCells - ((float3)pCoord + 0.5f);
+    const float3 dStagger0 = dCentre0 + 0.5f;
+
+    // wCentre[o] / wStagger[o] hold the per-axis factors for stencil offset o-1.
+    float3 wCentre[3];
+    float3 wStagger[3];
+    [unroll]
+    for (int o = 0; o < 3; ++o)
+    {
+        const float fo = (float)(o - 1);
+        wCentre[o]  = SeparableWeight(abs(dCentre0  - fo));
+        wStagger[o] = SeparableWeight(abs(dStagger0 - fo));
+    }
+
+    // 3x3x3 splat (quadratic kernel support), same footprint as full-sim splat.
+    // [unroll] is required, not cosmetic: it makes the wCentre/wStagger indices
+    // compile-time constants. Left dynamic, those local arrays spill to scratch
+    // memory instead of staying in registers.
+    [unroll]
+    for (int offi = -1; offi <= 1; ++offi)
+    [unroll]
+    for (int offj = -1; offj <= 1; ++offj)
+    [unroll]
+    for (int offk = -1; offk <= 1; ++offk)
+    {
+        int3 neighborCoord = pCoord + int3(offi, offj, offk);
+
+        const int3 o3 = int3(offi, offj, offk) + 1;
+        // vx: staggered on x, centred on y/z. vy: staggered on y. vz: on z.
+        float3 weights = float3(
+            wStagger[o3.x].x * wCentre[o3.y].y  * wCentre[o3.z].z,
+            wCentre[o3.x].x  * wStagger[o3.y].y * wCentre[o3.z].z,
+            wCentre[o3.x].x  * wCentre[o3.y].y  * wStagger[o3.z].z);
+
+        float3 warp_velocity_sum = weights * vel;
+        float3 warp_weight_sum = weights;
+
+        // density kernel is NOT separable - evaluate poly6 on the centred
+        // distance to this tap (same as GPU_FLIP's pos - cellCenter, but in
+        // cell units reusing the precomputed offset: posCells - (coord+o+0.5))
+        const float3 dCentre = dCentre0 - (o3 - 1);
+        float density = SmoothingKernelPoly6(dot(dCentre, dCentre));
+
+        // fold this offset's contribution across the same-cell lane run
+        int stride = 1;
+        while (stride <= iter)
+        {
+            float3 neighbor_velocity = WaveReadLaneAt(warp_velocity_sum, laneid + stride);
+            float3 neighbor_weights = WaveReadLaneAt(warp_weight_sum, laneid + stride);
+            float neighbor_density = WaveReadLaneAt(density, laneid + stride);
+            if (stride <= interval)
+            {
+                warp_velocity_sum += neighbor_velocity;
+                warp_weight_sum += neighbor_weights;
+                density += neighbor_density;
+            }
+            stride <<= 1;
+        }
+
+        int index = LocalIdx(localCoord + int3(offi, offj, offk));
+        bool is_valid = all(neighborCoord >= 0) && all(neighborCoord < _GridSize) && index >= 0 && index < 1000;
+
+        if (is_boundary && is_valid)
+        {
+            InterlockedAdd(g_dataSum[index + 0 * 1000], (int)round(warp_velocity_sum.x * SCALER));
+            InterlockedAdd(g_dataSum[index + 1 * 1000], (int)round(warp_velocity_sum.y * SCALER));
+            InterlockedAdd(g_dataSum[index + 2 * 1000], (int)round(warp_velocity_sum.z * SCALER));
+            InterlockedAdd(g_dataSum[index + 3 * 1000], (int)round(warp_weight_sum.x * SCALER));
+            InterlockedAdd(g_dataSum[index + 4 * 1000], (int)round(warp_weight_sum.y * SCALER));
+            InterlockedAdd(g_dataSum[index + 5 * 1000], (int)round(warp_weight_sum.z * SCALER));
+
+            InterlockedAdd(g_dataSum[index + 6 * 1000], (int)round(density * SCALER));
+        }
+    }
+}
+[numthreads(SPLAT_SIZE, 1, 1)]
+void P2G(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    // clear the 10x10x10x7 groupshared accumulator
+    for (int c = gi; c < 1000; c += SPLAT_SIZE)
+    {
+        [unroll]
+        for (int j = 0; j < 7; ++j)
+            g_dataSum[c + j * 1000] = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // gid is the 3D block coord; block Morton code indexes the range buffer
+    int3 coord0 = (int3)gid * 8;
+    int3 coordMin = coord0 - 1; // 1-cell halo
+    uint2 range = _BlockParticleRangeR[Coord2Idx(gid)];
+
+    if (range.x < range.y)
+    {
+        uint num_groups = (range.y - range.x + SPLAT_SIZE - 1) / SPLAT_SIZE;
+        for (uint i = 0; i < num_groups; i++)
+        {
+            uint pid = range.x + SPLAT_SIZE * i + gi;
+            if (pid < range.y)
+                ScatterParticleToSharedBlock(_Particles[pid], coordMin);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // flush groupshared tile to global. Interior cells (no cross-block
+    // overlap) store directly; the 1-cell halo folds into neighbours' tiles
+    // via atomics.
+    if (range.x >= range.y) return;
+    for (int idx = gi; idx < 1000; idx += SPLAT_SIZE)
+    {
+        int3 localCoord = LocalCoord(idx);
+        int3 globalCoord = coordMin + localCoord;
+        if (any(globalCoord < 0) || any(globalCoord >= _GridSize)) continue;
+        float sdf = _GridSDFR[globalCoord];
+        if (sdf > Band1 || sdf < -Band1)
+            continue;
+
+        int globalIdx = Morton3DEncode(globalCoord);
+        bool interior = all(localCoord > 1) && all(localCoord < 8);
+        if (interior)
+        {
+            [unroll]
+            for (int j = 0; j < 7; ++j)
+                _WeightsSumW[globalIdx + j * _NumCells] = g_dataSum[idx + j * 1000];
+        }
+        else
+        {
+            [unroll]
+            for (int j = 0; j < 7; ++j)
+                InterlockedAdd(_WeightsSumW[globalIdx + j * _NumCells], g_dataSum[idx + j * 1000]);
+        }
+    }
+}
+
+// ============================================================
+// Normalize: divide accumulated velocity by weight, write density.
+// Boundary condition is applied later in AddForce (matches gather P2G).
+// ============================================================
+[numthreads(GROUP_THREADS_D3)]
+void Normalize(uint3 id : SV_DispatchThreadID)
+{
+    float sdf = _GridSDFR[id];
+    if (sdf > Band1 || sdf < -Band2)
+    {
+        // Deep cells of BOTH phases keep the semi-Lagrangian velocity
+        // GridAdvection wrote last frame (air is simulated too now);
+        // w = TargetDensity marks "a full cell of particles" for the
+        // (disabled) density term — 5, matching the CPU constant
+        _VelocityOldW[id] = float4(_VelocityOldW[id].xyz, 5.0);
+        return;
+    }
+    int idx = Morton3DEncode(id);
+    float3 velocity = float3(
+        _WeightsSumR[idx + 0 * _NumCells],
+        _WeightsSumR[idx + 1 * _NumCells],
+        _WeightsSumR[idx + 2 * _NumCells]) / SCALER;
+    float4 weights = float4(
+        _WeightsSumR[idx + 3 * _NumCells],
+        _WeightsSumR[idx + 4 * _NumCells],
+        _WeightsSumR[idx + 5 * _NumCells],
+        _WeightsSumR[idx + 6 * _NumCells]) / SCALER;
+
+    // Zero-weight band cells keep the advected velocity — the select() in
+    // the CPU ParticleToGridJob: a band cell transiently without splats
+    // must not lose the semi-Lagrangian state GridAdvection left there
+    _VelocityOldW[id] = float4(weights.xyz > 1e-4f ? velocity / weights.xyz : _VelocityOldW[id].xyz, weights.w);
+}
+float3 _RayOrigin;
+float3 _RayDirection;
+float4 _MouseForceParameter; // xyz: force  w: range
+
+inline float GetMouseForce(float3 position)
+{
+    const float distance_to_mouse_ray = length(cross(_RayDirection, position - _RayOrigin));
+    const float normalized_distance = distance_to_mouse_ray / _MouseForceParameter.w;
+    return smoothstep(1.0, 0.9, normalized_distance);
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void AddForce(uint3 id : SV_DispatchThreadID)
+{
+    uint grid_types = _GridTypesR[id];
+
+    // forward Euler time integration
+    float4 velocity = _VelocityOldR[id] + _Gravity * _DeltaTime;
+
+    // add mouse force
+    const float3 position = id * _CellSize;
+    const float3 position_vx = position + float3(-0.5f * _CellSize, 0.0f, 0.0f);
+    const float3 position_vy = position + float3(0.0f, -0.5f * _CellSize, 0.0f);
+    const float3 position_vz = position + float3(0.0f, 0.0f, -0.5f * _CellSize);
+    float3 mouse_force = float3(GetMouseForce(position_vx), GetMouseForce(position_vy), GetMouseForce(position_vz));
+    mouse_force *= _MouseForceParameter.xyz * IsFluidCell(GetMyType(grid_types));
+    velocity.xyz += mouse_force * _DeltaTime;
+
+    _VelocityW[id] = float4(EnforceBoundaryCondition(velocity, grid_types), velocity.w);
+}

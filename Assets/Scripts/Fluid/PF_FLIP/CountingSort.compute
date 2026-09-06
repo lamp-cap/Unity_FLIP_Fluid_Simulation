@@ -1,0 +1,211 @@
+
+#pragma use_dxc
+
+#include "PF_FlipUtils.hlsl"
+
+#pragma target 6.5
+#pragma require WaveBasic WaveBallot WaveMultiPrefix
+
+#pragma kernel Counting
+#pragma kernel ClearGrid
+#pragma kernel ClearScanFlags
+#pragma kernel ScanRange
+#pragma kernel Rearrange
+
+StructuredBuffer<uint> _ParticlesIDR;
+RWStructuredBuffer<uint> _ParticlesIDW;
+
+StructuredBuffer<uint> _ParticlesHashR;
+RWStructuredBuffer<uint> _ParticlesHashW;
+
+StructuredBuffer<Particle> _ParticlesR;
+RWStructuredBuffer<Particle> _ParticlesW;
+
+StructuredBuffer<uint2> _ParticlesRangeR;
+RWStructuredBuffer<uint2> _ParticlesRangeW;
+
+RWTexture3D<float> _PressureW;
+
+StructuredBuffer<uint> _CounterR;
+RWStructuredBuffer<uint> _CounterW;
+
+globallycoherent RWStructuredBuffer<uint> _PartitionScanDescriptors;
+
+#define KEYS_PER_THREAD     8
+#define PARTITION_SIZE      512
+#define FLAG_INVALID        0u
+#define FLAG_AGGREGATE      1u
+#define FLAG_PREFIX         2u
+
+// Helper to count and rank keys using WaveMatch
+inline void CountAndRank(uint key, uint numParticles, out uint rank)
+{
+    // Use WaveMatch to find all threads with the same key
+    uint4 groupMask = WaveMatch(key);
+
+    // Find the highest lane with this key (leader)
+    int4 highLanes = (int4)(firstbithigh(groupMask) | uint4(0, 0x20, 0x40, 0x60));
+    uint highLane = (uint)max(max(max(highLanes.x, highLanes.y), highLanes.z), highLanes.w);
+    bool leader = WaveGetLaneIndex() == highLane;
+
+    // Count total threads with this key
+    uint4 active = countbits(groupMask);
+    uint result = active.x + active.y + active.z + active.w;
+
+    // Rank within the group
+    uint laneid = WaveGetLaneIndex();
+    uint sub = laneid & 31u;
+    uint which = laneid >> 5;
+    uint loMask = (1u << sub) - 1u;
+
+    uint4 before;
+    before.x = which > 0 ? 0xFFFFFFFFu : loMask;
+    before.y = which > 1 ? 0xFFFFFFFFu : (which == 1 ? loMask : 0u);
+    before.z = which > 2 ? 0xFFFFFFFFu : (which == 2 ? loMask : 0u);
+    before.w = which > 3 ? 0xFFFFFFFFu : (which == 3 ? loMask : 0u);
+
+    uint4 sameBefore = groupMask & before;
+    uint localRank = countbits(sameBefore.x) + countbits(sameBefore.y)
+                   + countbits(sameBefore.z) + countbits(sameBefore.w);
+
+    // Leader atomically adds to global counter
+    uint base = 0;
+    if (leader && key < 0xFFFFFFFFu)
+        InterlockedAdd(_ParticlesRangeW[key].y, result, base);
+    base = WaveReadLaneAt(base, highLane);
+
+    rank = base + localRank;
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void Counting(uint3 id : SV_DispatchThreadID)
+{
+    uint numParticles = _CounterR[0];
+    uint baseIndex = id.x * KEYS_PER_THREAD;
+
+    [unroll]
+    for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+    {
+        uint index = baseIndex + i;
+        if (index >= numParticles) break;
+
+        uint key = Coord2Idx(PositionCoord(_ParticlesR[index].packedPosition));
+
+        // Store hash for later use in Rearrange
+        _ParticlesHashW[index] = key;
+
+        uint rank;
+        CountAndRank(key, numParticles, rank);
+
+        if (key < 0xFFFFFFFFu)
+            _ParticlesIDW[index] = rank;
+    }
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void ClearGrid (uint3 id : SV_DispatchThreadID)
+{
+    _PressureW[id] = 0.f;
+    uint idx = Coord2Idx(id);
+    _ParticlesRangeW[idx] = uint2(0, 0);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ClearScanFlags(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x <= _NumPartitions + 1)
+        _PartitionScanDescriptors[id.x] = 0;
+    if (id.x == 0)
+        _PartitionScanDescriptors[0] = FLAG_PREFIX; // seed slot 0
+}
+
+// ------------------------------------------------------------------
+// ScanRange: exclusive prefix sum over the per-cell counts in
+// _ParticlesRangeW[].y (decoupled look-back), writing start/end:
+//   _ParticlesRangeW[cell] = uint2(start, end),  end == start + count
+// ------------------------------------------------------------------
+groupshared uint sharedData[16];
+groupshared uint partitionIndex;
+groupshared uint sharedPrefix;
+
+[numthreads(PARTITION_SIZE, 1, 1)]
+void ScanRange(uint id : SV_GroupIndex)
+{
+    if (id == 0)
+    {
+        InterlockedAdd(_PartitionScanDescriptors[_NumPartitions + 1], 1u, partitionIndex);
+        sharedPrefix = 0;
+    }
+    int wid = id / 32;
+    GroupMemoryBarrierWithGroupSync();
+    uint pid = partitionIndex;
+    uint globalIdx = pid * PARTITION_SIZE + id;
+
+    uint val = 0;
+    if (globalIdx < (uint)_NumCells)
+        val = _ParticlesRangeW[globalIdx].y;   // count from Counting
+
+    uint localInclusive = WavePrefixSum(val) + val;
+    if (WaveGetLaneIndex() == 31) sharedData[wid] = localInclusive;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (id < 16)
+        sharedData[id] += WavePrefixSum(sharedData[id]);
+    GroupMemoryBarrierWithGroupSync();
+
+    uint aggregate = sharedData[15];
+
+    bool ownsSlot = pid < (uint)_NumPartitions;
+    if (id == 0 && ownsSlot)
+        InterlockedAdd(_PartitionScanDescriptors[pid + 1], FLAG_AGGREGATE | (aggregate << 2));
+
+    if (id == 0 && ownsSlot)
+    {
+        int lookback = pid;
+        uint lookbackReduction = 0;
+        while (lookback >= 0)
+        {
+            const uint desc = _PartitionScanDescriptors[lookback];
+            if ((desc & 3) == FLAG_PREFIX)
+            {
+                lookbackReduction += desc >> 2;
+                if (pid < _NumPartitions - 1)
+                    InterlockedAdd(_PartitionScanDescriptors[pid + 1], FLAG_AGGREGATE | (lookbackReduction << 2));
+                sharedPrefix = lookbackReduction;
+                break;
+            }
+            if ((desc & 3) == FLAG_AGGREGATE)
+            {
+                lookbackReduction += desc >> 2;
+                lookback--;
+                continue;
+            }
+            // FLAG_INVALID (0): predecessor hasn't published yet — spin
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint offset = sharedPrefix + localInclusive - val + (wid > 0 ? sharedData[wid - 1] : 0);
+
+    if (globalIdx < (uint)_NumCells)
+        _ParticlesRangeW[globalIdx] = uint2(offset, offset + val);
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void Rearrange(uint3 id : SV_DispatchThreadID)
+{
+    uint numParticles = _CounterR[0];
+    uint baseIndex = id.x * KEYS_PER_THREAD;
+
+    [unroll]
+    for (uint i = 0; i < KEYS_PER_THREAD; ++i)
+    {
+        uint index = baseIndex + i;
+        if (index >= numParticles) break;
+
+        uint key = _ParticlesHashR[index];
+        uint dst = _ParticlesRangeR[key].x + _ParticlesIDR[index];
+        _ParticlesW[dst] = _ParticlesR[index];
+    }
+}

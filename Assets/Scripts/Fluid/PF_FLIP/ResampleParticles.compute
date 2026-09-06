@@ -1,0 +1,408 @@
+
+#pragma use_dxc
+#include "PF_FlipUtils.hlsl"
+
+#pragma target 6.0
+// #pragma enable_d3d12_debug_symbols
+
+#pragma kernel ClassifyGridPhase
+#pragma kernel SetGridType
+#pragma kernel SetGridLevel
+#pragma kernel ParticlesCounter
+#pragma kernel ResampleParticles
+#pragma kernel ClearScanFlags
+
+StructuredBuffer<int> _ParticlesIDR;
+RWStructuredBuffer<int> _ParticlesIDW;
+
+StructuredBuffer<uint> _ParticlesHashR;
+RWStructuredBuffer<uint> _ParticlesHashW;
+
+StructuredBuffer<Particle> _ParticlesR;
+RWStructuredBuffer<Particle> _ParticlesW;
+
+StructuredBuffer<uint2> _ParticlesRangeR;
+RWStructuredBuffer<uint2> _ParticlesRangeW;
+
+RWTexture3D<float> _GridSDFW;
+Texture3D<float> _GridSDFR;
+
+Texture3D<uint> _GridTypesR;
+RWTexture3D<uint> _GridTypesW;
+
+Texture3D<uint> _GridPhaseR;
+RWTexture3D<uint> _GridPhaseW;
+
+RWStructuredBuffer<uint> _CounterW;
+
+Texture3D<float4> _VelocityR;
+
+RWTexture3D<float4> _GridCoefficientW;
+
+// Two-phase: the whole domain interior is simulated — phase is a density
+// distinction carried by _GridPhase, not a cell type. SOLID stays walls-only.
+inline uint GetType(int3 coord)
+{
+    if (any(coord < 0) || any(coord >= _GridSize))
+        return SOLID;
+    return FLUID;
+}
+
+// ============================================================
+// ClassifyGridPhase: per-cell water/air from the phases of the
+// particles it currently holds (BuildLut already sorted them into
+// _ParticlesRangeR). One water particle outweighs any air crowd at
+// 1000:1, so ANY water particle classifies the cell water; empty
+// cells inherit the sign of last frame's SDF. Low 8 bits keep the
+// water count for spray detection in G2P.
+// ============================================================
+[numthreads(GROUP_THREADS_D3)]
+void ClassifyGridPhase (uint3 id : SV_DispatchThreadID)
+{
+    uint2 range = _ParticlesRangeR[Coord2Idx(id)];
+    uint waterCount = 0;
+    [loop]
+    for (uint i = range.x; i < range.y; i++)
+    {
+        waterCount += UnpackPhase(_ParticlesR[i].packedPosition.y);
+    }
+    waterCount = min(waterCount, 255u); // keep the count from touching bit 8
+
+    uint info = waterCount > 0 ? (GRIDPHASE_WATER_FLAG | waterCount) : 0;
+    if (range.x >= range.y)
+        info = _GridSDFR[id] >= 0 ? GRIDPHASE_WATER_FLAG : 0;
+
+    _GridPhaseW[id] = info;
+}
+
+// SetGridType reads a 1-cell halo around its 8x8x8 tile, so the naive version
+// evaluates GetType 7x per thread (3584 per group) over a footprint of only
+// 10^3 = 1000 distinct cells — every interior cell is fetched 7 times. Stage
+// the padded tile in LDS once, then read neighbours from there.
+#define SGT_TILE        8                                   // = GROUP_THREADS_D3
+#define SGT_PAD         (SGT_TILE + 2)                       // 10, one halo cell each side
+#define SGT_PAD_COUNT   (SGT_PAD * SGT_PAD * SGT_PAD)        // 1000
+#define SGT_GROUP_SIZE  (SGT_TILE * SGT_TILE * SGT_TILE)     // 512
+
+// gs_types entry: bits 0-1 = cell type, bit 2 = water-phase flag
+#define SGT_TYPE_MASK   3u
+#define SGT_WATER(t)    (((t) >> 2) & 1u)
+
+// Water flag lookup for the LDS staging loop; out-of-bounds cells are
+// SOLID walls, whose phase never reaches a coefficient (k = 0 anyway).
+inline uint SgtWaterSafe(int3 coord)
+{
+    if (any(coord < 0) || any(coord >= _GridSize))
+        return 0;
+    return CellIsWater(_GridPhaseR[coord]);
+}
+
+groupshared uint gs_types[SGT_PAD_COUNT];
+
+inline uint SgtPadIdx(uint3 p)
+{
+    return (p.z * SGT_PAD + p.y) * SGT_PAD + p.x;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void SetGridType (uint3 id : SV_DispatchThreadID,
+                  uint3 gtid : SV_GroupThreadID,
+                  uint3 gid : SV_GroupID,
+                  uint gindex : SV_GroupIndex)
+{
+    // Origin of the padded tile in grid space (may be negative; GetType clamps
+    // out-of-bounds lookups to SOLID, matching the per-thread version).
+    const int3 padOrigin = (int3)(gid * SGT_TILE) - 1;
+
+    // 1000 cells / 512 threads => at most 2 cooperative load iterations.
+    for (uint i = gindex; i < SGT_PAD_COUNT; i += SGT_GROUP_SIZE)
+    {
+        uint3 p = uint3(i % SGT_PAD, (i / SGT_PAD) % SGT_PAD, i / (SGT_PAD * SGT_PAD));
+        int3 coord = padOrigin + (int3)p;
+        gs_types[i] = GetType(coord)
+            | (SgtWaterSafe(coord) << 2);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint3 c = gtid + 1;   // this thread's cell inside the padded tile
+    const uint gridType = gs_types[SgtPadIdx(c)] & SGT_TYPE_MASK;
+    const uint xp_type  = gs_types[SgtPadIdx(c - uint3(1, 0, 0))];
+    const uint xn_type  = gs_types[SgtPadIdx(c + uint3(1, 0, 0))];
+    const uint yp_type  = gs_types[SgtPadIdx(c - uint3(0, 1, 0))];
+    const uint yn_type  = gs_types[SgtPadIdx(c + uint3(0, 1, 0))];
+    const uint zp_type  = gs_types[SgtPadIdx(c - uint3(0, 0, 1))];
+    const uint zn_type  = gs_types[SgtPadIdx(c + uint3(0, 0, 1))];
+
+    // Variable-coefficient row: face mobility toward each neighbour, k = 0 on
+    // solid faces (Neumann wall). Diagonal = -(sum of the 6 face mobilities),
+    // yzw carry the three "-axis" face coefficients — the MGPCG aggregation
+    // already supports arbitrary values here, so the solver needs no change.
+    const uint selfWater = SGT_WATER(gs_types[SgtPadIdx(c)]);
+    const float kxp = (xp_type & SGT_TYPE_MASK) == SOLID ? 0.0 : FaceMobility(selfWater, SGT_WATER(xp_type));
+    const float kxn = (xn_type & SGT_TYPE_MASK) == SOLID ? 0.0 : FaceMobility(selfWater, SGT_WATER(xn_type));
+    const float kyp = (yp_type & SGT_TYPE_MASK) == SOLID ? 0.0 : FaceMobility(selfWater, SGT_WATER(yp_type));
+    const float kyn = (yn_type & SGT_TYPE_MASK) == SOLID ? 0.0 : FaceMobility(selfWater, SGT_WATER(yn_type));
+    const float kzp = (zp_type & SGT_TYPE_MASK) == SOLID ? 0.0 : FaceMobility(selfWater, SGT_WATER(zp_type));
+    const float kzn = (zn_type & SGT_TYPE_MASK) == SOLID ? 0.0 : FaceMobility(selfWater, SGT_WATER(zn_type));
+
+    _GridCoefficientW[id] = gridType == FLUID
+        ? float4(-(kxp + kxn + kyp + kyn + kzp + kzn), kxp, kyp, kzp)
+        : 0;
+    _GridTypesW[id] = PackGridTyped(gridType,
+        xp_type & SGT_TYPE_MASK, xn_type & SGT_TYPE_MASK,
+        yp_type & SGT_TYPE_MASK, yn_type & SGT_TYPE_MASK,
+        zp_type & SGT_TYPE_MASK, zn_type & SGT_TYPE_MASK);
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void SetGridLevel (uint3 id : SV_DispatchThreadID)
+{
+    uint gridType = _GridTypesR[id];
+    float fill = -1;
+    if (IsFluidCell(GetMyType(gridType)))
+    {
+        // The interface belongs to the water side (seed 0); the facing air
+        // cell gets -1 so the JFA measures distance on both sides. Deep
+        // cells use +/-32 (JFA overwrites with true distance anyway).
+        // Interface = water-air phase change across an IN-DOMAIN face only:
+        // solid faces never seed a band (GPU design — particles live only
+        // around the fluid interface, unlike the CPU which banded walls
+        // too). Out-of-bounds reads return 0 (= air), so guard each edge.
+        const uint water = CellIsWater(_GridPhaseR[id]);
+        const int3 coord = (int3)id;
+        const bool interfaceCell =
+            (coord.x > 0              && CellIsWater(_GridPhaseR[coord - int3(1, 0, 0)]) != water)
+         || (coord.x < _GridSize.x - 1 && CellIsWater(_GridPhaseR[coord + int3(1, 0, 0)]) != water)
+         || (coord.y > 0              && CellIsWater(_GridPhaseR[coord - int3(0, 1, 0)]) != water)
+         || (coord.y < _GridSize.y - 1 && CellIsWater(_GridPhaseR[coord + int3(0, 1, 0)]) != water)
+         || (coord.z > 0              && CellIsWater(_GridPhaseR[coord - int3(0, 0, 1)]) != water)
+         || (coord.z < _GridSize.z - 1 && CellIsWater(_GridPhaseR[coord + int3(0, 0, 1)]) != water);
+        fill = water ? (interfaceCell ? 0 : 32) : (interfaceCell ? -1 : -32);
+    }
+
+    _GridSDFW[id] = fill;
+}
+
+globallycoherent RWStructuredBuffer<uint> _PartitionScanDescriptors; // init with 0
+
+#define PARTITION_SIZE      512
+#define FLAG_INVALID        0u
+#define FLAG_AGGREGATE      1u
+#define FLAG_PREFIX         2u
+
+groupshared uint sharedData[16];
+groupshared uint partitionIndex;
+groupshared uint sharedPrefix;
+
+// Slot layout (SweepCommon.hlsl style — each partition publishes to pid+1,
+// look-back reads from pid; this offset prevents races between publish and
+// predecessor's prefix update, because slot[pid+1]'s first writer is always partition pid):
+//   slot[0]                  = seed  FLAG_PREFIX | 0 (set by ClearScanFlags)
+//   slot[1 .. _NumPartitions] = per-partition data
+//   slot[_NumPartitions + 1]  = partition-index counter (InterlockedAdd)
+[numthreads(PARTITION_SIZE, 1, 1)]
+void ParticlesCounter (uint id : SV_GroupIndex)
+{
+    if (id < 16)
+    {
+        sharedData[id] = 0;
+    }
+    // Assign Partition by atomic add on dedicated counter slot
+    if (id == 0)
+    {
+        InterlockedAdd(_PartitionScanDescriptors[_NumPartitions + 1], 1u, partitionIndex);
+        sharedPrefix = 0;
+    }
+    int wid = id / 32;
+    GroupMemoryBarrierWithGroupSync();
+    uint pid = partitionIndex;
+    uint globalIdx = pid * PARTITION_SIZE + id;
+
+    // Threads past the last cell (partial final partition when _NumCells is not
+    // a multiple of PARTITION_SIZE, or a group whose pid landed beyond the grid)
+    // must NOT touch the buffers, but they still have to reach every group-wide
+    // barrier / wave op below, so keep them live and let them contribute 0.
+    bool inCell = globalIdx < (uint)_NumCells;
+
+    uint2 range = uint2(0, 0);
+    int level = -1;
+    if (inCell)
+    {
+        level = _GridSDFR[MortonD3Decode(globalIdx)];
+        range = _ParticlesRangeR[globalIdx];
+    }
+
+    uint count = 0;
+    uint expect = 0;
+    // Two-phase band covers BOTH sides of the signed SDF exactly like the
+    // CPU counter: water 0,1,2 and air -1,-2,-3 ([-Band2, Band2)).
+    // Level-0 (water interface) keeps whatever count is there; deeper
+    // band cells resample to the 8-per-cell basis.
+    if (level >= -Band2 && level < Band2)
+    {
+        count = clamp(range.y - range.x, 0, 32);
+        expect = level == 0 ? count : max(8, count);
+    }
+
+    uint val = expect;
+    uint localInclusive = WavePrefixSum(val) + val;
+
+    if (WaveGetLaneIndex() == 31) sharedData[wid] = localInclusive;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (id < 16)
+    {
+        sharedData[id] += WavePrefixSum(sharedData[id]);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint aggregate = sharedData[15];
+
+    // A group whose atomically-assigned pid landed outside [0, _NumPartitions)
+    // owns no descriptor slot. It must not publish (would clobber the counter
+    // slot at [_NumPartitions+1] or write past the buffer) nor look back.
+    bool ownsSlot = pid < (uint)_NumPartitions;
+
+    // Publish aggregate to slot[pid+1]
+    // (no special case for pid==0 — slot[0] is the seed, never written here)
+    if (id == 0 && ownsSlot)
+    {
+        InterlockedAdd(_PartitionScanDescriptors[pid + 1], (FLAG_AGGREGATE | (aggregate << 2)));
+    }
+
+    // === Look-back: start from slot[pid] (holds partition pid-1's data) ===
+    if (id == 0 && ownsSlot)
+    {
+        int lookback = pid;
+        uint lookbackReduction = 0;
+        while (lookback >= 0)
+        {
+            const uint desc = _PartitionScanDescriptors[lookback];
+            if ((desc & 3) == FLAG_PREFIX) {
+                // found inclusive prefix for partitions 0..lookback
+                lookbackReduction += desc >> 2;
+                // forward the prefix to the next partition's slot
+                if (pid < _NumPartitions - 1)
+                    InterlockedAdd(_PartitionScanDescriptors[pid + 1], FLAG_AGGREGATE | (lookbackReduction << 2));
+
+                sharedPrefix = lookbackReduction;
+                break;
+            }
+
+            if ((desc & 3) == FLAG_AGGREGATE)
+            {
+                lookbackReduction += desc >> 2;
+                lookback--;
+                continue;
+            }
+            // FLAG_INVALID (0): partition hasn't published yet — spin.
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // === global scan result ===
+    int offset = sharedPrefix + localInclusive - val + (wid > 0 ? sharedData[wid - 1] : 0);
+    
+    // total count
+    if (pid == _NumPartitions - 1 && id == 0) {
+        _CounterW[0] = min(sharedPrefix + aggregate, _NumParticles);
+    }
+    
+    if (globalIdx < _NumCells)
+    {
+        uint oldPtr = range.x;
+        // The scanned total is clamped to _NumParticles (counter + range below),
+        // so a cell whose offset runs past the buffer must not write its IDs
+        // either — clamp the loop to the same bound to avoid an OOB store.
+        int writeEnd = (int)min((uint)(offset + expect), (uint)_NumParticles) - offset;
+        for (int j = 0; j < writeEnd; j++)
+        {
+            _ParticlesIDW[offset + j] = j < count ? oldPtr + j : -1; // if need add particle, set -1
+        }
+        _ParticlesRangeW[globalIdx] = min(uint2(offset, offset + expect), _NumParticles - 1);
+    }
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void ResampleParticles (uint3 id : SV_DispatchThreadID)
+{
+    uint2 range = _ParticlesRangeR[Coord2Idx(id)];
+    if (range.x >= range.y) return;
+    int toAdd = 0;
+    for (uint i = range.x; i < range.y; i++)
+    {
+        int pid = _ParticlesIDR[i];
+        if (pid == -1)
+            toAdd++;
+        else
+        {
+            _ParticlesW[i] = _ParticlesR[pid];
+        }
+    }
+    
+    if (toAdd == 0) return;
+    
+    int existCount = range.y - range.x - toAdd;
+    Particle posArr[8];
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        if (i < existCount)
+        {
+            int p = _ParticlesIDR[range.x + i];
+            posArr[i] = _ParticlesR[p];
+        }
+        else
+        {
+            posArr[i] = (Particle)0;
+        }
+    }
+    
+    int3 coord = id;
+    float3 origin = ((float3)coord + 0.25f) * _CellSize;
+    for (int idx = 0; idx < toAdd; idx++)
+    {
+        float maxDst = 0;
+        float3 selectedPos = origin;
+        [unroll]
+        for (int i = 0; i < 8; i++)
+        { 
+            float3 tryPos = origin + float3(i & 1, i >> 1 & 1, i >> 2 & 1) * (_CellSize * 0.5f);
+            float minDst = 1000;
+            for (int j = 0; j < existCount; j++)
+            {
+                float3 vec = DecodePosition(posArr[j].packedPosition) - tryPos;
+                float len = dot(vec, vec);
+                minDst = min(minDst, len);
+            }
+
+            if (minDst > maxDst)
+            {
+                maxDst = minDst;
+                selectedPos = tryPos;
+            }
+        }
+        float3 v = SampleGrid(selectedPos, _VelocityR);
+        int p = range.x + existCount;
+        Particle pa;
+        // Spawned particles inherit the cell's phase, not the spawner's
+        pa.packedPosition = EncodePositionAndPhase(selectedPos, CellIsWater(_GridPhaseR[id]));
+        pa.packedVelocity = EncodeVelocity(v);
+        _ParticlesW[p] = pa;
+        posArr[existCount] = pa;
+        existCount++;
+    }
+}
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void ClearScanFlags (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 2) _CounterW[id.x] = 0;
+    // Clear all slots (0 .. _NumPartitions + 1), then set slot[0] as seed
+    if (id.x <= _NumPartitions + 1)
+        _PartitionScanDescriptors[id.x] = 0;
+    if (id.x == 0)
+        _PartitionScanDescriptors[0] = FLAG_PREFIX; // seed with inclusive sum = 0
+}

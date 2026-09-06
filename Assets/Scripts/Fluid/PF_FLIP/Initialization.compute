@@ -1,0 +1,224 @@
+
+#pragma use_dxc
+#pragma target 6.0
+
+#include "PF_FlipUtils.hlsl"
+
+#pragma kernel InitParticles
+#pragma kernel PrepareForRendering
+#pragma kernel Blur
+#pragma kernel InitLevel
+#pragma kernel ParticlesCounter
+
+RWStructuredBuffer<Particle> _ParticlesW;
+RWStructuredBuffer<int> _ParticlesIDW;
+
+float _Scale;
+float3 _InitMin0;
+float3 _InitMin1;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void InitParticles (uint3 id : SV_DispatchThreadID)
+{
+    Particle p;
+    uint localid = id.x % (_NumParticles / 2);
+    uint groupid = id.x / (_NumParticles / 2);
+    // block 0 = water (inside the InitLevel box), block 1 = air. The
+    // init spawner rebuilds band particles from _GridPhase anyway, so
+    // these seeds mostly matter as a consistent fallback.
+    const uint phase = groupid > 0 ? 0u : 1u;
+    p.packedPosition = EncodePositionAndPhase(MortonD3Decode(localid) * _CellSize * _Scale
+        + (groupid > 0 ? _InitMin1 : _InitMin0), phase);
+    p.packedVelocity = EncodeVelocity(0);
+
+    _ParticlesW[id.x] = p;
+    _ParticlesIDW[id.x] = 0;
+}
+
+StructuredBuffer<Particle> _ParticlesR;
+RWStructuredBuffer<float4> _ParticlesRender;
+
+StructuredBuffer<uint> _CounterR;
+RWStructuredBuffer<uint> _CounterW;
+RWStructuredBuffer<uint> _Args;
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void PrepareForRendering (uint3 id : SV_DispatchThreadID)
+{
+    uint numParticles = _CounterR[0];
+    if (id.x >= numParticles) return;
+    if (all(id == 0)) _Args[0] = _CounterR[0];
+    Particle p = _ParticlesR[id.x];
+    // w = speed, signed by phase: positive water / negative air, so a
+    // single draw can color both phases (ParticleUtils.hlsl keys off
+    // the sign and remaps abs(w)). Air is biased strictly negative:
+    // -0.0 < 0 evaluates FALSE, so resting air particles (speed 0 at
+    // init) would take the water color if we merely negated speed.
+    const float speed = asfloat(p.packedVelocity.x);
+    _ParticlesRender[id.x] = float4(DecodePosition(p.packedPosition),
+                                    UnpackPhase(p.packedPosition.y) ? speed : -(speed + 1e-4f));
+}
+
+Texture3D<float4> _Src;
+RWTexture3D<float4> _Dst;
+float3 _Size;
+SamplerState _LinearClamp;
+
+[numthreads(GROUP_THREADS_D3)]
+void Blur (uint3 id : SV_DispatchThreadID)
+{
+    float3 uvw = (id + 0.5) / _Size;
+    float2 offset = float2(-0.5f, 0.5f) / _Size;
+    float4 c000 = _Src.SampleLevel(_LinearClamp, uvw + offset.xxx, 0);
+    float4 c001 = _Src.SampleLevel(_LinearClamp, uvw + offset.xxy, 0);
+    float4 c010 = _Src.SampleLevel(_LinearClamp, uvw + offset.xyx, 0);
+    float4 c011 = _Src.SampleLevel(_LinearClamp, uvw + offset.xyy, 0);
+    float4 c100 = _Src.SampleLevel(_LinearClamp, uvw + offset.yxx, 0);
+    float4 c101 = _Src.SampleLevel(_LinearClamp, uvw + offset.yxy, 0);
+    float4 c110 = _Src.SampleLevel(_LinearClamp, uvw + offset.yyx, 0);
+    float4 c111 = _Src.SampleLevel(_LinearClamp, uvw + offset.yyy, 0);
+    _Dst[id] = (c000 + c001 + c010 + c011 + c100 + c101 + c110 + c111) * 0.125;
+}
+
+RWTexture3D<float> _GridSDFW;
+Texture3D<float> _GridSDFR;
+RWTexture3D<uint> _GridPhaseW;
+
+RWStructuredBuffer<uint2> _ParticlesRangeW;
+
+[numthreads(GROUP_THREADS_D3)]
+void InitLevel (uint3 id : SV_DispatchThreadID)
+{
+    // Bottom half water, top half air (gravity-stable layout). ONLY the
+    // two interface layers are seeds (water 0 / air -1): solid interfaces
+    // never carry a band in the GPU version, so domain edges are plain
+    // deep cells (+/-100).
+    int3 coord = id;
+    const int mid = _GridSize.y / 2;
+    const bool water = coord.y < mid;
+    const bool boundary = coord.y == mid - 1 || coord.y == mid;
+    const int level = water ? (boundary ? 0 : 100) : (boundary ? -1 : -100);
+
+    _GridSDFW[id] = level;
+    _GridPhaseW[id] = water ? GRIDPHASE_WATER_FLAG : 0;
+}
+
+globallycoherent RWStructuredBuffer<uint> _PartitionScanDescriptors; // init with 0
+
+#define PARTITION_SIZE      512
+#define FLAG_INVALID        0u
+#define FLAG_AGGREGATE      1u
+#define FLAG_PREFIX         2u
+
+groupshared uint sharedData[16];
+groupshared uint partitionIndex;
+groupshared uint sharedPrefix;
+
+// Slot layout (SweepCommon.hlsl style — each partition publishes to pid+1,
+// look-back reads from pid; this offset prevents races between publish and
+// predecessor's prefix update, because slot[pid+1]'s first writer is always partition pid):
+//   slot[0]                  = seed  FLAG_PREFIX | 0 (set by ClearScanFlags)
+//   slot[1 .. _NumPartitions] = per-partition data
+//   slot[_NumPartitions + 1]  = partition-index counter (InterlockedAdd)
+[numthreads(PARTITION_SIZE, 1, 1)]
+void ParticlesCounter (uint id : SV_GroupIndex)
+{
+    // Assign Partition by atomic add on dedicated counter slot
+    if (id == 0)
+    {
+        InterlockedAdd(_PartitionScanDescriptors[_NumPartitions + 1], 1u, partitionIndex);
+        sharedPrefix = 0;
+    }
+    int wid = id / 32;
+    GroupMemoryBarrierWithGroupSync();
+    uint pid = partitionIndex;
+    uint globalIdx = pid * PARTITION_SIZE + id;
+
+    int level = _GridSDFR[MortonD3Decode(globalIdx)];
+
+    // init SDF is signed after the JFA (water +, air -): seed the band
+    // on BOTH sides of the interface ([-Band2, Band2) = water 0,1,2 /
+    // air -1,-2,-3, same as the CPU counter)
+    uint expect = 0;
+    if (level >= -Band2 && level < Band2)
+    {
+        expect = 8;
+    }
+
+    uint val = expect;
+    uint localInclusive = WavePrefixSum(val) + val;
+
+    if (WaveGetLaneIndex() == 31) sharedData[wid] = localInclusive;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (id < 16)
+    {
+        sharedData[id] += WavePrefixSum(sharedData[id]);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint aggregate = sharedData[15];
+
+    // Publish aggregate to slot[pid+1]
+    // (no special case for pid==0 — slot[0] is the seed, never written here)
+    if (id == 0)
+    {
+        InterlockedAdd(_PartitionScanDescriptors[pid + 1], (FLAG_AGGREGATE | (aggregate << 2)));
+    }
+
+    // === Look-back: start from slot[pid] (holds partition pid-1's data) ===
+    if (id == 0)
+    {
+        int lookback = pid;
+        uint lookbackReduction = 0;
+        while (lookback >= 0)
+        {
+            const uint desc = _PartitionScanDescriptors[lookback];
+            if ((desc & 3) == FLAG_PREFIX) {
+                // found inclusive prefix for partitions 0..lookback
+                lookbackReduction += (desc >> 2);
+                // forward the prefix to the next partition's slot
+                if (pid < _NumPartitions - 1)
+                    InterlockedAdd(_PartitionScanDescriptors[pid + 1], FLAG_AGGREGATE | (lookbackReduction << 2));
+
+                // lookbackReduction is already the EXCLUSIVE prefix for this
+                // partition — subtracting our own aggregate shifted every
+                // partition's writes onto its predecessor's tail and silently
+                // corrupted the init spawns (striped holes in the band)
+                sharedPrefix = lookbackReduction;
+                break;
+            }
+
+            if ((desc & 3) == FLAG_AGGREGATE)
+            {
+                lookbackReduction += (desc >> 2);
+                lookback--;
+                continue;
+            }
+            // FLAG_INVALID (0): partition hasn't published yet — spin.
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // === global scan result ===
+    int offset = sharedPrefix + localInclusive - val + (wid > 0 ? sharedData[wid - 1] : 0);
+    
+    // total count
+    if (pid == _NumPartitions - 1 && id == 0) {
+        _CounterW[0] = min(sharedPrefix + aggregate, _NumParticles);
+    }
+
+    if (globalIdx < _NumCells)
+    {
+        // same capacity clamp as the steady counter — never announce or
+        // store ranges past the particle buffer
+        int writeEnd = (int)min((uint)(offset + expect), (uint)_NumParticles) - offset;
+        for (int j = 0; j < writeEnd; j++)
+        {
+            _ParticlesIDW[offset + j] = -1; // if need add particle, set -1
+        }
+        _ParticlesRangeW[globalIdx] = min(uint2(offset, offset + expect), _NumParticles - 1);
+    }
+}

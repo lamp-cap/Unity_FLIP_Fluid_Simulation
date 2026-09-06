@@ -1,0 +1,197 @@
+#pragma use_dxc
+
+#include "PF_FlipUtils.hlsl"
+
+#pragma kernel G2P
+#pragma kernel Advection
+#pragma kernel GridAdvection
+
+RWStructuredBuffer<Particle> _Particles;
+
+Texture3D<uint> _GridTypesR;
+
+Texture3D<float4> _VelocityOldR;
+RWTexture3D<float4> _VelocityOldW;
+
+Texture3D<float4> _VelocityR;
+StructuredBuffer<uint> _CounterR;
+
+Texture3D<float> _GridSDFR;
+
+Texture3D<uint> _GridPhaseR;
+
+float3 _Gravity;
+
+float _Flipness;
+
+inline float3 WorldPosToGrid(const float3 pos)
+{
+    return (pos - _GridMin) * _InvCellSize;
+}
+
+// A cell holding any water particle classifies as water outright (1000:1
+// mass), so only the water COUNT in _GridPhase can tell a connected body
+// from an isolated droplet: no cell in the 4x4x4 neighbourhood with more
+// than SPRAY_THRESHOLD water particles => ballistic free fall.
+#define SPRAY_THRESHOLD 2
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void G2P (uint3 id : SV_DispatchThreadID)
+{
+    uint numParticles = _CounterR[0];
+    const uint p_id = id.x;
+    if (p_id >= numParticles) return;
+
+    Particle p = _Particles[p_id];
+
+    float3 pos = DecodePosition(p.packedPosition);
+    const uint phase = UnpackPhase(p.packedPosition.y);
+
+    const float3 origin_vel = SampleGrid(pos, _VelocityOldR);
+    const float3 vel = SampleGrid(pos, _VelocityR);
+
+    const float3 pic_vel = vel;
+
+    bool freeFall = false;
+    if (phase)
+    {
+        const int3 coord = (int3)(pos * _InvCellSize);
+        uint maxWater = 0;
+        [loop]
+        for (int x = -1; x <= 2; ++x)
+        [loop]
+        for (int y = -1; y <= 2; ++y)
+        [loop]
+        for (int z = -1; z <= 2; ++z)
+        {
+            int3 c = clamp(coord + int3(x, y, z), 0, _GridSize - 1);
+            maxWater = max(maxWater, CellWaterCount(_GridPhaseR[c]));
+        }
+        freeFall = maxWater <= SPRAY_THRESHOLD;
+    }
+
+    if (freeFall)
+    {
+        // Ballistic droplet: gravity is folded in here; Advection then
+        // integrates straight with the particle's own velocity (bit 31).
+        p.packedVelocity = EncodeVelocity(lerp(DecodeVelocity(p.packedVelocity) + _Gravity * _DeltaTime, vel, 0.01));
+        p.packedPosition.y |= 0x80000000u;
+        _Particles[p_id] = p;
+        return;
+    }
+
+    // clear ONLY bit 31 (ballistic). The old 0x3FFFFFFF mask kept bits
+    // 0-29 and wiped bit 30 as well — every non-spray particle lost its
+    // phase here each frame (frame-1 all-mist render, ghost water
+    // particles invisible to ClassifyGridPhase, steady band attrition)
+    p.packedPosition.y &= 0x7FFFFFFFu;
+
+    const float3 flip_vel = DecodeVelocity(p.packedVelocity) + (vel - origin_vel);
+
+    p.packedVelocity = EncodeVelocity(lerp(pic_vel, flip_vel, _Flipness));
+    _Particles[p_id] = p;
+}
+
+#define POSITION_EPSILON  0.01f
+
+inline void ClampPosition(inout float3 position, float3 grid_min, float3 grid_max)
+{
+    position = clamp(position, (grid_min + POSITION_EPSILON) * _CellSize, (grid_max - POSITION_EPSILON) * _CellSize);
+}
+
+#define USE_RK3
+
+[numthreads(GROUP_THREADS_X, 1, 1)]
+void Advection (uint3 id : SV_DispatchThreadID)
+{
+    uint numParticles = _CounterR[0];
+    const uint p_id = id.x;
+    if (p_id >= numParticles) return;
+
+    Particle p = _Particles[p_id];
+
+    float3 pos = DecodePosition(p.packedPosition);
+    float3 vel = DecodeVelocity(p.packedVelocity);
+    const uint phase = UnpackPhase(p.packedPosition.y);
+    const uint ballistic = UnpackBallistic(p.packedPosition.y);
+
+    if (ballistic)
+    {
+        // Free-falling spray droplet: G2P already folded gravity into the
+        // velocity — integrate straight instead of tracing the grid
+        pos += vel * _DeltaTime;
+    }
+    else
+    {
+        // https://en.wikipedia.org/wiki/List_of_Runge-Kutta_methods
+        #if defined(USE_RK3)
+        // advect using RK3 (Ralston's third-order method)
+        const float3 k1 = SampleGrid(pos, _VelocityR);
+        const float3 k2 = SampleGrid(pos + 0.5f * _DeltaTime * k1, _VelocityR);
+        const float3 k3 = SampleGrid(pos + 0.75f * _DeltaTime * k2, _VelocityR);
+        const float3 velocity = 2.0f / 9.0f * k1 + 1.0f / 3.0f * k2 + 4.0f / 9.0f * k3;
+        #elif defined(USE_RK2)
+        // advect using RK2 (Explicit midpoint method)
+        const float3 k1 = SampleGrid(pos, _VelocityR);
+        const float3 k2 = SampleGrid(pos + 0.5f * _DeltaTime * k1, _VelocityR);
+        const float3 velocity = k2;
+        #else
+        // advect using RK1 (Forward Euler)
+        const float3 k1 = SampleGrid(pos, _VelocityR);
+        const float3 velocity = 1.0f * k1;
+        #endif
+
+        pos += velocity * _DeltaTime;
+    }
+
+    vel = pos <= 0.1f * _CellSize ? 0 : vel;
+    vel = pos >= (_GridSize - 0.1f) * _CellSize ? 0 : vel;
+
+    p.packedVelocity = EncodeVelocity(vel);
+    ClampPosition(pos, 0, _GridSize);
+
+    // Repack preserving phase + ballistic flags (plain EncodePosition
+    // would wipe them every frame)
+    p.packedPosition = EncodePositionWithFlags(pos, phase, ballistic);
+    _Particles[p_id] = p;
+}
+
+inline float ReadGridFaceBilinear(float3 pos, int axis, Texture3D<float4> gridData)
+{
+    float3 offset = 0;
+    offset[axis] = 0.5f;
+    return gridData.SampleLevel(my_linear_clamp_sampler, (pos * _InvCellSize + offset) / _GridSize, 0)[axis];
+}
+
+float3 BackwardTrace(float3 pos, Texture3D<float4> block)
+{
+    float3 k1 = SampleGrid(pos, block);
+    float3 k2 = SampleGrid(pos - 0.5f * _DeltaTime * k1, block);
+    float3 k3 = SampleGrid(pos - 0.75f * _DeltaTime * k2, block);
+    return 2.0f / 9.0f * k1 + 1.0f / 3.0f * k2 + 4.0f / 9.0f * k3;
+}
+
+[numthreads(GROUP_THREADS_D3)]
+void GridAdvection (uint3 id : SV_DispatchThreadID)
+{
+    // Semi-Lagrangian advection runs on the whole domain: both the water
+    // and the air side are simulated phases (the old sdf < -Band1 early-out
+    // would freeze the deep air).
+    int3 coord = id;
+    float3 cellCenter = ((float3)coord + 0.5f) * _CellSize;
+    // using RK3
+    float3 posFaceX = cellCenter + float3(-0.5f * _CellSize, 0, 0);
+    float3 traceDirX = BackwardTrace(posFaceX, _VelocityR);
+    float vx = ReadGridFaceBilinear(posFaceX - traceDirX * _DeltaTime, 0, _VelocityR);
+
+    float3 posFaceY = cellCenter + float3(0, -0.5f * _CellSize, 0);
+    float3 traceDirY = BackwardTrace(posFaceY, _VelocityR);
+    float vy = ReadGridFaceBilinear(posFaceY - traceDirY * _DeltaTime, 1, _VelocityR);
+    
+    float3 posFaceZ = cellCenter + float3(0, 0, -0.5f * _CellSize);
+    float3 traceDirZ = BackwardTrace(posFaceZ, _VelocityR);
+    float vz = ReadGridFaceBilinear(posFaceZ - traceDirZ * _DeltaTime, 2, _VelocityR);
+                
+    uint grid_types = _GridTypesR[id];
+    _VelocityOldW[id] = float4(EnforceBoundaryCondition(float3(vx, vy, vz), grid_types), 15);
+}

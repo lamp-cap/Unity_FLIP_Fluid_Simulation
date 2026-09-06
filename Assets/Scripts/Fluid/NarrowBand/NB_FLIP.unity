@@ -122,6 +122,68 @@ NavMeshSettings:
     debug:
       m_Flags: 0
   m_NavMeshData: {fileID: 0}
+--- !u!1 &480652242
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 480652244}
+  - component: {fileID: 480652243}
+  m_Layer: 0
+  m_Name: GameObject (2)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &480652243
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 480652242}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 8b3431a88e991274f8ceb4efb93784a0, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  initCs: {fileID: 7200000, guid: 24e2431d3477ff84c95242e8b1f9a066, type: 3}
+  buildLutCs: {fileID: 7200000, guid: f68067d6b5a13664e89e09b12deddd57, type: 3}
+  splatP2GCs: {fileID: 7200000, guid: fc9258dc6f38ec445bcf9e4fe1c8c09a, type: 3}
+  NBCs: {fileID: 7200000, guid: e78296ba5f5dc984fa5743f9073a8399, type: 3}
+  JFACs: {fileID: 7200000, guid: 4c34ace4f0c89214db485e7a19a7f988, type: 3}
+  projectionCs: {fileID: 7200000, guid: 319b7b50da7fdf44882e009914fb7d70, type: 3}
+  G2PCs: {fileID: 7200000, guid: 088a22b2241791b4288786844fd83898, type: 3}
+  countingSortCs: {fileID: 7200000, guid: 724ee015ac2ad264688b2097b5f347de, type: 3}
+  mcCs: {fileID: 7200000, guid: cbefffa4c1505b54689332f612d627e6, type: 3}
+  solverCs: {fileID: 7200000, guid: 52b98e85d8d6f1d44b0a29bf9021ee8e, type: 3}
+  damping: 0.6667
+  flipness: 0.95
+  mouseForce: 1
+  mouseForceRange: 2.5
+  threshold: 0.5
+  drawType: 0
+  meshMat: {fileID: 2100000, guid: b10ed8ca361f71d4db26639892ce1e22, type: 2}
+  digitMat: {fileID: 2100000, guid: a26dfe4acedb8504a9e77fee932f8775, type: 2}
+--- !u!4 &480652244
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 480652242}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &561548874
 GameObject:
   m_ObjectHideFlags: 0
@@ -200,7 +262,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &847268490
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -215,6 +277,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   gravity: -9
   flipness: 0.95
+  pcgIterations: 12
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: eef15dcddaf6c6847ab52c3502db77af, type: 2}
   airMat: {fileID: 2100000, guid: d53edb1ed065a594180cade218dbd50d, type: 2}
@@ -544,7 +607,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1330559874}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 728fe81bb13dde042af47c7a64de78dd, type: 3}
   m_Name: 
@@ -563,3 +626,4 @@ SceneRoots:
   - {fileID: 927855522}
   - {fileID: 561548876}
   - {fileID: 847268491}
+  - {fileID: 480652244}
