@@ -482,17 +482,8 @@ namespace AVBD.Cloth
         public static void QueryAABBStatic(
             in NativeArray<Node> nodes, int numPrimitives,
             float3 qMin, float3 qMax,
-            ref NativeList<int> stack, ref NativeList<int> results)
+            NativeList<int> stack, NativeList<int> results)
         {
-            results.Clear();
-            if (numPrimitives == 1)
-            {
-                if (Overlap(nodes[0].BoundsMin, nodes[0].BoundsMax, qMin, qMax))
-                    results.Add(nodes[0].Right);
-                return;
-            }
-
-            stack.Clear();
             stack.Add(0);
             while (stack.Length > 0)
             {

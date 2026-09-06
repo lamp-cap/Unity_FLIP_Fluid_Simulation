@@ -462,19 +462,14 @@ namespace AVBD.Cloth
             }
         }
 
-        // v 是否为 q 的一环邻居(或 v == q)。对 [start,end) 段做二分。
+        // v 是否为 q 的一环邻居(或 v == q)。
+        // 一环邻居通常只有 6-8 个,线性扫描比二分更快(无分支预测错 + 无除法)。
         public static bool IsNeighbor(
             NativeArray<int> neighborStart, NativeArray<int> neighborList, int q, int v)
         {
-            int lo = neighborStart[q];
-            int hi = neighborStart[q + 1] - 1;
-            while (lo <= hi)
+            for (int i = neighborStart[q], end = neighborStart[q + 1]; i < end; i++)
             {
-                int mid = (lo + hi) >> 1;
-                int val = neighborList[mid];
-                if (val == v) return true;
-                if (val < v) lo = mid + 1;
-                else hi = mid - 1;
+                if (neighborList[i] == v) return true;
             }
             return false;
         }

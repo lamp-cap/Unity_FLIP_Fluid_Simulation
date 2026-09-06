@@ -72,8 +72,9 @@ namespace AVBD.Cloth
 
         // Burst 路径用:Job 字段的 Native 容器必须 IsCreated。
         // 无碰撞/无碰撞体时用这些空容器占位。截断标志按"最大颜色组大小"分配。
-        private NativeParallelMultiHashMap<int, ClothCollision.VFContact> _emptyVFMap;
-        private NativeParallelMultiHashMap<int, ClothCollision.EEContact> _emptyEEMap;
+        private NativeArray<ClothCollision.VFContact> _emptyVFContacts;
+        private NativeArray<ClothCollision.EEContact> _emptyEEContacts;
+        private NativeArray<int> _emptyCounts;
         private NativeArray<AnalyticCollider> _emptyColliders;
         private NativeArray<byte> _truncFlags;
         private bool _burstAllocated;
@@ -93,8 +94,9 @@ namespace AVBD.Cloth
         void AllocateBurstScratch()
         {
             DisposeBurstScratch();
-            _emptyVFMap = new NativeParallelMultiHashMap<int, ClothCollision.VFContact>(1, Allocator.Persistent);
-            _emptyEEMap = new NativeParallelMultiHashMap<int, ClothCollision.EEContact>(1, Allocator.Persistent);
+            _emptyVFContacts = new NativeArray<ClothCollision.VFContact>(0, Allocator.Persistent);
+            _emptyEEContacts = new NativeArray<ClothCollision.EEContact>(0, Allocator.Persistent);
+            _emptyCounts = new NativeArray<int>(0, Allocator.Persistent);
             _emptyColliders = new NativeArray<AnalyticCollider>(0, Allocator.Persistent);
 
             // 最大颜色组大小
@@ -108,8 +110,9 @@ namespace AVBD.Cloth
         void DisposeBurstScratch()
         {
             if (!_burstAllocated) return;
-            if (_emptyVFMap.IsCreated) _emptyVFMap.Dispose();
-            if (_emptyEEMap.IsCreated) _emptyEEMap.Dispose();
+            if (_emptyVFContacts.IsCreated) _emptyVFContacts.Dispose();
+            if (_emptyEEContacts.IsCreated) _emptyEEContacts.Dispose();
+            if (_emptyCounts.IsCreated) _emptyCounts.Dispose();
             if (_emptyColliders.IsCreated) _emptyColliders.Dispose();
             if (_truncFlags.IsCreated) _truncFlags.Dispose();
             _burstAllocated = false;
@@ -196,8 +199,12 @@ namespace AVBD.Cloth
                 hasColliders = (byte)(hasColliders ? 1 : 0),
             };
 
-            var v2vf = hasCollision ? Collision.VertexToVF : _emptyVFMap;
-            var v2ee = hasCollision ? Collision.VertexToEE : _emptyEEMap;
+            var vfContacts = hasCollision ? Collision.VFContacts : _emptyVFContacts;
+            var eeContacts = hasCollision ? Collision.EEContacts : _emptyEEContacts;
+            var vfCounts = hasCollision ? Collision.VFCounts : _emptyCounts;
+            var eeCounts = hasCollision ? Collision.EECounts : _emptyCounts;
+            int maxVF = hasCollision ? Collision.MaxVFPerVertex : 0;
+            int maxEE = hasCollision ? Collision.MaxEEPerVertex : 0;
             var cols = hasColliders ? Colliders.Colliders : _emptyColliders;
 
             for (int c = 0; c < Topo.NumColors; c++)
@@ -229,8 +236,12 @@ namespace AVBD.Cloth
                     PositionsAtPrevCD = State.PositionsAtPrevCD,
                     PositionsNext = State.PositionsNext,
                     TruncFlags = _truncFlags,
-                    VertexToVF = v2vf,
-                    VertexToEE = v2ee,
+                    VFContacts = vfContacts,
+                    EEContacts = eeContacts,
+                    VFCounts = vfCounts,
+                    EECounts = eeCounts,
+                    MaxVFPerVertex = maxVF,
+                    MaxEEPerVertex = maxEE,
                     Colliders = cols,
                 };
                 stepJob.Schedule(count, 64).Complete();

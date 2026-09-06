@@ -79,10 +79,14 @@ namespace AVBD.Cloth
         // 截断标志:写组内 index i;主线程归约
         [WriteOnly] public NativeArray<byte> TruncFlags;
 
-        // ---- 碰撞(已检测结果,只读;无碰撞时为空容器) ----
-        // 顶点 -> 接触结构体(值直接存),与 ClothCollision 的新数据结构一致。
-        [ReadOnly] public NativeParallelMultiHashMap<int, ClothCollision.VFContact> VertexToVF;
-        [ReadOnly] public NativeParallelMultiHashMap<int, ClothCollision.EEContact> VertexToEE;
+        // ---- 碰撞(已检测结果,只读;无碰撞时用空容器) ----
+        // CSR 平坦数组: VFContacts[v*MaxVFPerVertex + i], EEContacts[v*MaxEEPerVertex + i]
+        [ReadOnly] public NativeArray<ClothCollision.VFContact> VFContacts;
+        [ReadOnly] public NativeArray<ClothCollision.EEContact> EEContacts;
+        [ReadOnly] public NativeArray<int> VFCounts;
+        [ReadOnly] public NativeArray<int> EECounts;
+        public int MaxVFPerVertex;
+        public int MaxEEPerVertex;
 
         // ---- 解析碰撞体 ----
         [ReadOnly] public NativeArray<AnalyticCollider> Colliders;
@@ -229,28 +233,28 @@ namespace AVBD.Cloth
             }
         }
 
-        // ---- 复用已检测接触(VF/EE) ----
+        // ---- 复用已检测接触(VF/EE),从 CSR 平坦数组遍历 ----
         void AccumulateContacts(int v, float dt, ref float3 force, ref float3x3 hessian)
         {
-            if (VertexToVF.TryGetFirstValue(v, out ClothCollision.VFContact c, out var it))
+            // VF
+            int cnt = VFCounts[v];
+            if (cnt > MaxVFPerVertex) cnt = MaxVFPerVertex; // overflow guard
+            for (int i = 0; i < cnt; i++)
             {
-                do
-                {
-                    int order = VFOrder(c, v);
-                    AccumulateVFContact(c, order, dt, ref force, ref hessian);
-                }
-                while (VertexToVF.TryGetNextValue(out c, ref it));
+                var c = VFContacts[v * MaxVFPerVertex + i];
+                int order = VFOrder(c, v);
+                AccumulateVFContact(c, order, dt, ref force, ref hessian);
             }
-
-            if (VertexToEE.TryGetFirstValue(v, out ClothCollision.EEContact ce, out var it2))
+            // EE
+            cnt = EECounts[v];
+            if (cnt > MaxEEPerVertex) cnt = MaxEEPerVertex;
+            int eeBase = v * MaxEEPerVertex;
+            for (int i = 0; i < cnt; i++)
             {
-                do
-                {
-                    int order = EEOrder(ce, v);
-                    if (order >= 0)
-                        AccumulateEEContact(ce, order, dt, ref force, ref hessian);
-                }
-                while (VertexToEE.TryGetNextValue(out ce, ref it2));
+                var ce = EEContacts[eeBase + i];
+                int order = EEOrder(ce, v);
+                if (order >= 0)
+                    AccumulateEEContact(ce, order, dt, ref force, ref hessian);
             }
         }
 
