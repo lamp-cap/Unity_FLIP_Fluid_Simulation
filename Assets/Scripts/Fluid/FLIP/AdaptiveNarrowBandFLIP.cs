@@ -48,11 +48,14 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     public Mesh mesh;
     public Material mat;
     private float _rs;
+    // HUD probes: post-projection divergence ceiling and velocity ceiling
+    private float _postDiv;
+    private float _maxVel;
         
 
     private const float InvDeltaTime = 120f;
     private const float DeltaTime = 1.0f / InvDeltaTime;
-    public const int NumParticles = 128 * 128;
+    public const int NumParticles = fWidth * fWidth;
     private const int Band1 = 2;
     private const int Band2 = 3;
 
@@ -74,6 +77,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
 
     private const int gWidth = MultiresBlockGridSolver.GridWidth;
     private const int bWidth = MultiresBlockGridSolver.BaseBlockSize;
+    private const int fWidth = MultiresBlockGridSolver.BaseLevelWidth; // fine cells per edge
     private const int bCount = gWidth * gWidth;
     private const int cWidth = MultiresBlockGridSolver.BaseCellSize;
 
@@ -82,10 +86,10 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
     // Start is called before the first frame update
     void OnEnable()
     {
-        _posBuffer = new ComputeBuffer(16384, sizeof(float) * 4);
-        _bounds = new Bounds(Vector3.one * 64f, Vector3.one * 128f);
+        _posBuffer = new ComputeBuffer(NumParticles, sizeof(float) * 4);
+        _bounds = new Bounds(Vector3.one * 128f, Vector3.one * 256f);
         _particleCount = new NativeReference<int>(Allocator.Persistent);
-        const int poolSize = 16384;
+        const int poolSize = fWidth * fWidth; // cell-hash LUT must cover the whole fine grid
         _start = new NativeArray<int>(poolSize, Allocator.Persistent);
         _end = new NativeArray<int>(poolSize, Allocator.Persistent);
         _range = new NativeArray<int2>(poolSize, Allocator.Persistent);
@@ -107,10 +111,10 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         if (_mbg != null) _mbg.Dispose();
         _mbg = new MultiresBlockGridSolver();
 
-        int2 start = new int2(1, 4);
-        int2 end = new int2(92, 92);
-        int2 startBlock = start / 8;
-        int2 endBlock = end / 8;
+        int2 start = new int2(2, 8);
+        int2 end = new int2(184, 184);
+        int2 startBlock = start / bWidth;
+        int2 endBlock = end / bWidth;
         for (int y = 0; y < gWidth; y++)
         for (int x = 0; x < gWidth; x++)
         {
@@ -237,9 +241,11 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         };
         GUI.Label(new Rect(0, 0, 100, 36), $"residual: {_rs:F3}", _labelStyle);
         GUI.Label(new Rect(0, 36, 100, 36),
-            $"cells: {(_mbg != null ? _mbg.CellCount : 0)} / {bCount * 64}", _labelStyle);
+            $"cells: {(_mbg != null ? _mbg.CellCount : 0)} / {bCount * bWidth * bWidth}", _labelStyle);
         GUI.Label(new Rect(0, 72, 100, 36),
             $"particles: {_particleCount.Value} / {NumParticles}", _labelStyle);
+        GUI.Label(new Rect(0, 108, 100, 36), $"post-div: {_postDiv:F4}", _labelStyle);
+        GUI.Label(new Rect(0, 144, 100, 36), $"max-vel: {_maxVel:F2}", _labelStyle);
     }
 
     private void TestStep()
@@ -303,6 +309,9 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         }.Schedule(bCount, 1).Complete();
         
         cellCount = _mbg.AllocateBaseCells();
+        // remap the advected field onto the new layout — without this, deep cells
+        // (which P2G never touches) carry stale values from the old block layout
+        _mbg.MigrateVelocityOnReallocation();
         
         new SetCellTypesJob()
         {
@@ -474,6 +483,9 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         }.Schedule(bCount, 1).Complete();
         
         cellCount = _mbg.AllocateBaseCells();
+        // remap the advected field onto the new layout — without this, deep cells
+        // (which P2G never touches) carry stale values from the old block layout
+        _mbg.MigrateVelocityOnReallocation();
         
         new SetCellTypesJob()
         {
@@ -540,6 +552,21 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         Profiler.BeginSample("Solve Pressure");
         _mbg.Solve();
         _rs = _mbg.LastResidual;
+
+        // Flux is dead after the solve (b was already copied into the solver
+        // buffers), so recomputing it on the projected velocity measures the
+        // projection directly — this is the number that splits the hypothesis
+        // space: small div + weird shape => transfer/advection; large div =>
+        // matrix/apply mismatch regardless of what the residual claims.
+        _mbg.CalcFlux();
+        _postDiv = 0;
+        _maxVel = 0;
+        int probeCells = _mbg.CellCount;
+        for (int i = 0; i < probeCells; i++)
+        {
+            _postDiv = math.max(_postDiv, math.abs(_mbg.Flux[i]));
+            _maxVel = math.max(_maxVel, math.length(_mbg.GridVelocity[i]));
+        }
         Profiler.EndSample();
         
         Profiler.BeginSample("G2P");
@@ -1797,7 +1824,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             }
         }
 
-        int count = gWidth * gWidth * 64;
+        int count = gWidth * gWidth * bWidth * bWidth;
         var v0 = new NativeArray<float>(count, Allocator.Temp);
         var v1 = new NativeArray<float>(count, Allocator.Temp);
         var b0 = new NativeArray<float>(count, Allocator.Temp);
@@ -1871,7 +1898,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
         _mbg.SetCellCount(counter);
         _mbg.FillMatrix(_mbg.GridLaplacian, _mbg.GridInfos);
 
-        int count = gWidth * gWidth * 64;
+        int count = gWidth * gWidth * bWidth * bWidth;
         var v0 = new NativeArray<float>(count, Allocator.Temp);
         var v1 = new NativeArray<float>(count, Allocator.Temp);
         var b0 = new NativeArray<float>(count, Allocator.Temp);
@@ -1994,7 +2021,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
                 int width = BlockWidth(level);
                 float h = GetH(level);
                 float half = h * 0.5f;
-                float2 posBase = new float2(x * 8, y * 8);
+                float2 posBase = new float2(x * bWidth, y * bWidth);
                 for (int yy = 0; yy < width; yy++)
                 for (int xx = 0; xx < width; xx++)
                 {
@@ -2025,7 +2052,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
             int width = BlockWidth(level);
             float h = GetH(level);
             float half = h * 0.5f;
-            float2 posBase = new float2(x * 8, y * 8);
+            float2 posBase = new float2(x * bWidth, y * bWidth);
             for (int yy = 0; yy < width; yy++)
             for (int xx = 0; xx < width; xx++)
             {
@@ -2057,7 +2084,7 @@ public class AdaptiveNarrowBandFLIP : MonoBehaviour
 
     private static int2 GetCoord(float2 pos) => (int2)math.floor(pos);
     private static int Coord2Idx(int x, int y)=> x + (y * gWidth);
-    private static int BlockWidth(int level) => 1 << (3 - level);
+    private static int BlockWidth(int level) => 1 << (4 - level);
     private static int BlockCoord2Idx(int2 coord, int res) => coord.x + coord.y * res;
     private static int BlockCoord2Idx(int x, int y, int res) => x + y * res;
     private static int2 Idx2Coord(int idx) => new int2(idx % gWidth, idx / gWidth);

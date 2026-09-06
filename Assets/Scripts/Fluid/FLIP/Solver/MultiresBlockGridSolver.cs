@@ -45,7 +45,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     
     public const int GridWidth = 16;
     public const int BlockCount = GridWidth * GridWidth;
-    public const int BaseBlockSize = 8;
+    public const int BaseBlockSize = 16;
     public const int BaseLevelWidth = GridWidth * BaseBlockSize;
     public const int BaseCellSize = 1;
 
@@ -59,7 +59,10 @@ public class MultiresBlockGridSolver : System.IDisposable
     
     public MultiresBlockGridSolver()
     {
-        int[] poolSize = new int[LevelCount] { BlockCount * 64, BlockCount * 16, BlockCount * 4, BlockCount, BlockCount / 4 };
+        // worst case per pyramid level: every block sits at that level, BlockWidth(level)² cells each
+        int[] poolSize = new int[LevelCount];
+        for (int i = 0; i < LevelCount; i++)
+            poolSize[i] = BlockCount * BlockWidth(i) * BlockWidth(i);
 
         _infoPymaid = new NativeArray<int2>[LevelCount];
         _coefPymaid = new NativeArray<float3>[LevelCount];
@@ -135,7 +138,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     public void Solve()
     {
         CalcFlux();
-        
+
         SolveMGPCG(4, GridInfos, GridLaplacian, _pressure, Flux);
 
         ApplyPressure(GridInfos, _pressure, GridVelocity);
@@ -161,12 +164,28 @@ public class MultiresBlockGridSolver : System.IDisposable
         var r = _r;
         var p = _p;
         b.CopyTo(r);
-        r.CopyTo(p);
         int numCells = _cellCount.Value;
+        // Neumann Poisson is singular (constant nullspace on fluid cells): unless b
+        // is compatible (sum over fluid = 0) the residual never vanishes and CG's
+        // alpha eventually explodes. Mixed-level fluxes only sum to ~0, so project
+        // the mean out first — Test() used to do this by hand, the live path didn't.
+        float mean = 0;
+        int fluidCells = 0;
+        for (int i = 0; i < numCells; i++)
+            if (matrix[i].x > 1e-5f) { mean += r[i]; fluidCells++; }
+        if (fluidCells > 0)
+        {
+            mean /= fluidCells;
+            for (int i = 0; i < numCells; i++)
+                if (matrix[i].x > 1e-5f) r[i] -= mean;
+        }
+        r.CopyTo(p);
+        // cold start like SolveMGPCG — a warm x0 paired with r0 = b converges to
+        // the wrong system (A x = b + A x0), which would poison the diagnostic
+        for (var i = 0; i < numCells; i++)
+            v[i] = 0;
         var Ap = _Ap;
         float rs = Dot(r, r, _rzOld);
-
-        var msg = "CG init with rs: " + rs + "\n";
 
         for (int iter = 0; iter < maxIter; iter++)
         {
@@ -191,7 +210,6 @@ public class MultiresBlockGridSolver : System.IDisposable
 
             rs = Dot(r, r, _rzNew);
 
-            msg += $"iter {iter + 1} \trs: {rs}\n";
             if (rs < 1e-6f) break;
             
             UpdateP(r, p, _rzNew, _rzOld);
@@ -199,7 +217,8 @@ public class MultiresBlockGridSolver : System.IDisposable
             (_rzOld, _rzNew) = (_rzNew, _rzOld);
         }
         
-        Debug.Log(msg + "Residual:" + Residual(infos, matrix, v, b));
+        // console logging removed — 128-iteration CG per frame flooded the console;
+        // the OnGUI residual label (LastResidual) shows the same number
     }
 
 
@@ -211,22 +230,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     private void SolveMG(int maxIter, NativeArray<int2> infos, NativeArray<float3> matrix, NativeArray<float> v, NativeArray<float> flux)
     {
         var ifs = _infoPymaid;
-        int ptr1 = 0, ptr2 = 0, ptr3 = 0;
-        for (int y = 0; y < GridWidth; y++)
-        for (int x = 0; x < GridWidth; x++)
-        {
-            int i = Coord2Idx(x, y);
-            int l0 = infos[i].x;
-            int l1 = l0 < 0 ? -1 : math.max(1, l0);
-            int l2 = l0 < 0 ? -1 : math.max(2, l1);
-            int l3 = l0 < 0 ? -1 : math.max(3, l2);
-            ifs[1][i] = new int2(l1, ptr1);
-            ifs[2][i] = new int2(l2, ptr2);
-            ifs[3][i] = new int2(l3, ptr3);
-            ptr1 += l1 < 0 ? 0 : BlockWidth(l1) * BlockWidth(l1);
-            ptr2 += l2 < 0 ? 0 : BlockWidth(l2) * BlockWidth(l2);
-            ptr3 += l3 < 0 ? 0 : BlockWidth(l3) * BlockWidth(l3);
-        }
+        BuildInfoPyramid();
 
         var As = _coefPymaid;
         var xs = _xPymaid;
@@ -236,7 +240,7 @@ public class MultiresBlockGridSolver : System.IDisposable
 
         var msg = ("init with residual: " + Residual(ifs[0], As[0], xs[0], bs[0]));
 
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < LevelCount - 1; i++)
             RestrictionCoefficients(As[i], ifs[i], As[i + 1], ifs[i + 1]);
         for (int i = 0; i < maxIter; i++)
         {
@@ -253,22 +257,7 @@ public class MultiresBlockGridSolver : System.IDisposable
     private void SolveMGPCG(int maxIter, NativeArray<int2> infos, NativeArray<float3> matrix, NativeArray<float> v, NativeArray<float> flux)
     {
         var ifs = _infoPymaid;
-        int ptr1 = 0, ptr2 = 0, ptr3 = 0;
-        for (int y = 0; y < GridWidth; y++)
-        for (int x = 0; x < GridWidth; x++)
-        {
-            int i = Coord2Idx(x, y);
-            int l0 = infos[i].x;
-            int l1 = l0 < 0 ? -1 : math.max(1, l0);
-            int l2 = l0 < 0 ? -1 : math.max(2, l1);
-            int l3 = l0 < 0 ? -1 : math.max(3, l2);
-            ifs[1][i] = new int2(l1, ptr1);
-            ifs[2][i] = new int2(l2, ptr2);
-            ifs[3][i] = new int2(l3, ptr3);
-            ptr1 += l1 < 0 ? 0 : BlockWidth(l1) * BlockWidth(l1);
-            ptr2 += l2 < 0 ? 0 : BlockWidth(l2) * BlockWidth(l2);
-            ptr3 += l3 < 0 ? 0 : BlockWidth(l3) * BlockWidth(l3);
-        }
+        BuildInfoPyramid();
 
         var As = _coefPymaid;
         var xs = _xPymaid;
@@ -288,7 +277,7 @@ public class MultiresBlockGridSolver : System.IDisposable
             z[i] = 0;
         }
 
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < LevelCount - 1; i++)
             RestrictionCoefficients(As[i], ifs[i], As[i + 1], ifs[i + 1]);
         
         MultiGridVCycle(ifs, As, xs, bs);
@@ -346,28 +335,13 @@ public class MultiresBlockGridSolver : System.IDisposable
     public void ApplyVCycle(NativeArray<float> rhs, NativeArray<float> result)
     {
         var ifs = _infoPymaid;
-        int ptr1 = 0, ptr2 = 0, ptr3 = 0;
-        for (int y = 0; y < GridWidth; y++)
-        for (int x = 0; x < GridWidth; x++)
-        {
-            int i = Coord2Idx(x, y);
-            int l0 = ifs[0][i].x;
-            int l1 = l0 < 0 ? -1 : math.max(1, l0);
-            int l2 = l0 < 0 ? -1 : math.max(2, l1);
-            int l3 = l0 < 0 ? -1 : math.max(3, l2);
-            ifs[1][i] = new int2(l1, ptr1);
-            ifs[2][i] = new int2(l2, ptr2);
-            ifs[3][i] = new int2(l3, ptr3);
-            ptr1 += l1 < 0 ? 0 : BlockWidth(l1) * BlockWidth(l1);
-            ptr2 += l2 < 0 ? 0 : BlockWidth(l2) * BlockWidth(l2);
-            ptr3 += l3 < 0 ? 0 : BlockWidth(l3) * BlockWidth(l3);
-        }
+        BuildInfoPyramid();
 
         var As = _coefPymaid;
         var xs = _xPymaid;
         var bs = _bPymaid;
 
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < LevelCount - 1; i++)
             RestrictionCoefficients(As[i], ifs[i], As[i + 1], ifs[i + 1]);
 
         // rhs -> bs[0] (= _r); zero the solution (= _z) so M is applied from x = 0.
@@ -380,26 +354,43 @@ public class MultiresBlockGridSolver : System.IDisposable
         xs[0].CopyTo(result);
     }
 
+    // rebuilds the coarse pyramid levels (1..LevelCount-1) above the base level
+    // (index 0 = GridInfos): every active block is lifted to at least the pyramid
+    // index, so all active blocks on level p are exactly level p. Widths halve per
+    // level down to the single-cell coarsest level, which CoarseGaussSeidelJob solves.
+    private void BuildInfoPyramid()
+    {
+        var ifs = _infoPymaid;
+        int[] ptrs = new int[LevelCount];
+        for (int y = 0; y < GridWidth; y++)
+        for (int x = 0; x < GridWidth; x++)
+        {
+            int i = Coord2Idx(x, y);
+            int l = ifs[0][i].x;
+            for (int p = 1; p < LevelCount; p++)
+            {
+                l = l < 0 ? -1 : math.max(p, l);
+                ifs[p][i] = new int2(l, ptrs[p]);
+                ptrs[p] += l < 0 ? 0 : BlockWidth(l) * BlockWidth(l);
+            }
+        }
+    }
+
     private void MultiGridVCycle(NativeArray<int2>[] infos, NativeArray<float3>[] As, NativeArray<float>[] xs, NativeArray<float>[] bs)
     {
         int smoothIter = 4;
-        
-        for (int i = 0; i < 3; i++)
+
+        for (int i = 0; i < LevelCount - 1; i++)
         {
             for (int iter = 0; iter < smoothIter; iter++)
                 GaussSeidelPhase(i, infos[i], As[i], xs[i], bs[i], true);
-            
+
             Restriction(bs[i], As[i], xs[i], infos[i], bs[i + 1], As[i + 1], xs[i + 1], infos[i + 1]);
         }
-        
-        // for (int iter = 0; iter < smoothIter; iter++)
-        // {
-        //     GaussSeidelPhase(3, lvs[3], ids[3], As[3], xs[3], bs[3], true);
-        //     GaussSeidelPhase(3, lvs[3], ids[3], As[3], xs[3], bs[3], false);
-        // }
-        new CoarseGaussSeidelJob(xs[3], As[3], infos[3], bs[3]).Run();
 
-        for (int i = 2; i >= 0; i--)
+        new CoarseGaussSeidelJob(xs[LevelCount - 1], As[LevelCount - 1], infos[LevelCount - 1], bs[LevelCount - 1]).Run();
+
+        for (int i = LevelCount - 2; i >= 0; i--)
         {
             Prolongation(xs[i+1], infos[i+1], xs[i], infos[i]);
             for (int iter = 0; iter < smoothIter; iter++)
@@ -527,6 +518,28 @@ public class MultiresBlockGridSolver : System.IDisposable
         new AllocateCellsJob(BlockLevel, GridInfos, _cellCount).Run();
 
         return _cellCount.Value;
+    }
+
+    // A block level change shifts every later block's ptr and swaps coarse/fine
+    // cells, but GridVelocityAlt still holds the advected field at the OLD layout.
+    // P2G only refreshes the band, so without remapping the deep cells keep
+    // whatever stale values sit at their new indices — the projection then spreads
+    // that garbage into the band, which shows up as block-periodic waves and
+    // velocity jumps at block borders.
+    public void MigrateVelocityOnReallocation()
+    {
+        bool changed = false;
+        for (int i = 0; i < BlockCount; i++)
+        {
+            if (GridInfos[i].x == GridInfosOld[i].x) continue;
+            changed = true;
+            break;
+        }
+        if (!changed) return;
+
+        GridVelocityAltDS.CopyFrom(GridVelocityAlt); // preserve the old-layout field
+        new MigrateVelocityJob(GridVelocityAltDS, GridInfosOld, GridVelocityAlt, GridInfos)
+            .Schedule(BlockCount, 1).Complete();
     }
 
     public void FillMatrix()
@@ -765,6 +778,105 @@ public class MultiresBlockGridSolver : System.IDisposable
         }
     }
 
+    // resamples the advected velocity field from the old block layout onto the new
+    // one after reallocation; corners resolve through their own old blocks, so a
+    // resolution change just mixes scales — the goal is beating stale garbage
+    [BurstCompile]
+    private struct MigrateVelocityJob : IJobParallelFor
+    {
+        [ReadOnly] private NativeArray<float2> _vOld;
+        [ReadOnly] private NativeArray<int2> _lutOld;
+        [ReadOnly] private NativeArray<int2> _lutNew;
+        // writes go to pool offsets, not the job index — same exception as every
+        // other block-wise job here
+        [NativeDisableParallelForRestriction, WriteOnly] private NativeArray<float2> _vNew;
+
+        public MigrateVelocityJob(NativeArray<float2> vOld, NativeArray<int2> lutOld,
+            NativeArray<float2> vNew, NativeArray<int2> lutNew)
+        {
+            _vOld = vOld;
+            _lutOld = lutOld;
+            _vNew = vNew;
+            _lutNew = lutNew;
+        }
+
+        public void Execute(int i)
+        {
+            int2 info = _lutNew[i];
+            int level = info.x;
+            if (level < 0) return;
+            int ptr = info.y;
+            int width = BlockWidth(level);
+            float h = GetH(level);
+            float2 blockOrigin = (float2)(Idx2Coord(i) * BaseBlockSize);
+            for (int y = 0; y < width; y++)
+            for (int x = 0; x < width; x++)
+            {
+                float2 cellCenter = blockOrigin + (new float2(x, y) + 0.5f) * h;
+                float2 posFaceX = cellCenter + new float2(-0.5f * h, 0f);
+                float2 posFaceY = cellCenter + new float2(0f, -0.5f * h);
+                _vNew[ptr + BlockCoord2Idx(x, y, width)] =
+                    new float2(SampleFace(0, posFaceX), SampleFace(1, posFaceY));
+            }
+        }
+
+        // same MAC face convention as the G2P/grid samplers: u faces at integer x,
+        // v faces at integer y, offsets in the containing block's cell units
+        private float SampleFace(int axis, float2 pos)
+        {
+            int gridSize = GridWidth * BaseBlockSize;
+            int2 baseCoord = (int2)math.floor(pos);
+            if (math.any(baseCoord < 0) || math.any(baseCoord >= gridSize))
+                return 0f;
+            int2 blockCoord = baseCoord / BaseBlockSize;
+            int2 info = _lutOld[Coord2Idx(blockCoord)];
+            int level = info.x;
+            if (level < 0) return 0f;
+            int blockWidth = BlockWidth(level);
+
+            float2 localUV = (pos - (float2)(blockCoord * BaseBlockSize)) / (1 << level);
+            float2 offset = new float2(0.5f, 0.5f);
+            offset[axis] = 0f;
+            localUV -= offset;
+            float2 weight = localUV - math.floor(localUV);
+
+            if (math.all(localUV > 0f & localUV < blockWidth - 1f))
+            {
+                int2 c0 = (int2)math.floor(localUV);
+                int2 c1 = c0 + 1;
+                int ptr = info.y;
+                float v00 = _vOld[ptr + BlockCoord2Idx(c0.x, c0.y, blockWidth)][axis];
+                float v10 = _vOld[ptr + BlockCoord2Idx(c1.x, c0.y, blockWidth)][axis];
+                float v01 = _vOld[ptr + BlockCoord2Idx(c0.x, c1.y, blockWidth)][axis];
+                float v11 = _vOld[ptr + BlockCoord2Idx(c1.x, c1.y, blockWidth)][axis];
+                return LerpBilinear(weight, v00, v10, v01, v11);
+            }
+
+            // block edge: four corners, each read at its own old block's level
+            bool2 selector = weight > 0.5f;
+            selector[axis] = false;
+            int2 c0g = baseCoord - math.select(int2.zero, 1, selector);
+            int2 c1g = c0g + 1;
+            float lb = PointSample(c0g.x, c0g.y)[axis];
+            float rb = PointSample(c1g.x, c0g.y)[axis];
+            float lt = PointSample(c0g.x, c1g.y)[axis];
+            float rt = PointSample(c1g.x, c1g.y)[axis];
+            return LerpBilinear(weight, lb, rb, lt, rt);
+        }
+
+        private float2 PointSample(int x, int y)
+        {
+            int gridSize = GridWidth * BaseBlockSize;
+            int2 baseCoord = math.clamp(new int2(x, y), 0, gridSize - 1);
+            int2 blockCoord = baseCoord / BaseBlockSize;
+            int2 info = _lutOld[Coord2Idx(blockCoord)];
+            if (info.x < 0) return float2.zero;
+            int blockWidth = BlockWidth(info.x);
+            int2 localCoord = (baseCoord - blockCoord * BaseBlockSize) >> info.x;
+            return _vOld[info.y + BlockCoord2Idx(localCoord, blockWidth)];
+        }
+    }
+
     [BurstCompile]
     private struct InitGridTypesJob : IJobParallelFor
     {
@@ -792,7 +904,7 @@ public class MultiresBlockGridSolver : System.IDisposable
             for (int y = 0; y < width; y++)
             for (int x = 0; x < width; x++)
             {
-                int2 cCoord = coord * 8 + new int2(x, y) * cellSize;
+                int2 cCoord = coord * BaseBlockSize + new int2(x, y) * cellSize;
                 int4 ox = new int4(-cellSize, cellSize, 0, 0);
                 int4 oy = new int4(0, 0, -cellSize, cellSize);
                 uint type = GetType(cCoord);
@@ -852,7 +964,9 @@ public class MultiresBlockGridSolver : System.IDisposable
             for (int xx = 1; xx <= width; xx++)
             {
                 int idx = ptr + BlockCoord2Idx(xx - 1, yy - 1, width);
-                if (!IsFluidCell(GridTypes[idx])) continue;
+                // zero non-fluid rows too — b is persistent, stale values here
+                // leak straight into CG's initial search direction (p0 = b)
+                if (!IsFluidCell(GridTypes[idx])) { GridFlux[idx] = 0; continue; }
                 float2 vel = haloBlock[BlockCoord2Idx(xx, yy, haloWidth)];
                 float un = haloBlock[BlockCoord2Idx(xx + 1, yy, haloWidth)].x;
                 float vn = haloBlock[BlockCoord2Idx(xx, yy + 1, haloWidth)].y;
@@ -934,10 +1048,10 @@ public class MultiresBlockGridSolver : System.IDisposable
             for (int y = 1; y <= width; y++)
             for (int x = 1; x <= width; x++)
             {
+                int ii = offset + BlockCoord2Idx(x - 1, y - 1, width);
                 float xc = blockV[BlockCoord2Idx(x, y, haloWidth)];
                 float neighborSum = NeighborSum(blockV, blockA, out float ac, x, y, haloWidth);
-                if (ac < 1e-5f) continue;
-                int ii = offset + BlockCoord2Idx(x - 1, y - 1, width);
+                if (ac < 1e-5f) { _r[ii] = 0; continue; } // zero the row — stale values would leak into the CG dots
                 _r[ii] = neighborSum + ac * xc;
             }
                 
@@ -1126,8 +1240,12 @@ public class MultiresBlockGridSolver : System.IDisposable
         }
     }
 
-    // coarsest-level (level 3) smoother: forward + backward Gauss-Seidel sweeps.
+    // coarsest-level (single-cell blocks) smoother: forward + backward Gauss-Seidel sweeps.
     // Serial IJob on purpose — each cell reads neighbors updated earlier in the same sweep.
+    // Cells live in per-block flat storage (BlockWidth(level)² per block), so both the
+    // cell itself and its cross-block neighbors must resolve through the lut; inactive
+    // or off-domain neighbors read as Neumann zero. All active blocks on this pyramid
+    // level share the same level, so neighbor cells line up 1:1 across block borders.
     [BurstCompile]
     private struct CoarseGaussSeidelJob : IJob
     {
@@ -1160,19 +1278,46 @@ public class MultiresBlockGridSolver : System.IDisposable
 
         private void Smooth(int x, int y)
         {
-            int i = Coord2Idx(x, y);
-            int level = _lut[i].x;
+            int2 info = _lut[Coord2Idx(x, y)];
+            int level = info.x;
             if (level < 0) return;
-            float3 ac = _a[i];
-            if (ac.x < 1e-5f) return;
-            float ar = x < GridWidth - 1 ? _a[Coord2Idx(x + 1, y)].y : 0;
-            float at = y < GridWidth - 1 ? _a[Coord2Idx(x, y + 1)].z : 0;
-            float xl = x > 0 ? _v[Coord2Idx(x - 1, y)] : 0;
-            float xr = x < GridWidth - 1 ? _v[Coord2Idx(x + 1, y)] : 0;
-            float xb = y > 0 ? _v[Coord2Idx(x, y - 1)] : 0;
-            float xt = y < GridWidth - 1 ? _v[Coord2Idx(x, y + 1)] : 0;
-            float xc = _v[i];
-            _v[i] = math.lerp(xc, (_b[i] - (xl * ac.y + xr * ar + xb * ac.z + xt * at)) / ac.x, 1.3f);
+            int w = BlockWidth(level);
+            int ptr = info.y;
+
+            for (int cy = 0; cy < w; cy++)
+            for (int cx = 0; cx < w; cx++)
+            {
+                int i = ptr + BlockCoord2Idx(cx, cy, w);
+                float3 ac = _a[i];
+                if (ac.x < 1e-5f) continue;
+
+                // .y couples a cell to its left neighbor, .z to the one below it —
+                // the right/top couplings therefore live in those neighbors' own rows
+                int l = cx > 0 ? ptr + BlockCoord2Idx(cx - 1, cy, w) : NeighborIdx(x - 1, y, w - 1, cy);
+                int r = cx < w - 1 ? ptr + BlockCoord2Idx(cx + 1, cy, w) : NeighborIdx(x + 1, y, 0, cy);
+                int b = cy > 0 ? ptr + BlockCoord2Idx(cx, cy - 1, w) : NeighborIdx(x, y - 1, cx, w - 1);
+                int t = cy < w - 1 ? ptr + BlockCoord2Idx(cx, cy + 1, w) : NeighborIdx(x, y + 1, cx, 0);
+
+                float ar = r >= 0 ? _a[r].y : 0;
+                float at = t >= 0 ? _a[t].z : 0;
+                float xl = l >= 0 ? _v[l] : 0;
+                float xr = r >= 0 ? _v[r] : 0;
+                float xb = b >= 0 ? _v[b] : 0;
+                float xt = t >= 0 ? _v[t] : 0;
+                float xc = _v[i];
+                _v[i] = math.lerp(xc, (_b[i] - (xl * ac.y + xr * ar + xb * ac.z + xt * at)) / ac.x, 1.3f);
+            }
+        }
+
+        // flat index of a cell in an adjacent block; -1 when that block is inactive
+        // or outside the domain
+        private int NeighborIdx(int bx, int by, int cx, int cy)
+        {
+            if (bx < 0 || by < 0 || bx >= GridWidth || by >= GridWidth) return -1;
+            int2 info = _lut[Coord2Idx(bx, by)];
+            if (info.x < 0) return -1;
+            int nw = BlockWidth(info.x);
+            return info.y + BlockCoord2Idx(math.clamp(cx, 0, nw - 1), math.clamp(cy, 0, nw - 1), nw);
         }
     }
 
@@ -1783,7 +1928,13 @@ public class MultiresBlockGridSolver : System.IDisposable
         }
     }
 
-    private static int BlockWidth(int level) => 1 << (3 - level);
+    private static int BlockWidth(int level) => 1 << (4 - level);
+    private static float LerpBilinear(float2 weight, float lb, float rb, float lt, float rt)
+    {
+        var b = math.lerp(lb, rb, weight.x);
+        var t = math.lerp(lt, rt, weight.x);
+        return math.lerp(b, t, weight.y);
+    }
     private static int BlockCoord2Idx(int2 coord, int res) => coord.x + coord.y * res;
     private static int BlockCoord2Idx(int x, int y, int res) => x + y * res;
     private static int2 Idx2Coord(int idx) => new int2(idx % GridWidth, idx / GridWidth);

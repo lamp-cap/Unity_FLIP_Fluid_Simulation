@@ -702,7 +702,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1848604088
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -746,8 +746,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   solverType: 2
   iterations: 100
-  gravity: -9.19
-  flipness: 0.993
+  gravity: -10
+  flipness: 0
   mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
   mat: {fileID: 2100000, guid: e18c57763f7bbce4e91ebffe70bc613b, type: 2}
 --- !u!1 &1985490831
